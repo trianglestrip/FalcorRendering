@@ -1,5 +1,7 @@
 add_falcor_executable(PBRTOfflineRenderer)
 
+target_include_directories(PBRTOfflineRenderer PRIVATE ${CMAKE_SOURCE_DIR}/third_party/taskflow)
+
 target_sources(PBRTOfflineRenderer PRIVATE
     PBRTOfflineRenderer.cpp
     PBRTOfflineRenderer.h

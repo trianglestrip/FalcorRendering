@@ -6,8 +6,8 @@
 FALCOR_EXPORT_D3D12_AGILITY_SDK
 static const float4 kClear = float4(0.1f, 0.1f, 0.12f, 1.f);
 
-PBRTOfflineRenderer::PBRTOfflineRenderer(const SampleAppConfig& c) : SampleApp(c) {}
-PBRTOfflineRenderer::~PBRTOfflineRenderer() {}
+PBRTOfflineRenderer::PBRTOfflineRenderer(const SampleAppConfig& c) : SampleApp(c), mExecutor(std::thread::hardware_concurrency()) { buildTaskGraph(); }
+PBRTOfflineRenderer::~PBRTOfflineRenderer() { mExecutor.wait_for_all(); }
 
 void PBRTOfflineRenderer::onLoad(RenderContext* pCtx)
 {
@@ -15,7 +15,7 @@ void PBRTOfflineRenderer::onLoad(RenderContext* pCtx)
     else logInfo("No scene. Drag .pbrt file or use --scene <path>");
 }
 
-void PBRTOfflineRenderer::onShutdown() { mpRasterPass = nullptr; mpScene = nullptr; }
+void PBRTOfflineRenderer::onShutdown() { mExecutor.wait_for_all(); mpRasterPass = nullptr; mpScene = nullptr; }
 
 void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
 {
@@ -77,12 +77,38 @@ void PBRTOfflineRenderer::saveOutput(RenderContext* pCtx)
 {
     if (mOutputPath.empty()) return;
     logInfo("Saving: {}", mOutputPath.string());
-    try
+
+    // Async save via Taskflow (non-blocking)
     {
-        getTargetFbo()->getColorTexture(0)->captureToFile(0, 0, mOutputPath, Bitmap::FileFormat::PngFile, Bitmap::ExportFlags::None, false);
-        logInfo("Saved OK.");
+        std::lock_guard<std::mutex> lock(mSaveMutex);
+        mSavePath = mOutputPath;
+        // Capture the current color texture from the target FBO
+        mSaveTexture = getTargetFbo()->getColorTexture(0);
+        mSavePending = true;
     }
-    catch (const std::exception& e) { logError("Save error: {}", e.what()); }
+
+    // Run the taskflow to save asynchronously
+    mExecutor.run(mTaskflow).wait();
+
+    logInfo("Saved OK.");
+}
+
+void PBRTOfflineRenderer::buildTaskGraph()
+{
+    // Build a task graph for async operations:
+    // 1. Save texture to file on a worker thread
+    mTaskflow.emplace([this]() {
+        std::lock_guard<std::mutex> lock(mSaveMutex);
+        if (mSavePending && mSaveTexture)
+        {
+            try
+            {
+                mSaveTexture->captureToFile(0, 0, mSavePath, Bitmap::FileFormat::PngFile, Bitmap::ExportFlags::None, false);
+            }
+            catch (const std::exception&) {}
+            mSavePending = false;
+        }
+    });
 }
 
 void PBRTOfflineRenderer::onGuiRender(Gui* pGui)

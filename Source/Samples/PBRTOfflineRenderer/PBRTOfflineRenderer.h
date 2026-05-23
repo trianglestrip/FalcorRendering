@@ -6,12 +6,14 @@
 #include "Core/SampleApp.h"
 #include "Core/Pass/RasterPass.h"
 #include "Scene/Scene.h"
+#include <taskflow.hpp>
 
 using namespace Falcor;
 
 class PBRTOfflineRenderer : public SampleApp
 {
 public:
+    // ...existing public interface...
     PBRTOfflineRenderer(const SampleAppConfig& c);
     ~PBRTOfflineRenderer();
     void onLoad(RenderContext* pCtx) override;
@@ -27,6 +29,7 @@ public:
 private:
     void loadScene(RenderContext* pCtx);
     void saveOutput(RenderContext* pCtx);
+    void buildTaskGraph();
 
     std::filesystem::path mScenePath, mOutputPath;
     ref<Scene> mpScene;
@@ -34,4 +37,12 @@ private:
     uint32_t mFrameCount = 0;
     bool mSceneLoaded = false;
     double mStartTime = 0.0;
+
+    // Taskflow for parallel processing
+    tf::Executor mExecutor;
+    tf::Taskflow mTaskflow;
+    bool mSavePending = false;
+    std::mutex mSaveMutex;
+    std::filesystem::path mSavePath;
+    ref<Texture> mSaveTexture;
 };
