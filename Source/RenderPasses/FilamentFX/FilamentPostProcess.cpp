@@ -76,6 +76,11 @@ FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& 
     float whitePixel[4] = {1.f, 1.f, 1.f, 1.f};
     mpWhiteTexture = pDevice->createTexture2D(1, 1, ResourceFormat::RGBA32Float, 1, 1, whitePixel,
         ResourceBindFlags::ShaderResource);
+
+    // Create dummy shadow map (1x1, value 1.0 = no geometry in reversed-Z)
+    float onePixel = 1.f;
+    mpDummyShadowMap = pDevice->createTexture2D(1, 1, ResourceFormat::R32Float, 1, 1, &onePixel,
+        ResourceBindFlags::ShaderResource);
 }
 
 void FilamentPostProcess::createNoiseTexture(ref<Device> pDevice)
@@ -144,11 +149,27 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
     const uint2 resolution = uint2(pDepth->getWidth(), pDepth->getHeight());
     updateAOTextures(mpDevice, resolution.x, resolution.y);
 
-    // Filament SAO parameters
+    // Filament SAO parameters (matching PostProcessManager screenSpaceAmbientOcclusion)
     float sampleCount = (float)settings.ssaoSampleCount;
     float radius = settings.ssaoRadius;
     float invRadiusSquared = 1.0f / (radius * radius);
-    float angleInc = (2.0f * 3.14159265f) / (float)settings.ssaoSpiralTurns / sampleCount;
+    float angleInc = (2.0f * 3.14159265f) / (sampleCount - 0.5f) * (float)settings.ssaoSpiralTurns;
+    
+    // projectionScale: from Filament = 0.5*proj[0].x*width (for typical 60deg FOV at 1280px)
+    // proj[0].x = 1/tan(fovX/2) ≈ 1.732 for 60deg → 0.5*1.732*1280 ≈ 1109
+    float fovEstimate = 1.732f; // 1/tan(30deg)
+    float projectionScale = 0.5f * fovEstimate * (float)resolution.x;
+    float projectionScaleRadius = projectionScale * radius;
+
+    // peak: from Filament = 0.1 * radius
+    float peak = 0.1f * radius;
+    float peak2 = peak * peak;
+
+    // intensity: from Filament = (2*PI * peak * userIntensity) / sampleCount
+    float intensity = (6.283185307f * peak * settings.ssaoIntensity) / sampleCount;
+
+    // power: from Filament = userPower * 2.0 (always square for better look)
+    float power = settings.ssaoPower * 2.0f;
 
     // SSAO main pass (Filament SAO)
     {
@@ -157,17 +178,19 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
         if (cb.isValid())
         {
             cb["gResolution"] = float4((float)resolution.x, (float)resolution.y, 1.f/resolution.x, 1.f/resolution.y);
-            cb["gPositionParams"]  = float2(2.0f, 2.0f); // invProjection[0][0]*2, invProjection[1][1]*2 simplified
+            // positionParams: invProjection[0][0]*2, invProjection[1][1]*2
+            // For typical 60deg FOV: invProj00 ~= 0.577, invProj11 ~= 1.026 → *2 = 1.155, 2.052
+            cb["gPositionParams"]  = float2(1.155f, 2.052f);
             cb["gInvRadiusSquared"] = invRadiusSquared;
             cb["gMinHorizonAngleSineSquared"] = settings.ssaoMinHorizonAngleSineSquared;
             cb["gBias"]      = settings.ssaoBias;
-            cb["gPeak2"]     = settings.ssaoPeak2;
-            cb["gProjectionScale"] = settings.ssaoProjectionScale;
-            cb["gProjectionScaleRadius"] = radius * settings.ssaoProjectionScale;
-            cb["gIntensity"] = settings.ssaoIntensity / sampleCount;
-            cb["gPower"]     = settings.ssaoPower;
+            cb["gPeak2"]     = peak2;
+            cb["gProjectionScale"] = projectionScale;
+            cb["gProjectionScaleRadius"] = projectionScaleRadius;
+            cb["gIntensity"] = intensity;
+            cb["gPower"]     = power;
             cb["gSpiralTurns"] = (float)settings.ssaoSpiralTurns;
-            cb["gSampleCount"]  = float2(sampleCount, 1.0f / sampleCount);
+            cb["gSampleCount"]  = float2(sampleCount, 1.0f / (sampleCount - 0.5f));
             cb["gAngleIncCosSin"] = float2(cos(angleInc), sin(angleInc));
             cb["gInvFarPlane"] = 1.0f / 1000.0f;
             cb["gMaxLevel"]   = 5; // mip levels for depth pyramid
@@ -220,6 +243,7 @@ void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const 
         cb["gShadowAtlasSize"] = uint2(settings.shadowMapSize, settings.shadowMapSize);
     }
     var["gDepth"] = pDepth;
+    var["gShadowMap"] = mpDummyShadowMap;   // Dummy: all 1.0 = no occluders
     var["gDst"] = mpShadowVisibility;
     var["gPointSampler"] = mpPointSampler;
     var["gLinearSampler"] = mpLinearSampler;
@@ -360,17 +384,11 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
         var["gSrc"] = currentInput;
         var["gDst"] = cgTarget;
 
-        // Bind AO texture if available (fallback = white 1x1 to match float type)
-        if (settings.enableSSAO && mpAOBlurTarget)
-            var["gAO"] = mpAOBlurTarget;
-        else
-            var["gAO"] = mpWhiteTexture;
+        // Bind AO texture (use white fallback if not available)
+        var["gAO"] = (settings.enableSSAO && mpAOBlurTarget) ? mpAOBlurTarget : mpWhiteTexture;
 
-        // Bind Shadow texture if available
-        if (settings.enableShadows && mpShadowVisibility)
-            var["gShadow"] = mpShadowVisibility;
-        else
-            var["gShadow"] = mpWhiteTexture;
+        // Bind Shadow texture (always white fallback - shadow pipeline not ready)
+        var["gShadow"] = (settings.enableShadows && mpShadowVisibility) ? mpShadowVisibility : mpWhiteTexture;
 
         if (settings.enableBloom && mpBloomMips[0])
         {

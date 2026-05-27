@@ -98,7 +98,8 @@ void ssaoMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     float2 uv = (coord + 0.5) * gResolution.zw;
     
     float depth = gDepth.SampleLevel(gPointSampler, uv, 0).r;
-    if (depth >= 1.0) { gDst[dispatchThreadId.xy] = 1.0; return; }
+    // Reversed-Z: depth ≈ 0 for far/sky, depth ≈ 1 for near plane
+    if (depth < 1e-5) { gDst[dispatchThreadId.xy] = 1.0; return; }
     
     float linearDepth = linearizeDepth(depth);
     float3 origin = computeViewSpacePositionFromDepth(uv, linearDepth);

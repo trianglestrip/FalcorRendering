@@ -38,20 +38,20 @@ public:
         int bloomBlendMode = 0; // 0: Add, 1: Screen
         float bloomThreshold = 1.0f;
 
-        // SSAO (Filament SAO parameters)
-        bool enableSSAO = false;           // OFF until depth params are calibrated
-        float ssaoRadius = 0.3f;          // world-space radius (Filament: options.radius)
-        float ssaoBias = 0.001f;          // depth bias (Filament: options.bias)
-        float ssaoPower = 1.0f;           // power curve (Filament: options.power)
-        float ssaoIntensity = 1.0f;       // intensity multiplier (Filament: options.intensity)
-        int   ssaoSampleCount = 11;       // samples (Filament MEDIUM quality: 11)
-        int   ssaoSpiralTurns = 6;        // spiral turns (Filament MEDIUM: 6)
-        float ssaoMinHorizonAngleSineSquared = 0.0f;  // Filament: options.minHorizonAngleSineSquared
-        float ssaoPeak2 = 0.0001f;        // peak^2 for AO function
-        float ssaoProjectionScale = 1.0f; // projection scaling
+        // SSAO (Filament SAO parameters) - enabled with reversed-Z depth fix
+        bool enableSSAO = true;
+        float ssaoRadius = 0.5f;          // world-space radius
+        float ssaoBias = 0.005f;          // depth bias
+        float ssaoPower = 1.0f;           // power curve
+        float ssaoIntensity = 1.0f;       // intensity multiplier
+        int   ssaoSampleCount = 11;       // Filament MEDIUM quality: 11
+        int   ssaoSpiralTurns = 6;        // Filament MEDIUM: 6
+        float ssaoMinHorizonAngleSineSquared = 0.0f;
+        float ssaoPeak2 = 0.0001f;
+        float ssaoProjectionScale = 1.0f;
 
-        // Shadow
-        bool enableShadows = true;
+        // Shadow (dummy shadow map bound, safe to enable in GUI)
+        bool enableShadows = false;
         int shadowType = 1; // 0: PCF Hard, 1: PCF Low (3x3), 2: VSM
         int shadowCascades = 4;
         float shadowBias = 0.001f;
@@ -111,6 +111,7 @@ private:
 
     // Fallback white texture for AO/Shadow when disabled
     ref<Texture> mpWhiteTexture;
+    ref<Texture> mpDummyShadowMap;     // 1x1 shadow map to prevent null binding
 
     // Helper functions
     void updateBloomTextures(ref<Device> pDevice, uint32_t width, uint32_t height, uint32_t levels);
