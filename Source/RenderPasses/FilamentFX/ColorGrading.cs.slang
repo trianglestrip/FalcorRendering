@@ -12,10 +12,14 @@ cbuffer PerFrameCB
     float3 gVignetteColor;
     float gBloomStrength;
     float gBloomBlendMode; // 0: Add, 1: Screen
+    float gAOEnabled;      // 1.0 = enabled, 0.0 = disabled
+    float gShadowEnabled;  // 1.0 = enabled, 0.0 = disabled
 };
 
 Texture2D<float4> gSrc;
 Texture2D<float4> gBloom; // Mip 0 from bloom upsample
+Texture2D<float>  gAO;     // Ambient occlusion (R channel, 0-1)
+Texture2D<float>  gShadow; // Shadow visibility (R channel, 0-1)
 SamplerState gSampler;
 RWTexture2D<float4> gDst;
 
@@ -68,6 +72,19 @@ void colorGradingMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     float2 uv = (float2(coord) + 0.5f) / float2(gResolution);
     
     float3 color = gSrc.Load(int3(coord, 0)).rgb;
+
+    // Apply Ambient Occlusion (clamped to prevent black screen from bad params)
+    if (gAOEnabled > 0.5f) {
+        float ao = gAO.Load(int3(coord, 0)).r;
+        ao = clamp(ao, 0.05, 1.0);  // Prevent complete blackout
+        color *= ao;
+    }
+
+    // Apply Shadow Visibility
+    if (gShadowEnabled > 0.5f) {
+        float shadow = gShadow.Load(int3(coord, 0)).r;
+        color *= shadow;
+    }
 
     // Apply Bloom Composite
     if (gBloomStrength > 0.0f) {

@@ -39,7 +39,7 @@ public:
         float bloomThreshold = 1.0f;
 
         // SSAO (Filament SAO parameters)
-        bool enableSSAO = false;
+        bool enableSSAO = false;           // OFF until depth params are calibrated
         float ssaoRadius = 0.3f;          // world-space radius (Filament: options.radius)
         float ssaoBias = 0.001f;          // depth bias (Filament: options.bias)
         float ssaoPower = 1.0f;           // power curve (Filament: options.power)
@@ -108,6 +108,9 @@ private:
     // Samplers
     ref<Sampler> mpLinearSampler;
     ref<Sampler> mpPointSampler;
+
+    // Fallback white texture for AO/Shadow when disabled
+    ref<Texture> mpWhiteTexture;
 
     // Helper functions
     void updateBloomTextures(ref<Device> pDevice, uint32_t width, uint32_t height, uint32_t levels);

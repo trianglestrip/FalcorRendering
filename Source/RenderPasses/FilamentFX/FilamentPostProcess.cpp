@@ -71,6 +71,11 @@ FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& 
 
     // Create SSAO noise texture
     createNoiseTexture(pDevice);
+
+    // Create 1x1 white fallback texture for AO/Shadow when disabled
+    float whitePixel[4] = {1.f, 1.f, 1.f, 1.f};
+    mpWhiteTexture = pDevice->createTexture2D(1, 1, ResourceFormat::RGBA32Float, 1, 1, whitePixel,
+        ResourceBindFlags::ShaderResource);
 }
 
 void FilamentPostProcess::createNoiseTexture(ref<Device> pDevice)
@@ -348,10 +353,25 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
             cb["gVignetteColor"] = settings.vignetteColor;
             cb["gBloomStrength"] = settings.enableBloom ? settings.bloomStrength : 0.0f;
             cb["gBloomBlendMode"] = (float)settings.bloomBlendMode;
+            cb["gAOEnabled"] = (settings.enableSSAO && mpAOBlurTarget) ? 1.0f : 0.0f;
+            cb["gShadowEnabled"] = (settings.enableShadows && mpShadowVisibility) ? 1.0f : 0.0f;
         }
 
         var["gSrc"] = currentInput;
         var["gDst"] = cgTarget;
+
+        // Bind AO texture if available (fallback = white 1x1 to match float type)
+        if (settings.enableSSAO && mpAOBlurTarget)
+            var["gAO"] = mpAOBlurTarget;
+        else
+            var["gAO"] = mpWhiteTexture;
+
+        // Bind Shadow texture if available
+        if (settings.enableShadows && mpShadowVisibility)
+            var["gShadow"] = mpShadowVisibility;
+        else
+            var["gShadow"] = mpWhiteTexture;
+
         if (settings.enableBloom && mpBloomMips[0])
         {
             var["gBloom"] = mpBloomMips[0];
