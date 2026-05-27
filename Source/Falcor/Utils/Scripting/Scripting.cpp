@@ -70,7 +70,9 @@ void Scripting::start()
         }
         catch (const std::exception& e)
         {
-            FALCOR_THROW("Failed to start the Python interpreter: {}", e.what());
+            // Non-fatal: Python scripting is optional for rendering
+            logWarning("Python scripting unavailable: {}", e.what());
+            sRunning = false;
         }
     }
 }

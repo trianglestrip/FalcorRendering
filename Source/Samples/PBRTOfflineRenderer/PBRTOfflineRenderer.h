@@ -6,6 +6,7 @@
 #include "Core/SampleApp.h"
 #include "Core/Pass/RasterPass.h"
 #include "Scene/Scene.h"
+#include "FilamentPostProcess.h"
 #include <taskflow.hpp>
 
 using namespace Falcor;
@@ -34,6 +35,10 @@ private:
     std::filesystem::path mScenePath, mOutputPath;
     ref<Scene> mpScene;
     ref<RasterPass> mpRasterPass;
+    ref<FilamentPostProcess> mpFilamentPostProcess;
+    ref<Texture> mpIntermediateTexture;
+    ref<Texture> mpIntermediateDepth;
+    ref<Texture> mpPostProcessOutput;
     uint32_t mFrameCount = 0;
     bool mSceneLoaded = false;
     double mStartTime = 0.0;
@@ -45,4 +50,6 @@ private:
     std::mutex mSaveMutex;
     std::filesystem::path mSavePath;
     ref<Texture> mSaveTexture;
+
+    FilamentPostProcess::FilamentSettings mFilamentSettings;
 };

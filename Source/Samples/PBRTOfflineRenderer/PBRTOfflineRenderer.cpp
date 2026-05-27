@@ -44,10 +44,14 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
 
         // Create raster pass (like HelloDXR)
         ProgramDesc d;
+        d.addCompilerArguments({"-Wno-30081"});
         d.addShaderModules(mpScene->getShaderModules());
         d.addShaderLibrary("Samples/PBRTOfflineRenderer/PBRTOfflineRenderer.3d.slang").vsEntry("vsMain").psEntry("psMain");
         d.addTypeConformances(mpScene->getTypeConformances());
         mpRasterPass = RasterPass::create(getDevice(), d, mpScene->getSceneDefines());
+
+        Properties props;
+        mpFilamentPostProcess = FilamentPostProcess::create(getDevice(), props);
     }
     catch (const std::exception& e)
     {
@@ -60,10 +64,39 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     pCtx->clearFbo(pFbo.get(), kClear, 1.f, 0, FboAttachmentType::All);
     if (!mSceneLoaded || !mpScene || !mpRasterPass) return;
 
+    // Ensure intermediate texture is correct size
+    auto pTarget = pFbo->getColorTexture(0);
+    if (!mpIntermediateTexture || mpIntermediateTexture->getWidth() != pTarget->getWidth() || mpIntermediateTexture->getHeight() != pTarget->getHeight())
+    {
+        mpIntermediateTexture = getDevice()->createTexture2D(
+            pTarget->getWidth(), pTarget->getHeight(), ResourceFormat::RGBA32Float, 1, 1, nullptr,
+            ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+        mpIntermediateDepth = getDevice()->createTexture2D(
+            pTarget->getWidth(), pTarget->getHeight(), ResourceFormat::D32Float, 1, 1, nullptr,
+            ResourceBindFlags::DepthStencil | ResourceBindFlags::ShaderResource);
+        mpPostProcessOutput = getDevice()->createTexture2D(
+            pTarget->getWidth(), pTarget->getHeight(), ResourceFormat::RGBA32Float, 1, 1, nullptr,
+            ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+    }
+
+    auto pInterFbo = Fbo::create(getDevice(), {mpIntermediateTexture}, mpIntermediateDepth);
+    pCtx->clearFbo(pInterFbo.get(), kClear, 1.f, 0, FboAttachmentType::All);
+
     mpScene->update(pCtx, getGlobalClock().getTime());
 
-    mpRasterPass->getState()->setFbo(pFbo);
+    mpRasterPass->getState()->setFbo(pInterFbo);
     mpScene->rasterize(pCtx, mpRasterPass->getState().get(), mpRasterPass->getVars().get());
+
+    // Sync FilamentSettings to FilamentPostProcess pass
+    if (mpFilamentPostProcess && mFilamentSettings.postProcessingEnabled)
+    {
+        mpFilamentPostProcess->executeCustom(pCtx, mpIntermediateTexture, mpIntermediateDepth, mpPostProcessOutput, mFilamentSettings);
+        pCtx->blit(mpPostProcessOutput->getSRV(), pTarget->getRTV());
+    }
+    else
+    {
+        pCtx->blit(mpIntermediateTexture->getSRV(), pTarget->getRTV());
+    }
 
     mFrameCount++;
     if (mFrameCount == 1)
@@ -118,6 +151,92 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
     else w.text("No scene. Drag .pbrt file or use --scene <path>");
     w.text(fmt::format("Frame: {}", mFrameCount));
     if (w.button("Save Screenshot")) { if (mOutputPath.empty()) { mOutputPath = mScenePath; mOutputPath.replace_extension(".exr"); } saveOutput(getRenderContext()); }
+    
+    if (auto g = w.group("Filament Settings"))
+    {
+        if (auto viewGroup = g.group("View")) {
+            viewGroup.checkbox("Post-processing", mFilamentSettings.postProcessingEnabled);
+            viewGroup.checkbox("Dithering", mFilamentSettings.dithering);
+            Gui::DropdownList aaList = {{0, "None"}, {1, "FXAA"}, {2, "TAA"}};
+            viewGroup.dropdown("Anti-aliasing", aaList, (uint32_t&)mFilamentSettings.antiAliasing);
+        }
+
+        if (mpScene && mpScene->getEnvMap())
+        {
+            if (auto envGroup = g.group("Environment Map (IBL)"))
+            {
+                mpScene->getEnvMap()->renderUI(envGroup);
+            }
+        }
+
+        if (auto shadowGroup = g.group("Shadows")) {
+            shadowGroup.checkbox("Enable Shadows", mFilamentSettings.enableShadows);
+            if (mFilamentSettings.enableShadows) {
+                Gui::DropdownList shadowTypes = {{0, "PCF Hard"}, {1, "PCF Low (3x3)"}, {2, "VSM"}};
+                shadowGroup.dropdown("Shadow Type", shadowTypes, (uint32_t&)mFilamentSettings.shadowType);
+                shadowGroup.slider("Cascades", mFilamentSettings.shadowCascades, 1, 4);
+                shadowGroup.slider("Bias", mFilamentSettings.shadowBias, 0.0f, 0.01f);
+                shadowGroup.slider("Map Size", mFilamentSettings.shadowMapSize, 512u, 4096u);
+            }
+        }
+
+        if (mFilamentSettings.postProcessingEnabled) {
+            if (auto ppGroup = g.group("Post-processing")) {
+                
+                if (auto ssaoGroup = ppGroup.group("SSAO (Ambient Occlusion)")) {
+                    ssaoGroup.checkbox("Enable", mFilamentSettings.enableSSAO);
+                    if (mFilamentSettings.enableSSAO) {
+                        ssaoGroup.slider("Radius", mFilamentSettings.ssaoRadius, 0.01f, 3.0f);
+                        ssaoGroup.slider("Bias", mFilamentSettings.ssaoBias, 0.0f, 0.1f);
+                        ssaoGroup.slider("Power", mFilamentSettings.ssaoPower, 0.1f, 5.0f);
+                        ssaoGroup.slider("Intensity", mFilamentSettings.ssaoIntensity, 0.0f, 3.0f);
+                        ssaoGroup.slider("Samples", mFilamentSettings.ssaoSampleCount, 4, 64);
+                        ssaoGroup.slider("Spiral Turns", mFilamentSettings.ssaoSpiralTurns, 1, 15);
+                    }
+                }
+                
+                if (auto bloomGroup = ppGroup.group("Bloom")) {
+                    bloomGroup.checkbox("Enable", mFilamentSettings.enableBloom);
+                    if (mFilamentSettings.enableBloom) {
+                        bloomGroup.slider("Strength", mFilamentSettings.bloomStrength, 0.0f, 1.0f);
+                        bloomGroup.slider("Threshold", mFilamentSettings.bloomThreshold, 0.0f, 10.0f);
+                        bloomGroup.slider("Levels", mFilamentSettings.bloomLevels, 1, 7);
+                        Gui::DropdownList blendModes = {{0, "Add"}, {1, "Screen"}};
+                        bloomGroup.dropdown("Blend Mode", blendModes, (uint32_t&)mFilamentSettings.bloomBlendMode);
+                    }
+                }
+                
+                if (auto dofGroup = ppGroup.group("Depth of Field")) {
+                    dofGroup.checkbox("Enable", mFilamentSettings.enableDoF);
+                    if (mFilamentSettings.enableDoF) {
+                        dofGroup.slider("Focal Distance", mFilamentSettings.dofFocalDistance, 0.1f, 100.0f);
+                        dofGroup.slider("Aperture", mFilamentSettings.dofAperture, 1.0f, 32.0f);
+                        dofGroup.slider("Max CoC", mFilamentSettings.dofMaxCoC, 1.0f, 32.0f);
+                    }
+                }
+                
+                if (auto vigGroup = ppGroup.group("Vignette")) {
+                    vigGroup.checkbox("Enable", mFilamentSettings.enableVignette);
+                    if (mFilamentSettings.enableVignette) {
+                        vigGroup.slider("Midpoint", mFilamentSettings.vignetteMidpoint, 0.0f, 1.0f);
+                        vigGroup.slider("Roundness", mFilamentSettings.vignetteRoundness, 0.0f, 1.0f);
+                        vigGroup.slider("Feather", mFilamentSettings.vignetteFeather, 0.0f, 1.0f);
+                        vigGroup.rgbColor("Color", mFilamentSettings.vignetteColor);
+                    }
+                }
+
+                if (auto cgGroup = ppGroup.group("Color Grading")) {
+                    Gui::DropdownList tmModes = {{0, "ACES"}, {1, "Filmic"}, {2, "Linear"}, {3, "Display"}};
+                    cgGroup.dropdown("Tone Mapping", tmModes, (uint32_t&)mFilamentSettings.toneMapping);
+                    cgGroup.slider("Exposure (EV)", mFilamentSettings.exposure, -10.0f, 10.0f);
+                    cgGroup.slider("Contrast", mFilamentSettings.contrast, 0.0f, 2.0f);
+                    cgGroup.slider("Vibrance", mFilamentSettings.vibrance, 0.0f, 2.0f);
+                    cgGroup.slider("Saturation", mFilamentSettings.saturation, 0.0f, 2.0f);
+                }
+            }
+        }
+    }
+
     renderGlobalUI(pGui);
 }
 
