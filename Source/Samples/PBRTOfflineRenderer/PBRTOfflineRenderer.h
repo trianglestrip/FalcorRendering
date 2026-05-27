@@ -31,6 +31,7 @@ private:
     void loadScene(RenderContext* pCtx);
     void saveOutput(RenderContext* pCtx);
     void buildTaskGraph();
+    void renderShadowMap(RenderContext* pCtx);
 
     std::filesystem::path mScenePath, mOutputPath;
     ref<Scene> mpScene;
@@ -39,6 +40,13 @@ private:
     ref<Texture> mpIntermediateTexture;
     ref<Texture> mpIntermediateDepth;
     ref<Texture> mpPostProcessOutput;
+
+    // Shadow map resources
+    ref<Texture> mpShadowMapDepth;
+    ref<Fbo> mpShadowFbo;
+    ref<RasterPass> mpShadowRasterPass;
+    uint32_t mShadowMapSize = 2048;
+
     uint32_t mFrameCount = 0;
     bool mSceneLoaded = false;
     double mStartTime = 0.0;

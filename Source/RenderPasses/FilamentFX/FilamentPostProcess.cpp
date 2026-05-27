@@ -219,7 +219,7 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
     }
 }
 
-void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings)
+void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings, const ref<Texture>& pShadowMapDepth)
 {
     if (!mpShadowMapPass || !pDepth) return;
 
@@ -243,26 +243,29 @@ void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const 
         cb["gShadowAtlasSize"] = uint2(settings.shadowMapSize, settings.shadowMapSize);
     }
 
-    // Initialize ShadowCameraCB with identity matrices (no real shadow casting yet)
-    // These push all transforms outside [0,1] so everything is lit
+    // Use real shadow map if available, else dummy
+    var["gShadowMap"] = pShadowMapDepth ? pShadowMapDepth : mpDummyShadowMap;
+
+    // Set light view-proj matrices
     auto shadowCB = var["ShadowCameraCB"];
     if (shadowCB.isValid())
     {
         for (int i = 0; i < 4; i++)
         {
-            // Identity matrix keeps coordinates in [-1,1] which maps to [0,1] after *0.5+0.5
-            // Use large scale XY to push outside [0,1] → bounds check → visibility=1.0
-            float scaleOut = 100.0f;
             float4x4 mat;
-            mat[0] = float4(scaleOut, 0, 0, 0);
-            mat[1] = float4(0, scaleOut, 0, 0);
-            mat[2] = float4(0, 0, 1, 0);
-            mat[3] = float4(0, 0, 0, 1);
+            if (pShadowMapDepth && i == 0)
+                mat = settings.shadowLightViewProj;
+            else
+            {
+                // Push other cascades / dummy out of bounds
+                mat[0] = float4(100, 0, 0, 0);
+                mat[1] = float4(0, 100, 0, 0);
+                mat[2] = float4(0, 0, 1, 0);
+                mat[3] = float4(0, 0, 0, 1);
+            }
             shadowCB["gLightViewProj"][i] = mat;
         }
     }
-
-    var["gDepth"] = pDepth;
     var["gShadowMap"] = mpDummyShadowMap;
     var["gDst"] = mpShadowVisibility;
     var["gPointSampler"] = mpPointSampler;
@@ -294,7 +297,7 @@ void FilamentPostProcess::execute(RenderContext* pRenderContext, const RenderDat
     executeCustom(pRenderContext, pSrc, nullptr, pDst, defaultSettings);
 }
 
-void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings)
+void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pShadowMap)
 {
     if (!pSrc || !pDst) return;
 
@@ -304,7 +307,7 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     // --- Pipeline Stage 0: Shadow Map (if enabled + depth available) ---
     if (settings.enableShadows && pDepth && mpShadowMapPass)
     {
-        executeShadowMap(pRenderContext, pDepth, settings);
+        executeShadowMap(pRenderContext, pDepth, settings, pShadowMap);
     }
 
     // --- Pipeline Stage 1: SSAO (if enabled + depth available) ---
@@ -407,8 +410,13 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
         // Bind AO texture (use white fallback if not available)
         var["gAO"] = (settings.enableSSAO && mpAOBlurTarget) ? mpAOBlurTarget : mpWhiteTexture;
 
-        // Bind Shadow texture (always white fallback - shadow pipeline not ready)
-        var["gShadow"] = (settings.enableShadows && mpShadowVisibility) ? mpShadowVisibility : mpWhiteTexture;
+        // Bind Shadow texture (use real shadow map if available, else dummy)
+        if (settings.enableShadows && pShadowMap)
+            var["gShadow"] = pShadowMap;
+        else if (settings.enableShadows && mpShadowVisibility)
+            var["gShadow"] = mpShadowVisibility;
+        else
+            var["gShadow"] = mpWhiteTexture;
 
         if (settings.enableBloom && mpBloomMips[0])
         {

@@ -50,6 +50,21 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         d.addTypeConformances(mpScene->getTypeConformances());
         mpRasterPass = RasterPass::create(getDevice(), d, mpScene->getSceneDefines());
 
+        // Create shadow map resources
+        mShadowMapSize = mFilamentSettings.shadowMapSize;
+        mpShadowMapDepth = getDevice()->createTexture2D(
+            mShadowMapSize, mShadowMapSize, ResourceFormat::D32Float, 1, 1, nullptr,
+            ResourceBindFlags::DepthStencil | ResourceBindFlags::ShaderResource);
+        mpShadowFbo = Fbo::create(getDevice(), {}, mpShadowMapDepth);
+
+        // Create shadow depth raster pass (depth-only from light POV)
+        ProgramDesc sd;
+        sd.addCompilerArguments({"-Wno-30081"});
+        sd.addShaderModules(mpScene->getShaderModules());
+        sd.addShaderLibrary("Samples/PBRTOfflineRenderer/ShadowDepth.3d.slang").vsEntry("vsMain").psEntry("psMain");
+        sd.addTypeConformances(mpScene->getTypeConformances());
+        mpShadowRasterPass = RasterPass::create(getDevice(), sd, mpScene->getSceneDefines());
+
         Properties props;
         mpFilamentPostProcess = FilamentPostProcess::create(getDevice(), props);
     }
@@ -59,10 +74,60 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
     }
 }
 
+void PBRTOfflineRenderer::renderShadowMap(RenderContext* pCtx)
+{
+    if (!mpShadowFbo || !mpShadowRasterPass || !mpScene) return;
+
+    pCtx->clearFbo(mpShadowFbo.get(), float4(0,0,0,0), 1.f, 0, FboAttachmentType::Depth);
+
+    float3 lightDir = normalize(mFilamentSettings.sunDirection);
+    float sceneRadius = mpScene->getSceneBounds().radius();
+    float3 sceneCenter = mpScene->getSceneBounds().center();
+    float3 lightPos = sceneCenter - lightDir * sceneRadius * 2.f;
+    float3 lightTarget = sceneCenter;
+
+    float3 f = normalize(lightTarget - lightPos);
+    float3 s = normalize(cross(f, float3(0,1,0)));
+    float3 u = cross(s, f);
+    float4x4 lightView;
+    lightView[0] = float4(s.x, u.x, -f.x, 0);
+    lightView[1] = float4(s.y, u.y, -f.y, 0);
+    lightView[2] = float4(s.z, u.z, -f.z, 0);
+    lightView[3] = float4(-dot(s,lightPos), -dot(u,lightPos), dot(f,lightPos), 1);
+
+    float orthoSize = sceneRadius * 1.5f;
+    float nearP = 0.1f, farP = sceneRadius * 5.f;
+    float rcpRange = 1.f / (farP - nearP);
+    float4x4 lightProj;
+    lightProj[0] = float4(1.f/orthoSize, 0, 0, 0);
+    lightProj[1] = float4(0, 1.f/orthoSize, 0, 0);
+    lightProj[2] = float4(0, 0, rcpRange, 0);
+    lightProj[3] = float4(0, 0, -nearP*rcpRange, 1);
+
+    float4x4 lightViewProj = mul(lightProj, lightView);
+    mFilamentSettings.shadowLightViewProj = lightViewProj;
+
+    auto pCam = mpScene->getCamera();
+    auto origView = pCam->getViewMatrix();
+    auto origProj = pCam->getProjMatrix();
+    pCam->setViewMatrix(lightView);
+    pCam->setProjectionMatrix(lightProj);
+
+    mpShadowRasterPass->getState()->setFbo(mpShadowFbo);
+    mpScene->rasterize(pCtx, mpShadowRasterPass->getState().get(), mpShadowRasterPass->getVars().get());
+
+    pCam->setViewMatrix(origView);
+    pCam->setProjectionMatrix(origProj);
+}
+
 void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFbo)
 {
     pCtx->clearFbo(pFbo.get(), kClear, 1.f, 0, FboAttachmentType::All);
     if (!mSceneLoaded || !mpScene || !mpRasterPass) return;
+
+    // --- Stage 0: Render shadow map ---
+    if (mFilamentSettings.enableShadows && mpShadowRasterPass)
+        renderShadowMap(pCtx);
 
     // Ensure intermediate texture is correct size
     auto pTarget = pFbo->getColorTexture(0);
@@ -90,7 +155,8 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     // Sync FilamentSettings to FilamentPostProcess pass
     if (mpFilamentPostProcess && mFilamentSettings.postProcessingEnabled)
     {
-        mpFilamentPostProcess->executeCustom(pCtx, mpIntermediateTexture, mpIntermediateDepth, mpPostProcessOutput, mFilamentSettings);
+        mpFilamentPostProcess->executeCustom(pCtx, mpIntermediateTexture, mpIntermediateDepth, mpPostProcessOutput, mFilamentSettings,
+            mFilamentSettings.enableShadows ? mpShadowMapDepth : nullptr);
         pCtx->blit(mpPostProcessOutput->getSRV(), pTarget->getRTV());
     }
     else

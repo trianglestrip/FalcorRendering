@@ -12,6 +12,7 @@ target_sources(PBRTOfflineRenderer PRIVATE
 target_link_libraries(PBRTOfflineRenderer PRIVATE FilamentPostProcessLib)
 
 # Copy shader includes to shader dir
+# Copy shader includes to shader dir
 target_copy_shaders(PBRTOfflineRenderer Samples/PBRTOfflineRenderer)
 target_copy_shaders(PBRTOfflineRenderer RenderPasses/FilamentFX)
 

@@ -57,6 +57,7 @@ public:
         float shadowBias = 0.001f;
         float4 cascadeSplits = float4(5.0f, 15.0f, 40.0f, 100.0f);
         uint32_t shadowMapSize = 2048;
+        float4x4 shadowLightViewProj = float4x4(); // Set by renderShadowMap
 
         // Depth of Field
         bool enableDoF = false;
@@ -80,7 +81,7 @@ public:
     };
 
     // Custom execution for PBRTOfflineRenderer
-    void executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings);
+    void executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pShadowMap = nullptr);
 
 private:
     // Post-processing passes
@@ -118,5 +119,5 @@ private:
     void updateAOTextures(ref<Device> pDevice, uint32_t width, uint32_t height);
     void createNoiseTexture(ref<Device> pDevice);
     void executeSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
-    void executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
+    void executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings, const ref<Texture>& pShadowMapDepth = nullptr);
 };
