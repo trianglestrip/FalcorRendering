@@ -38,12 +38,12 @@ public:
         int bloomBlendMode = 0; // 0: Add, 1: Screen
         float bloomThreshold = 1.0f;
 
-        // SSAO (Filament SAO parameters) - enabled with reversed-Z depth fix
+        // SSAO (Filament SAO parameters)
         bool enableSSAO = true;
-        float ssaoRadius = 1.0f;          // world-space radius (bigger = more AO spread)
-        float ssaoBias = 0.005f;          // depth bias
-        float ssaoPower = 1.0f;           // power curve (Filament doubles this internally)
-        float ssaoIntensity = 2.0f;       // intensity multiplier (Filament: options.intensity)
+        float ssaoRadius = 0.3f;          // Filament default radius
+        float ssaoBias = 0.001f;          // Filament default bias
+        float ssaoPower = 1.0f;           // power curve (doubled internally)
+        float ssaoIntensity = 1.0f;       // Filament default intensity
         int   ssaoSampleCount = 11;       // Filament MEDIUM quality: 11
         int   ssaoSpiralTurns = 6;        // Filament MEDIUM: 6
         float ssaoMinHorizonAngleSineSquared = 0.0f;

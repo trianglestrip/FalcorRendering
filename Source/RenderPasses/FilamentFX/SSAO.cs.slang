@@ -35,9 +35,9 @@ float interleavedGradientNoise(float2 screenPos)
 // Linearize depth (reversed-Z, like Filament's depthUtils.fs)
 float linearizeDepth(float depth)
 {
-    // Reversed-Z (D3D12): depth=1→near, depth=0→far
-    // viewZ = nearPlane / depth, with nearPlane≈1.0 for reasonable scene scale
-    return 1.0 / max(depth, 1.0 / 16777216.0);
+    // Reversed-Z: depth = nearPlane / viewZ
+    // Falcor sets near=0.1m (see PBRTOfflineRenderer::loadScene)
+    return 0.1 / max(depth, 1.0 / 16777216.0);
 }
 
 float sampleDepthLinear(float2 uv, float lod)
