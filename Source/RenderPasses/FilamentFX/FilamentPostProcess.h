@@ -50,8 +50,8 @@ public:
         float ssaoPeak2 = 0.0001f;
         float ssaoProjectionScale = 1.0f;
 
-        // Shadow (dummy shadow map bound, safe to enable in GUI)
-        bool enableShadows = false;
+        // Shadow (safe dummy shadow map + identity matrices, toggle won't crash)
+        bool enableShadows = true;
         int shadowType = 1; // 0: PCF Hard, 1: PCF Low (3x3), 2: VSM
         int shadowCascades = 4;
         float shadowBias = 0.001f;

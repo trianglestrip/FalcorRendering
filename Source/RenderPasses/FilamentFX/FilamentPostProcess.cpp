@@ -242,8 +242,28 @@ void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const 
         cb["gShadowBias"] = settings.shadowBias;
         cb["gShadowAtlasSize"] = uint2(settings.shadowMapSize, settings.shadowMapSize);
     }
+
+    // Initialize ShadowCameraCB with identity matrices (no real shadow casting yet)
+    // These push all transforms outside [0,1] so everything is lit
+    auto shadowCB = var["ShadowCameraCB"];
+    if (shadowCB.isValid())
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            // Identity matrix keeps coordinates in [-1,1] which maps to [0,1] after *0.5+0.5
+            // Use large scale XY to push outside [0,1] → bounds check → visibility=1.0
+            float scaleOut = 100.0f;
+            float4x4 mat;
+            mat[0] = float4(scaleOut, 0, 0, 0);
+            mat[1] = float4(0, scaleOut, 0, 0);
+            mat[2] = float4(0, 0, 1, 0);
+            mat[3] = float4(0, 0, 0, 1);
+            shadowCB["gLightViewProj"][i] = mat;
+        }
+    }
+
     var["gDepth"] = pDepth;
-    var["gShadowMap"] = mpDummyShadowMap;   // Dummy: all 1.0 = no occluders
+    var["gShadowMap"] = mpDummyShadowMap;
     var["gDst"] = mpShadowVisibility;
     var["gPointSampler"] = mpPointSampler;
     var["gLinearSampler"] = mpLinearSampler;
