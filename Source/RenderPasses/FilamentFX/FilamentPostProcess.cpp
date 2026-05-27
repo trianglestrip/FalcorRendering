@@ -179,8 +179,8 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
         {
             cb["gResolution"] = float4((float)resolution.x, (float)resolution.y, 1.f/resolution.x, 1.f/resolution.y);
             // positionParams: invProjection[0][0]*2, invProjection[1][1]*2
-            // For typical 60deg FOV: invProj00 ~= 0.577, invProj11 ~= 1.026 → *2 = 1.155, 2.052
-            cb["gPositionParams"]  = float2(1.155f, 2.052f);
+            // 60deg FOV, 16:9 aspect: invProj00=0.577, invProj11=0.324 → *2 = 1.155, 0.649
+            cb["gPositionParams"]  = float2(1.155f, 0.649f);
             cb["gInvRadiusSquared"] = invRadiusSquared;
             cb["gMinHorizonAngleSineSquared"] = settings.ssaoMinHorizonAngleSineSquared;
             cb["gBias"]      = settings.ssaoBias;

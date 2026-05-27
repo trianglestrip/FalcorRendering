@@ -35,9 +35,9 @@ float interleavedGradientNoise(float2 screenPos)
 // Linearize depth (reversed-Z, like Filament's depthUtils.fs)
 float linearizeDepth(float depth)
 {
-    const float preventDiv0 = 1.0 / 16777216.0;
-    // Simplified perspective linearization: near=0.01, far=inf
-    return 0.01 / max(depth, preventDiv0);
+    // Reversed-Z (D3D12): depth=1→near, depth=0→far
+    // viewZ = nearPlane / depth, with nearPlane≈1.0 for reasonable scene scale
+    return 1.0 / max(depth, 1.0 / 16777216.0);
 }
 
 float sampleDepthLinear(float2 uv, float lod)

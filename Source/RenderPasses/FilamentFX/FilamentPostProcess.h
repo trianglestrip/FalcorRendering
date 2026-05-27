@@ -40,10 +40,10 @@ public:
 
         // SSAO (Filament SAO parameters) - enabled with reversed-Z depth fix
         bool enableSSAO = true;
-        float ssaoRadius = 0.5f;          // world-space radius
+        float ssaoRadius = 1.0f;          // world-space radius (bigger = more AO spread)
         float ssaoBias = 0.005f;          // depth bias
-        float ssaoPower = 1.0f;           // power curve
-        float ssaoIntensity = 1.0f;       // intensity multiplier
+        float ssaoPower = 1.0f;           // power curve (Filament doubles this internally)
+        float ssaoIntensity = 2.0f;       // intensity multiplier (Filament: options.intensity)
         int   ssaoSampleCount = 11;       // Filament MEDIUM quality: 11
         int   ssaoSpiralTurns = 6;        // Filament MEDIUM: 6
         float ssaoMinHorizonAngleSineSquared = 0.0f;
