@@ -14,7 +14,14 @@ cbuffer PerFrameCB
     float gBloomBlendMode; // 0: Add, 1: Screen
     float gAOEnabled;      // 1.0 = enabled, 0.0 = disabled
     float gShadowEnabled;  // 1.0 = enabled, 0.0 = disabled
+    float gDithering;      // 1.0 = enabled
 };
+
+float interleavedGradientNoise(float2 screenPos)
+{
+    float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+    return frac(magic.z * frac(dot(screenPos.xy, magic.xy)));
+}
 
 Texture2D<float4> gSrc;
 Texture2D<float4> gBloom; // Mip 0 from bloom upsample
@@ -71,13 +78,16 @@ void colorGradingMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     int2 coord = int2(dispatchThreadId.xy);
     float2 uv = (float2(coord) + 0.5f) / float2(gResolution);
     
-    float3 color = gSrc.Load(int3(coord, 0)).rgb;
+    float4 src = gSrc.Load(int3(coord, 0));
+    float3 color = src.rgb;
+    // Alpha stores ambient/indirect weight (Filament applies SSAO to indirect only, not direct sun)
+    float ambientWeight = src.a;
 
-    // Apply Ambient Occlusion (clamped to prevent black screen from bad params)
+    // Apply SSAO to indirect term: result = direct + ambient * ao
     if (gAOEnabled > 0.5f) {
         float ao = gAO.Load(int3(coord, 0)).r;
-        ao = clamp(ao, 0.05, 1.0);  // Prevent complete blackout
-        color *= ao;
+        ao = saturate(ao);
+        color *= (1.0 - ambientWeight + ambientWeight * ao);
     }
 
     // Apply Shadow Visibility
@@ -119,5 +129,11 @@ void colorGradingMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         color = saturate(color);
     } // Linear is just pass-through
 
-    gDst[coord] = float4(color, 1.0f);
+    // Filament dithering (reduce banding after tone map)
+    if (gDithering > 0.5f) {
+        float noise = interleavedGradientNoise(float2(coord)) / 255.0;
+        color += noise - 0.5 / 255.0;
+    }
+
+    gDst[coord] = float4(saturate(color), 1.0f);
 }

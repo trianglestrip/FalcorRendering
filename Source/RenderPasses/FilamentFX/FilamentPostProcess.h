@@ -33,10 +33,10 @@ public:
 
         // Bloom
         bool enableBloom = true;
-        float bloomStrength = 0.1f;
+        float bloomStrength = 0.25f;
         int bloomLevels = 6;
         int bloomBlendMode = 0; // 0: Add, 1: Screen
-        float bloomThreshold = 1.0f;
+        float bloomThreshold = 0.0f;
 
         // SSAO (Filament SAO parameters)
         bool enableSSAO = true;
@@ -78,6 +78,17 @@ public:
         float contrast = 1.0f;
         float vibrance = 1.0f;
         float saturation = 1.0f;
+
+        // TAA
+        float taaFeedback = 0.9f;
+
+        // Camera (set each frame by PBRTOfflineRenderer)
+        float4x4 invViewProj = float4x4();
+        float4x4 invProj = float4x4();
+        float nearPlane = 0.1f;
+        float farPlane = 1000.0f;
+        float ssaoBilateralThreshold = 0.05f;
+        float2 positionParams = float2(1.155f, 0.649f); // invProj scale * 2 for x,y
     };
 
     // Custom execution for PBRTOfflineRenderer
@@ -89,6 +100,8 @@ private:
     ref<ComputePass> mpBloomDownsamplePass;
     ref<ComputePass> mpBloomUpsamplePass;
     ref<ComputePass> mpFXAAPass;
+    ref<ComputePass> mpDoFPass;
+    ref<ComputePass> mpTAAPass;
 
     // SSAO passes
     ref<ComputePass> mpSSAOPass;
@@ -101,8 +114,12 @@ private:
     static const uint32_t kMaxBloomLevels = 7;
     ref<Texture> mpBloomMips[kMaxBloomLevels];
     ref<Texture> mpColorGradingTarget;
+    ref<Texture> mpDoFTarget;
+    ref<Texture> mpHistoryColor;
+    ref<Texture> mpHistoryDepth;
     ref<Texture> mpAOBuffer;
     ref<Texture> mpAOBlurTarget;
+    ref<Texture> mpAOBlurTemp;
     ref<Texture> mpShadowVisibility;
     ref<Texture> mpSSAONoiseTexture;
 
@@ -120,4 +137,9 @@ private:
     void createNoiseTexture(ref<Device> pDevice);
     void executeSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
     void executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings, const ref<Texture>& pShadowMapDepth = nullptr);
+    void executeDoF(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings);
+    void executeTAA(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings);
+    void updateHistory(RenderContext* pRenderContext, const ref<Texture>& pColor, const ref<Texture>& pDepth, uint32_t width, uint32_t height);
+    uint32_t mHistoryWidth = 0;
+    uint32_t mHistoryHeight = 0;
 };

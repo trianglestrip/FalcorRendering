@@ -8,7 +8,16 @@ add_plugin(FilamentFX)
 add_library(FilamentPostProcessLib STATIC
     FilamentPostProcess.cpp
     FilamentPostProcess.h
+    Bloom.cs.slang
+    ColorGrading.cs.slang
+    FXAA.cs.slang
+    SSAO.cs.slang
+    ShadowMap.cs.slang
+    DoF.cs.slang
+    TAA.cs.slang
 )
+
+target_copy_shaders(FilamentPostProcessLib RenderPasses/FilamentFX)
 
 # Include path for FilamentPostProcess.h itself
 target_include_directories(FilamentPostProcessLib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -26,6 +35,8 @@ target_sources(FilamentFX PRIVATE
     FXAA.cs.slang
     SSAO.cs.slang
     ShadowMap.cs.slang
+    DoF.cs.slang
+    TAA.cs.slang
 )
 
 target_compile_definitions(FilamentFX PRIVATE BUILDING_FILAMENT_FX)

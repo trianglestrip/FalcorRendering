@@ -6,13 +6,13 @@ target_include_directories(PBRTOfflineRenderer PRIVATE ${CMAKE_SOURCE_DIR}/Sourc
 target_sources(PBRTOfflineRenderer PRIVATE
     PBRTOfflineRenderer.cpp
     PBRTOfflineRenderer.h
+    PBRTOfflineRenderer.3d.slang
+    ShadowDepth.3d.slang
 )
 
 # Link against FilamentPostProcessLib (standalone static library)
 target_link_libraries(PBRTOfflineRenderer PRIVATE FilamentPostProcessLib)
 
-# Copy shader includes to shader dir
-# Copy shader includes to shader dir
 target_copy_shaders(PBRTOfflineRenderer Samples/PBRTOfflineRenderer)
 target_copy_shaders(PBRTOfflineRenderer RenderPasses/FilamentFX)
 

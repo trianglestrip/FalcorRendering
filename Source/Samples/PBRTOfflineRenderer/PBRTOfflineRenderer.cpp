@@ -145,12 +145,25 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     }
 
     auto pInterFbo = Fbo::create(getDevice(), {mpIntermediateTexture}, mpIntermediateDepth);
-    pCtx->clearFbo(pInterFbo.get(), kClear, 1.f, 0, FboAttachmentType::All);
+    // D3D depth [0,1]: clear to 1 (far/sky) so SSAO skips background correctly
+    pCtx->clearFbo(pInterFbo.get(), kClear, 1.f, 1.f, FboAttachmentType::All);
 
     mpScene->update(pCtx, getGlobalClock().getTime());
 
     mpRasterPass->getState()->setFbo(pInterFbo);
     mpScene->rasterize(pCtx, mpRasterPass->getState().get(), mpRasterPass->getVars().get());
+
+    // Camera matrices for shadow / SSAO
+    if (mpScene)
+    {
+        auto pCam = mpScene->getCamera();
+        mFilamentSettings.invViewProj = pCam->getInvViewProjMatrix();
+        mFilamentSettings.nearPlane = pCam->getNearPlane();
+        mFilamentSettings.farPlane = pCam->getFarPlane();
+        auto proj = pCam->getProjMatrix();
+        mFilamentSettings.positionParams = float2(2.0f / proj[0][0], 2.0f / proj[1][1]);
+        mFilamentSettings.invProj = inverse(proj);
+    }
 
     // Sync FilamentSettings to FilamentPostProcess pass
     if (mpFilamentPostProcess && mFilamentSettings.postProcessingEnabled)
@@ -225,6 +238,18 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
             viewGroup.checkbox("Dithering", mFilamentSettings.dithering);
             Gui::DropdownList aaList = {{0, "None"}, {1, "FXAA"}, {2, "TAA"}};
             viewGroup.dropdown("Anti-aliasing", aaList, (uint32_t&)mFilamentSettings.antiAliasing);
+            if (mFilamentSettings.antiAliasing == 2)
+                viewGroup.slider("TAA Feedback", mFilamentSettings.taaFeedback, 0.0f, 0.99f);
+        }
+
+        if (auto lightGroup = g.group("Light (Sun)")) {
+            lightGroup.slider("Intensity", mFilamentSettings.sunIntensity, 0.0f, 200000.0f);
+            lightGroup.rgbColor("Color", mFilamentSettings.sunColor);
+            lightGroup.slider("Dir X", mFilamentSettings.sunDirection.x, -1.0f, 1.0f);
+            lightGroup.slider("Dir Y", mFilamentSettings.sunDirection.y, -1.0f, 1.0f);
+            lightGroup.slider("Dir Z", mFilamentSettings.sunDirection.z, -1.0f, 1.0f);
+            if (lightGroup.button("Normalize Direction"))
+                mFilamentSettings.sunDirection = normalize(mFilamentSettings.sunDirection);
         }
 
         if (mpScene && mpScene->getEnvMap())
