@@ -1,120 +1,121 @@
 ![](docs/images/teaser.png)
 
-# Falcor
+# Falcor — PBRT 离线渲染 + Filament 对齐（当前改动说明）
 
-Falcor is a real-time rendering framework supporting DirectX 12 and Vulkan. It aims to improve productivity of research and prototype projects.
+本仓库在 [NVIDIA Falcor](https://github.com/NVIDIAGameWorks/Falcor) 基础上扩展 **PBRT v4 离线预览** 与 **Filament 风格渲染管线**，分支：`feature/pbrt-offline-renderer`。
 
-Features include:
-* Abstracting many common graphics operations, such as shader compilation, model loading, and scene rendering
-* Raytracing support
-* Python scripting support
-* Render graph system to build modular renderers
-* Common rendering techniques such post-processing effects
-* Unbiased path tracer
-* Integration of various RTX SDKs such as DLSS, RTXDI and NRD
+> 上游完整介绍、特性列表、Python/CUDA/OptiX 说明见 [官方 README](https://github.com/NVIDIAGameWorks/Falcor/blob/master/README.md) 与 [文档索引](./docs/index.md)。
 
-## Prerequisites
-- Windows 10 version 20H2 (October 2020 Update) or newer, OS build revision .789 or newer
-- Visual Studio 2022
-- [Windows 10 SDK (10.0.19041.0) for Windows 10, version 2004](https://developer.microsoft.com/en-us/windows/downloads/windows-10-sdk/)
-- A GPU which supports DirectX Raytracing, such as the NVIDIA Titan V or GeForce RTX
-- NVIDIA driver 466.11 or newer
+---
 
-Optional:
-- Windows 10 Graphics Tools. To run DirectX 12 applications with the debug layer enabled, you must install this. There are two ways to install it:
-    - Click the Windows button and type `Optional Features`, in the window that opens click `Add a feature` and select `Graphics Tools`.
-    - Download an offline package from [here](https://docs.microsoft.com/en-us/windows-hardware/test/hlk/windows-hardware-lab-kit#supplemental-content-for-graphics-media-and-mean-time-between-failures-mtbf-tests). Choose a ZIP file that matches the OS version you are using (not the SDK version used for building Falcor). The ZIP includes a document which explains how to install the graphics tools.
-- NVAPI, CUDA, OptiX (see below)
+## 当前改动摘要
 
-## Building Falcor
-Falcor uses the [CMake](https://cmake.org) build system. Additional information on how to use Falcor with CMake is available in the [CMake](docs/development/cmake.md) development documetation page.
+### 1. `Source/Samples/PBRTOfflineRenderer` — Kitchen 场景样例
 
-### Visual Studio
-If you are working with Visual Studio 2022, you can setup a native Visual Studio solution by running `setup_vs2022.bat` after cloning this repository. The solution files are written to `build/windows-vs2022` and the binary output is located in `build/windows-vs2022/bin`.
+- 加载 PBRT v4 场景（网格、材质、相机、面光源），输出 PNG
+- 前向着色：`PBRTOfflineRenderer.3d.slang` 内接 Filament IBL split-sum、SSAO/GTAO、CSM 阴影采样
+- UI 分组贴近 Filament `gltf_viewer`：Sun/IBL、阴影、后处理参数可调
+- 默认场景：`scene-v4.pbrt`（可用 `--scene` / `--output` 指定）
 
-### Visual Studio Code
-If you are working with Visual Studio Code, run `setup.bat` after cloning this repository. This will setup a VS Code workspace in the `.vscode` folder with sensible defaults (only if `.vscode` does not exist yet). When opening the project folder in VS Code, it will prompt to install recommended extensions. We recommend you do, but at least make sure that _CMake Tools_ is installed. To build Falcor, you can select the configure preset by executing the _CMake: Select Configure Preset_ action (Ctrl+Shift+P). Choose the _Windows Ninja/MSVC_ preset. Then simply hit _Build_ (or press F7) to build the project. The binary output is located in `build/windows-ninja-msvc/bin`.
+### 2. `Source/RenderPasses/FilamentFX` — 后处理静态库
 
-Warning: Do not start VS Code from _Git Bash_, it will modify the `PATH` environment variable to an incompatible format, leading to issues with CMake.
+| 模块 | 说明 |
+|------|------|
+| `FilamentPostProcess` | 帧调度：TAA → DoF → Fog → Bloom → Color Grading → FXAA → FSR |
+| `StructurePass` | 深度 Mipmap 金字塔，供 SSAO/SSR stub 使用 |
+| `SSAO` / `GTAO` | SAO 默认路径；UI 可切换 GTAO；半分辨率 + 前向双边上采样 |
+| `ShadowEVSM` | CSM 图集 + PCF/VSM/EVSM 矩模糊链 |
+| `ColorGrading` | CPU 烘焙 3D LUT |
+| `Fog` / `FSR` | 体积雾；FSR 为 RCAS 锐化（非完整 EASU） |
+| `FilamentIBL` / `FilamentAO` / `FilamentShadow` | 共享 Slang 头：IBL、AO 评估、阴影采样 |
 
-### Linux
-Falcor has experimental support for Ubuntu 22.04. To build Falcor on Linux, run `setup.sh` after cloning this repository. You also need to install some system library headers using:
+**帧序：** Shadow CSM → Depth prepass → Structure+SSAO/GTAO → Forward(Color+IBL+AO+Shadow) → Post
 
+**资产：** `data/ibl/lightroom_14b/`、`dfg.dds` 部署至 `bin/Release/data/ibl/`
+
+### 3. Mogwai 插件
+
+- `FilamentPostProcess::execute()` 支持可选 depth / motionVec / shadowMap 输入，便于 RenderGraph 复用
+
+### 4. 已实现 vs 简化
+
+| 已实现（Wave 0–3） | 简化 / 未实现 |
+|-------------------|---------------|
+| IBL、CSM、TAA Halton jitter、SSAO 半分辨率 | 完整 SSR 光线步进 |
+| VSM/EVSM、3D LUT、Fog、GTAO 可选 | FSR EASU 动态分辨率 |
+| FSR RCAS、独立 depth prepass | Froxel 点光、SSCT、Lens Flare |
+
+详细对照见 [Filament_vs_Falcor_Comparison.md](./docs/development/Filament_vs_Falcor_Comparison.md) §12。
+
+---
+
+## 构建（Windows / VS2022）
+
+首次配置：
+
+```bat
+cd D:\gitProject\FalcorRendering
+setup_vs2022.bat
 ```
-sudo apt install xorg-dev libgtk-3-dev
+
+日常最小编译（推荐）：
+
+```bat
+build_pbrt_renderer.bat
 ```
 
-You can use the same instructions for building Falcor as described in the _Visual Studio Code_ section above, simply choose the _Linux/GCC_ preset.
+| 模式 | 命令 | 说明 |
+|------|------|------|
+| 增量（默认） | `build_pbrt_renderer.bat` | 仅编译 `PBRTOfflineRenderer` 及变更依赖，`/m:1` |
+| 全量链式 | `build_pbrt_renderer.bat full` | Falcor → FilamentPostProcessLib → App |
+| 清缓存 | `build_pbrt_renderer.bat clean` | Clean 后增量编译 |
 
-### Configure Presets
-Falcor uses _CMake Presets_ store in `CMakePresets.json` to provide a set of commonly used build configurations. You can get the full list of available configure presets running `cmake --list-presets`:
+产物：`build\windows-vs2022\bin\Release\PBRTOfflineRenderer.exe`
 
+> **注意：** 勿对全 solution 使用 `-j` 或 `/m:8`，易触发 `LNK1104`/`LNK1181`（`ScriptBindings.obj`、`cmake_pch.obj` 竞争）。
+
+## 运行
+
+```bat
+render_kitchen.bat
 ```
-$ cmake --list-presets
-Available configure presets:
 
-  "windows-vs2022"           - Windows VS2022
-  "windows-ninja-msvc"       - Windows Ninja/MSVC
-  "linux-clang"              - Linux Ninja/Clang
-  "linux-gcc"                - Linux Ninja/GCC
+或手动：
+
+```bat
+build\windows-vs2022\bin\Release\PBRTOfflineRenderer.exe --scene D:\gitProject\VLR_WF\models\kitchen\scene-v4.pbrt --output scene-v4_render.png
 ```
 
-Use `cmake --preset <preset name>` to generate the build tree for a given preset. The build tree is written to the `build/<preset name>` folder and the binary output files are in `build/<preset name>/bin`.
+---
 
-An existing build tree can be compiled using `cmake --build build/<preset name>`.
+## 与 Filament 分支的关系
 
-## Falcor In Python
-For more information on how to use Falcor as a Python module see [Falcor In Python](docs/falcor-in-python.md).
+[filament](https://github.com/trianglestrip/filament) 的 `feature/pbrt-kitchen` 在原生 Filament 上验证 PBRT 几何与矩形面光源；本分支在 **Falcor** 上实现 Filament 风格后处理与 IBL 对齐，用于 kitchen 场景观感交叉对比。
 
-## Microsoft DirectX 12 Agility SDK
-Falcor uses the [Microsoft DirectX 12 Agility SDK](https://devblogs.microsoft.com/directx/directx12agility/) to get access to the latest DirectX 12 features. Applications can enable the Agility SDK by putting `FALCOR_EXPORT_D3D12_AGILITY_SDK` in the main `.cpp` file. `Mogwai`, `FalcorTest` and `RenderGraphEditor` have the Agility SDK enabled by default.
+---
 
-## NVAPI
-To enable NVAPI support, head over to https://developer.nvidia.com/nvapi and download the latest version of NVAPI (this build is tested against version R535).
-Extract the content of the zip file into `external/packman/` and rename `R535-developer` to `nvapi`.
+## 上游 Falcor 构建与环境
 
-## NSight Aftermath
-To enable NSight Aftermath support, head over to https://developer.nvidia.com/nsight-aftermath and download the latest version of Aftermath (this build is tested against version 2023.1).
-Extract the content of the zip file into `external/packman/aftermath`.
+- **前置条件：** Windows 10 20H2+、VS2022、Windows 10 SDK 10.0.19041.0、支持 DXR 的 GPU
+- **CMake Presets：** `windows-vs2022`（VS 方案）、`windows-ninja-msvc`（VS Code）
+- **可选：** NVAPI、CUDA、OptiX、DLSS/RTXDI/NRD — 见 [官方 README](https://github.com/NVIDIAGameWorks/Falcor/blob/master/README.md)
 
-## CUDA
-To enable CUDA support, download and install [CUDA 11.6.2](https://developer.nvidia.com/cuda-11-6-2-download-archive) or later and reconfigure the build.
+## 相关文档
 
-See the `CudaInterop` sample application located in `Source/Samples/CudaInterop` for an example of how to use CUDA.
-
-## OptiX
-If you want to use Falcor's OptiX functionality (specifically the `OptixDenoiser` render pass) download the [OptiX SDK](https://developer.nvidia.com/designworks/optix/download) (Falcor is currently tested against OptiX version 7.3) After running the installer, link or copy the OptiX SDK folder into `external/packman/optix` (i.e., file `external/packman/optix/include/optix.h` should exist).
-
-Note: You also need CUDA installed to compile the `OptixDenoiser` render pass, see above for details.
-
-## NVIDIA RTX SDKs
-Falcor ships with the following NVIDIA RTX SDKs:
-
-- DLSS (https://github.com/NVIDIA/DLSS)
-- RTXDI (https://github.com/NVIDIAGameWorks/RTXDI)
-- NRD (https://github.com/NVIDIAGameWorks/RayTracingDenoiser)
-
-Note that these SDKs are not under the same license as Falcor, see [LICENSE.md](LICENSE.md) for details.
-
-## Resources
-- [Falcor](https://github.com/NVIDIAGameWorks/Falcor): Falcor's GitHub page.
-- [Documentation](./docs/index.md): Additional information and tutorials.
-    - [Getting Started](./docs/getting-started.md)
-    - [Render Graph Tutorials](./docs/tutorials/index.md)
-- [Rendering Resources](https://benedikt-bitterli.me/resources) A collection of scenes loadable in Falcor (pbrt-v4 format).
-- [ORCA](https://developer.nvidia.com/orca): A collection of scenes and assets optimized for Falcor.
-- [Slang](https://github.com/shader-slang/slang): Falcor's shading language and compiler.
+- [current-architecture.md](./docs/development/current-architecture.md) §7 — PBRTOfflineRenderer 架构
+- [Filament_vs_Falcor_Comparison.md](./docs/development/Filament_vs_Falcor_Comparison.md) — 逐项对齐表
+- [Filament_Strict_Implementation.md](./docs/development/Filament_Strict_Implementation.md) — 实现约束
 
 ## Citation
-If you use Falcor in a research project leading to a publication, please cite the project.
-The BibTex entry is
+
+若在研究项目中引用 Falcor，请引用上游项目：
 
 ```bibtex
 @Misc{Kallweit22,
    author =      {Simon Kallweit and Petrik Clarberg and Craig Kolb and Tom{'a}{\v s} Davidovi{\v c} and Kai-Hwa Yao and Theresa Foley and Yong He and Lifan Wu and Lucy Chen and Tomas Akenine-M{\"o}ller and Chris Wyman and Cyril Crassin and Nir Benty},
    title =       {The {Falcor} Rendering Framework},
    year =        {2022},
-   month =       {8},
+   month =        {8},
    url =         {https://github.com/NVIDIAGameWorks/Falcor},
    note =        {\url{https://github.com/NVIDIAGameWorks/Falcor}}
 }
