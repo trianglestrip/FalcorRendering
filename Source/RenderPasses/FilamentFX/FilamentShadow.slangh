@@ -1,8 +1,15 @@
-// Filament-style shadow sampling for forward shading (PCF Hard + Castano 3x3 Low)
-// Shared by PBRTOfflineRenderer.3d.slang and ShadowMap.cs.slang
+// Filament-style shadow sampling for forward shading (PCF Hard/Low + EVSM/VSM)
+// Shared by PBRTOfflineRenderer.3d.slang, ShadowMap.cs.slang
 
 #define SHADOW_TYPE_PCF_HARD 0u
 #define SHADOW_TYPE_PCF_LOW  1u
+#define SHADOW_TYPE_VSM      2u
+
+// Default EVSM parameters (Filament VsmShadowOptions / half-precision path)
+static const float kVsmExponent = 5.2;
+static const float kVsmMaxMoment = 65504.0;
+static const float kVsmLightBleedReduction = 0.15;
+static const float kVsmEpsilonMultiplier = 0.002;
 
 // Select cascade based on view-space depth (world distance from camera)
 int selectShadowCascade(float viewSpaceDepth, uint cascadeCount, float4 cascadeSplits)
@@ -39,6 +46,63 @@ float shadowSample_PCF_Low(Texture2D<float> shadowMap, SamplerState sampler, flo
     return sum / 16.0;
 }
 
+// Filament surface_shadowing.fs - Chebyshev upper bound with light bleeding reduction
+float chebyshevUpperBound(float2 moments, float depth, float minVariance, float lbrAmount)
+{
+    if (depth <= moments.x)
+        return 1.0;
+
+    float variance = max(moments.y - moments.x * moments.x, minVariance);
+    float d = depth - moments.x;
+    float pMax = variance / (variance + d * d);
+    return saturate((pMax - lbrAmount) / (1.0 - lbrAmount));
+}
+
+// Filament evaluateEVSM (positive wrap only; RG moments = exp(c*z), exp(2*c*z))
+float evaluateEVSM(float2 moments, float zReceiver, float2 dzduv, float2 texelSize, float c, float lbrAmount)
+{
+    float2 texelDzduv = dzduv * texelSize;
+    float dz2 = dot(texelDzduv, texelDzduv);
+
+    // Remap depth to [-1, 1] then positive exponential wrap
+    float depth = zReceiver * 2.0 - 1.0;
+    float pw = exp(c * depth);
+    float epsilon = kVsmEpsilonMultiplier * (pw * pw);
+    float dpwdz = 2.0 * c * pw;
+    float pMinVariance = epsilon + 0.25 * (dpwdz * dpwdz) * dz2;
+    return chebyshevUpperBound(moments, pw, pMinVariance, lbrAmount);
+}
+
+// Receiver-plane depth bias (GDC 2006) - derivatives of light-space depth w.r.t. UV
+float2 computeReceiverPlaneDepthBias(float3 position)
+{
+    float3 duvzDx = dFdx(position);
+    float3 duvzDy = dFdy(position);
+    float2x2 duv = float2x2(duvzDx.xy, duvzDy.xy);
+    float det = duv[0][0] * duv[1][1] - duv[0][1] * duv[1][0];
+    if (abs(det) < 1e-8)
+        return float2(0.0, 0.0);
+    float2x2 invDuv = float2x2(duv[1][1], -duv[0][1], -duv[1][0], duv[0][0]) / det;
+    return mul(invDuv, float2(duvzDx.z, duvzDy.z));
+}
+
+float shadowSample_EVSM(
+    Texture2D<float2> shadowMoments,
+    SamplerState sampler,
+    float2 atlasUV,
+    float2 cascadeUV,
+    float referenceDepth,
+    float2 tileSize,
+    float c,
+    float lbrAmount)
+{
+    float2 texelSize = 1.0 / tileSize;
+    float2 moments = shadowMoments.SampleLevel(sampler, atlasUV, 0).rg;
+    float3 position = float3(cascadeUV, referenceDepth);
+    float2 dzduv = computeReceiverPlaneDepthBias(position);
+    return evaluateEVSM(moments, referenceDepth, dzduv, texelSize, c, lbrAmount);
+}
+
 // World position -> shadow visibility [0,1]
 float evaluateShadowVisibility(
     float3 worldPos,
@@ -52,7 +116,10 @@ float evaluateShadowVisibility(
     float4 cascadeAtlasRect[4],
     float2 shadowAtlasSize,
     Texture2D<float> shadowMap,
-    SamplerState shadowSampler)
+    Texture2D<float2> shadowMoments,
+    SamplerState shadowSampler,
+    float vsmExponent,
+    float vsmLightBleedReduction)
 {
     if (shadowEnabled == 0u)
         return 1.0;
@@ -72,10 +139,34 @@ float evaluateShadowVisibility(
 
     float referenceDepth = lightSpacePos.z - shadowBias;
 
-    // Per-cascade tile resolution for PCF texel size
+    // Per-cascade tile resolution
     float2 tileSize = shadowAtlasSize * atlasRect.zw;
+
+    if (shadowType == SHADOW_TYPE_VSM)
+    {
+        float c = (vsmExponent > 0.0) ? vsmExponent : kVsmExponent;
+        float lbr = (vsmLightBleedReduction >= 0.0) ? vsmLightBleedReduction : kVsmLightBleedReduction;
+        return shadowSample_EVSM(shadowMoments, shadowSampler, atlasUV, shadowUV, referenceDepth, tileSize, c, lbr);
+    }
 
     if (shadowType == SHADOW_TYPE_PCF_LOW)
         return shadowSample_PCF_Low(shadowMap, shadowSampler, atlasUV, referenceDepth, tileSize);
     return shadowSample_PCF_Hard(shadowMap, shadowSampler, atlasUV, referenceDepth);
+}
+
+// Filament surface_depth_main.fs - EVSM moment generation for shadow depth pass
+// depth: light-space depth in [0, 1]
+float2 computeDepthMomentsVSM(float depth, float c, float maxMoment)
+{
+    float wrappedDepth = depth * 2.0 - 1.0;
+    float z = exp(c * wrappedDepth);
+    float m1 = z;
+    float m2 = z * z;
+
+    float dzdx = dFdx(wrappedDepth);
+    float dzdy = dFdy(wrappedDepth);
+    float linearVariance = 0.25 * (dzdx * dzdx + dzdy * dzdy);
+    float analyticVariance = c * c * m2 * linearVariance;
+    m2 = min(m2 + analyticVariance, maxMoment);
+    return float2(m1, m2);
 }

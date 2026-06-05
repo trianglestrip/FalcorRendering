@@ -1,25 +1,92 @@
 #include "FilamentPostProcess.h"
+#include <cmath>
 #include <random>
+#include <vector>
 
 namespace
 {
     const char kSrc[] = "src";
     const char kDst[] = "dst";
+    const char kDepth[] = "depth";
+    const char kMotionVec[] = "motionVec";
+    const char kShadowMap[] = "shadowMap";
+
+    const char kEnableFog[] = "enableFog";
+    const char kFogDensity[] = "fogDensity";
+    const char kFogStart[] = "fogStart";
+    const char kFogColor[] = "fogColor";
+    const char kEnableSSR[] = "enableSSR";
+    const char kEnableBloom[] = "enableBloom";
+    const char kEnableSSAO[] = "enableSSAO";
+    const char kEnableDoF[] = "enableDoF";
+    const char kAntiAliasing[] = "antiAliasing";
+    const char kPostProcessingEnabled[] = "postProcessingEnabled";
+
     const char kColorGradingShader[] = "RenderPasses/FilamentFX/ColorGrading.cs.slang";
     const char kBloomShader[] = "RenderPasses/FilamentFX/Bloom.cs.slang";
     const char kFXAAShader[] = "RenderPasses/FilamentFX/FXAA.cs.slang";
     const char kStructureShader[] = "RenderPasses/FilamentFX/StructurePass.cs.slang";
     const char kSSAOShader[] = "RenderPasses/FilamentFX/SSAO.cs.slang";
     const char kShadowMapShader[] = "RenderPasses/FilamentFX/ShadowMap.cs.slang";
+    const char kShadowEVSMShader[] = "RenderPasses/FilamentFX/ShadowEVSM.cs.slang";
     const char kDoFShader[] = "RenderPasses/FilamentFX/DoF.cs.slang";
+    const char kFogShader[] = "RenderPasses/FilamentFX/Fog.cs.slang";
+    const char kFSRShader[] = "RenderPasses/FilamentFX/FSR.cs.slang";
+    const char kGTAOShader[] = "RenderPasses/FilamentFX/GTAO.cs.slang";
     const char kTAAShader[] = "RenderPasses/FilamentFX/TAA.cs.slang";
 
     const uint32_t kNoiseTextureSize = 4; // 4x4 noise texture for SSAO
     const uint32_t kMaxStructureLevels = 8;
+
+    float3 colorGradeCPU(float3 color, float exposure, float contrast, float saturation, float vibrance)
+    {
+        color *= std::exp2(exposure);
+        color = saturate(color);
+        color = pow(color, float3(contrast));
+        const float luma = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+        color = lerp(float3(luma), color, saturation);
+        const float maxColor = std::max(color.x, std::max(color.y, color.z));
+        const float minColor = std::min(color.x, std::min(color.y, color.z));
+        const float sat = maxColor - minColor;
+        const float sign = maxColor > 0.0f ? 1.0f : (maxColor < 0.0f ? -1.0f : 0.0f);
+        color = lerp(float3(luma), color, 1.0f + (vibrance * (1.0f - (sign * sat))));
+        return color;
+    }
+}
+
+void FilamentPostProcess::parseProperties(const Properties& props)
+{
+    for (const auto& [key, value] : props)
+    {
+        if (key == kPostProcessingEnabled)
+            mSettings.postProcessingEnabled = value;
+        else if (key == kAntiAliasing)
+            mSettings.antiAliasing = value;
+        else if (key == kEnableBloom)
+            mSettings.enableBloom = value;
+        else if (key == kEnableSSAO)
+            mSettings.enableSSAO = value;
+        else if (key == kEnableDoF)
+            mSettings.enableDoF = value;
+        else if (key == kEnableFog)
+            mSettings.enableFog = value;
+        else if (key == kFogDensity)
+            mSettings.fogDensity = value;
+        else if (key == kFogStart)
+            mSettings.fogStart = value;
+        else if (key == kFogColor)
+            mSettings.fogColor = value;
+        else if (key == kEnableSSR)
+            mSettings.enableSSR = value;
+        else
+            logWarning("Unknown property '{}' in FilamentPostProcess properties.", key);
+    }
 }
 
 FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 {
+    parseProperties(props);
+
     DefineList defines;
     
     // Color Grading prep (AO/shadow before TAA) + composite (bloom/grading after DoF)
@@ -78,11 +145,32 @@ FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& 
     shadowDesc.addCompilerArguments({"-Wno-30081"});
     mpShadowMapPass = ComputePass::create(mpDevice, shadowDesc, defines);
 
+    ProgramDesc evsmBlurDesc;
+    evsmBlurDesc.addShaderLibrary(kShadowEVSMShader).csEntry("evsmBlur");
+    evsmBlurDesc.addCompilerArguments({"-Wno-30081"});
+    mpShadowEVSMBlurPass = ComputePass::create(mpDevice, evsmBlurDesc, defines);
+
     // Depth of Field
     ProgramDesc dofDesc;
     dofDesc.addShaderLibrary(kDoFShader).csEntry("dofMain");
     dofDesc.addCompilerArguments({"-Wno-30081"});
     mpDoFPass = ComputePass::create(mpDevice, dofDesc, defines);
+
+    // Fog
+    ProgramDesc fogDesc;
+    fogDesc.addShaderLibrary(kFogShader).csEntry("fogMain");
+    fogDesc.addCompilerArguments({"-Wno-30081"});
+    mpFogPass = ComputePass::create(mpDevice, fogDesc, defines);
+
+    ProgramDesc fsrDesc;
+    fsrDesc.addShaderLibrary(kFSRShader).csEntry("fsrRcasMain");
+    fsrDesc.addCompilerArguments({"-Wno-30081"});
+    mpFSRPass = ComputePass::create(mpDevice, fsrDesc, defines);
+
+    ProgramDesc gtaoDesc;
+    gtaoDesc.addShaderLibrary(kGTAOShader).csEntry("gtaoMain");
+    gtaoDesc.addCompilerArguments({"-Wno-30081"});
+    mpGTAOPass = ComputePass::create(mpDevice, gtaoDesc, defines);
 
     // TAA
     ProgramDesc taaDesc;
@@ -114,10 +202,64 @@ FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& 
     mpDummyShadowMap = pDevice->createTexture2D(1, 1, ResourceFormat::R32Float, 1, 1, &onePixel,
         ResourceBindFlags::ShaderResource);
 
+    // Dummy EVSM moments (fully lit)
+    float litMoments[2] = {65504.f, 65504.f};
+    mpDummyShadowMoments = pDevice->createTexture2D(1, 1, ResourceFormat::RG32Float, 1, 1, litMoments,
+        ResourceBindFlags::ShaderResource);
+
     // Zero motion vector fallback (RG32Float)
     float zeroMotion[2] = {0.f, 0.f};
     mpZeroMotionTexture = pDevice->createTexture2D(1, 1, ResourceFormat::RG32Float, 1, 1, zeroMotion,
         ResourceBindFlags::ShaderResource);
+
+    // 1x1x1 fallback when LUT path is disabled
+    float identityLUT[4] = {1.f, 1.f, 1.f, 1.f};
+    mpIdentityLUT = pDevice->createTexture3D(1, 1, 1, ResourceFormat::RGBA16Float, 1, identityLUT,
+        ResourceBindFlags::ShaderResource);
+
+    // Procedural 3D color grading LUT (exposure/contrast/saturation/vibrance baked on change)
+    FilamentSettings defaultLUTSettings;
+    updateColorGradingLUT(pDevice, defaultLUTSettings);
+}
+
+void FilamentPostProcess::updateColorGradingLUT(ref<Device> pDevice, const FilamentSettings& settings)
+{
+    const uint32_t size = (uint32_t)(settings.lutSize == 16 ? 16 : 32);
+    const bool needsRebuild = !mpColorLUT || mLUTSize != size
+        || mLUTExposure != settings.exposure || mLUTContrast != settings.contrast
+        || mLUTVibrance != settings.vibrance || mLUTSaturation != settings.saturation;
+    if (!needsRebuild)
+        return;
+
+    const size_t voxelCount = size_t(size) * size * size;
+    std::vector<float> lutData(voxelCount * 4);
+    const float denom = (size > 1) ? float(size - 1) : 1.0f;
+
+    for (uint32_t z = 0; z < size; ++z)
+    {
+        for (uint32_t y = 0; y < size; ++y)
+        {
+            for (uint32_t x = 0; x < size; ++x)
+            {
+                const float3 input(float(x) / denom, float(y) / denom, float(z) / denom);
+                const float3 graded = colorGradeCPU(input, settings.exposure, settings.contrast, settings.saturation, settings.vibrance);
+                const size_t idx = (size_t(z) * size * size + size_t(y) * size + x) * 4;
+                lutData[idx + 0] = graded.x;
+                lutData[idx + 1] = graded.y;
+                lutData[idx + 2] = graded.z;
+                lutData[idx + 3] = 1.0f;
+            }
+        }
+    }
+
+    mpColorLUT = pDevice->createTexture3D(size, size, size, ResourceFormat::RGBA16Float, 1, lutData.data(),
+        ResourceBindFlags::ShaderResource);
+
+    mLUTSize = size;
+    mLUTExposure = settings.exposure;
+    mLUTContrast = settings.contrast;
+    mLUTVibrance = settings.vibrance;
+    mLUTSaturation = settings.saturation;
 }
 
 void FilamentPostProcess::createNoiseTexture(ref<Device> pDevice)
@@ -384,7 +526,69 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
     }
 }
 
-void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings, const ref<Texture>& pShadowMapDepth)
+void FilamentPostProcess::blurShadowMoments(RenderContext* pRenderContext, const ref<Texture>& pMoments, const ref<Texture>& pTemp, const FilamentSettings& settings)
+{
+    if (!mpShadowEVSMBlurPass || !pMoments || !pTemp || settings.vsmBlurWidth <= 0.f)
+        return;
+
+    const uint32_t atlasSize = settings.shadowMapSize;
+    const uint2 resolution = uint2(atlasSize, atlasSize);
+    const float blurWidth = settings.vsmBlurWidth;
+    const float sigma = blurWidth / 2.5f;
+    const int radius = std::min(int(std::ceil(blurWidth)), 31);
+    const int sampleCount = radius + 1;
+
+    float kernel[32] = {};
+    float sum = 0.f;
+    for (int i = 0; i <= radius; ++i)
+    {
+        kernel[i] = std::exp(-(float(i * i) / (2.f * sigma * sigma)));
+        sum += (i == 0) ? kernel[i] : (2.f * kernel[i]);
+    }
+    const float invSum = 1.f / sum;
+    for (int i = 0; i <= radius; ++i)
+        kernel[i] *= invSum;
+
+    const int2 dirs[2] = {int2(1, 0), int2(0, 1)};
+    ref<Texture> blurInput = pMoments;
+    ref<Texture> blurOutput = pTemp;
+    const uint32_t cascadeCount = (uint32_t)std::clamp(settings.shadowCascades, 1, 4);
+
+    for (uint32_t pass = 0; pass < 2; ++pass)
+    {
+        for (uint32_t c = 0; c < cascadeCount; ++c)
+        {
+            const float4& rect = settings.cascadeAtlasRect[c];
+            const int2 boundsMin = int2(
+                int(std::floor(rect.x * float(atlasSize))),
+                int(std::floor(rect.y * float(atlasSize))));
+            const int2 boundsMax = int2(
+                int(std::ceil((rect.x + rect.z) * float(atlasSize))) - 1,
+                int(std::ceil((rect.y + rect.w) * float(atlasSize))) - 1);
+
+            auto var = mpShadowEVSMBlurPass->getRootVar();
+            auto cb = var["PerFrameCB"];
+            if (cb.isValid())
+            {
+                cb["gResolution"] = resolution;
+                cb["gBlurDir"] = dirs[pass];
+                cb["gBlurRadius"] = radius;
+                cb["gBlurSampleCount"] = sampleCount;
+                cb["gBoundsMin"] = boundsMin;
+                cb["gBoundsMax"] = boundsMax;
+                for (int i = 0; i < sampleCount; ++i)
+                    cb["gBlurKernel"][i] = kernel[i];
+            }
+            var["gSrcMoments"] = blurInput;
+            var["gDstMoments"].setUav(blurOutput->getUAV(0));
+            var["gPointSampler"] = mpPointSampler;
+            mpShadowEVSMBlurPass->execute(pRenderContext, uint3(atlasSize, atlasSize, 1));
+        }
+        std::swap(blurInput, blurOutput);
+    }
+}
+
+void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings, const ref<Texture>& pShadowMapDepth, const ref<Texture>& pShadowMoments)
 {
     if (!mpShadowMapPass || !pDepth) return;
 
@@ -396,19 +600,18 @@ void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const 
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
     }
 
-    uint32_t shadowType = (uint32_t)settings.shadowType;
-    if (shadowType == 2) shadowType = 1; // VSM not fully implemented, use PCF Low
-
     auto var = mpShadowMapPass->getRootVar();
     auto cb = var["PerFrameCB"];
     if (cb.isValid())
     {
         cb["gResolution"] = resolution;
-        cb["gShadowType"] = shadowType;
+        cb["gShadowType"] = (uint32_t)settings.shadowType;
         cb["gCascadeCount"] = (uint32_t)settings.shadowCascades;
         cb["gCascadeSplits"] = settings.cascadeSplits;
         cb["gShadowBias"] = settings.shadowBias;
         cb["gShadowAtlasSize"] = uint2(settings.shadowMapSize, settings.shadowMapSize);
+        cb["gVsmExponent"] = settings.vsmExponent;
+        cb["gVsmLightBleedReduction"] = settings.vsmLightBleedReduction;
     }
 
     auto camCB = var["CameraCB"];
@@ -420,6 +623,7 @@ void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const 
 
     var["gDepth"] = pDepth;
     var["gShadowMap"] = pShadowMapDepth ? pShadowMapDepth : mpDummyShadowMap;
+    var["gShadowMoments"] = pShadowMoments ? pShadowMoments : mpDummyShadowMoments;
     var["gDst"] = mpShadowVisibility;
     var["gPointSampler"] = mpPointSampler;
 
@@ -456,6 +660,44 @@ void FilamentPostProcess::executeDoF(RenderContext* pRenderContext, const ref<Te
     var["gDst"] = pDst;
     var["gLinearSampler"] = mpLinearSampler;
     mpDoFPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
+}
+
+void FilamentPostProcess::executeFog(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings)
+{
+    if (!mpFogPass || !pSrc || !pDepth || !pDst || !settings.enableFog) return;
+    const uint2 resolution = uint2(pSrc->getWidth(), pSrc->getHeight());
+
+    auto var = mpFogPass->getRootVar();
+    auto cb = var["PerFrameCB"];
+    if (cb.isValid())
+    {
+        cb["gResolution"] = resolution;
+        cb["gFogEnabled"] = 1.0f;
+        cb["gFogDensity"] = settings.fogDensity;
+        cb["gFogStart"] = settings.fogStart;
+        cb["gFogColor"] = settings.fogColor;
+    }
+    auto camCB = var["CameraCB"];
+    if (camCB.isValid())
+    {
+        camCB["gInvProj"] = settings.invProj;
+        camCB["gInvViewProj"] = settings.invViewProj;
+        camCB["gNearPlane"] = settings.nearPlane;
+        camCB["gFarPlane"] = settings.farPlane;
+        camCB["gCameraPos"] = settings.cameraPos;
+    }
+    var["gSrc"] = pSrc;
+    var["gDepth"] = pDepth;
+    var["gDst"] = pDst;
+    var["gLinearSampler"] = mpLinearSampler;
+    mpFogPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
+}
+
+void FilamentPostProcess::executeSSR(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings)
+{
+    if (!settings.enableSSR || !pDepth) return;
+    // Stub: build structure depth pyramid for a future SSR trace pass.
+    executeStructure(pRenderContext, pDepth);
 }
 
 void FilamentPostProcess::updateHistory(RenderContext* pRenderContext, const ref<Texture>& pColor, const ref<Texture>& pDepth, uint32_t width, uint32_t height)
@@ -507,11 +749,98 @@ void FilamentPostProcess::executeTAA(RenderContext* pRenderContext, const ref<Te
     mpTAAPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
 }
 
+void FilamentPostProcess::executeGTAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings)
+{
+    if (!mpGTAOPass || !mpSSAOBlurPass || !pDepth || !mpStructureDepth) return;
+
+    const uint2 fullResolution = uint2(pDepth->getWidth(), pDepth->getHeight());
+    updateAOTextures(mpDevice, fullResolution.x, fullResolution.y, settings.ssaoResolution);
+    const uint2 resolution = uint2(mAOBufferWidth, mAOBufferHeight);
+
+    float sampleCount = (float)settings.ssaoSampleCount;
+    float radius = settings.gtaoRadius;
+    float peak = 0.1f * radius;
+    float intensity = (6.283185307f * peak * settings.ssaoIntensity) / sampleCount;
+    float power = settings.ssaoPower * 2.0f;
+
+    {
+        auto var = mpGTAOPass->getRootVar();
+        auto cb = var["PerFrameCB"];
+        if (cb.isValid())
+        {
+            cb["gResolution"] = float4((float)resolution.x, (float)resolution.y, 1.f / resolution.x, 1.f / resolution.y);
+            cb["gIntensity"] = intensity;
+            cb["gPower"] = power;
+            cb["gInvFarPlane"] = 1.0f / std::max(settings.farPlane, 1.0f);
+            cb["gPositionParams"] = settings.positionParams;
+            cb["gGtaoRadius"] = settings.gtaoRadius;
+            cb["gGtaoSlices"] = settings.gtaoSlices;
+            cb["gGtaoSteps"] = settings.gtaoSteps;
+        }
+        auto camCB = var["CameraCB"];
+        if (camCB.isValid())
+            camCB["gInvProj"] = settings.invProj;
+        var["gStructureDepth"] = mpStructureDepth;
+        var["gDst"] = mpAOBuffer;
+        var["gPointSampler"] = mpPointSampler;
+        mpGTAOPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
+    }
+
+    const float farPlaneOverEdgeDistance = settings.farPlane / std::max(settings.ssaoBilateralThreshold, 1e-4f);
+    const float2 axes[2] = { float2(1.f / resolution.x, 0.f), float2(0.f, 1.f / resolution.y) };
+    const float bilateralStdDev = 4.0f;
+    const uint32_t gaussianSampleCount = 6;
+    float kGaussianSamples[16] = {};
+    for (uint32_t i = 0; i < gaussianSampleCount; ++i)
+        kGaussianSamples[i] = std::exp(-(float(i) * float(i)) / (2.0f * bilateralStdDev * bilateralStdDev));
+
+    ref<Texture> blurInput = mpAOBuffer;
+    ref<Texture> blurOutputs[2] = { mpAOBlurTemp, mpAOBlurTarget };
+    for (uint32_t pass = 0; pass < 2; ++pass)
+    {
+        auto var = mpSSAOBlurPass->getRootVar();
+        auto cb = var["PerFrameCB"];
+        if (cb.isValid())
+        {
+            cb["gResolution"] = float4((float)resolution.x, (float)resolution.y, 1.f / resolution.x, 1.f / resolution.y);
+            cb["gBlurAxis"] = axes[pass];
+            cb["gFarPlaneOverEdgeDistance"] = farPlaneOverEdgeDistance;
+            cb["gBlurSampleCount"] = (int)gaussianSampleCount;
+            for (uint32_t i = 0; i < gaussianSampleCount; ++i)
+                cb["gBlurKernel"][i] = kGaussianSamples[i];
+        }
+        var["gAOBuffer"] = blurInput;
+        var["gBlurredAO"] = blurOutputs[pass];
+        var["gPointSampler"] = mpPointSampler;
+        mpSSAOBlurPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
+        blurInput = blurOutputs[pass];
+    }
+}
+
+void FilamentPostProcess::executeFSR(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings)
+{
+    if (!mpFSRPass || !pSrc || !pDst || !settings.enableFSR) return;
+    const uint2 resolution = uint2(pDst->getWidth(), pDst->getHeight());
+    auto var = mpFSRPass->getRootVar();
+    if (var["PerFrameCB"].isValid())
+    {
+        var["PerFrameCB"]["gResolution"] = resolution;
+        var["PerFrameCB"]["gSharpness"] = settings.fsrSharpness;
+    }
+    var["gSrc"] = pSrc;
+    var["gDst"] = pDst;
+    var["gLinearSampler"] = mpLinearSampler;
+    mpFSRPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
+}
+
 void FilamentPostProcess::executePrePassSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings)
 {
-    if (!settings.enableSSAO || !pDepth || !mpSSAOPass) return;
+    if (!settings.enableSSAO || !pDepth) return;
     executeStructure(pRenderContext, pDepth);
-    executeSSAO(pRenderContext, pDepth, settings);
+    if (settings.ssaoMode == 1 && mpGTAOPass)
+        executeGTAO(pRenderContext, pDepth, settings);
+    else if (mpSSAOPass)
+        executeSSAO(pRenderContext, pDepth, settings);
 }
 
 ref<Texture> FilamentPostProcess::getAOTexture(const FilamentSettings& settings) const
@@ -565,12 +894,25 @@ void FilamentPostProcess::executeColorGradingComposite(RenderContext* pRenderCon
         cb["gBloomBlendMode"] = (float)settings.bloomBlendMode;
         cb["gPostProcessShadow"] = 0.0f;
         cb["gDithering"] = settings.dithering ? 1.0f : 0.0f;
+        if (settings.enableColorGradingLUT)
+        {
+            updateColorGradingLUT(mpDevice, settings);
+            cb["gUseLUT"] = 1.0f;
+            const float lutSize = float(mLUTSize);
+            cb["gLUTSize"] = float2(0.5f / lutSize, (lutSize - 1.0f) / lutSize);
+        }
+        else
+        {
+            cb["gUseLUT"] = 0.0f;
+            cb["gLUTSize"] = float2(0.0f, 1.0f);
+        }
     }
 
     var["gSrc"] = pSrc;
     var["gDst"] = pDst;
     var["gAO"] = mpWhiteTexture;
     var["gShadow"] = mpWhiteTexture;
+    var["gLUTSampler"] = mpLinearSampler;
 
     if (settings.enableBloom && mpBloomMips[0])
     {
@@ -583,18 +925,43 @@ void FilamentPostProcess::executeColorGradingComposite(RenderContext* pRenderCon
         var["gSampler"] = mpLinearSampler;
     }
 
+    if (settings.enableColorGradingLUT && mpColorLUT)
+        var["gColorLUT"] = mpColorLUT;
+    else
+        var["gColorLUT"] = mpIdentityLUT;
+
     mpColorGradingPass->execute(pRenderContext, uint3(resolution, 1));
 }
 
 Properties FilamentPostProcess::getProperties() const
 {
-    return Properties();
+    Properties props;
+    props[kPostProcessingEnabled] = mSettings.postProcessingEnabled;
+    props[kAntiAliasing] = mSettings.antiAliasing;
+    props[kEnableBloom] = mSettings.enableBloom;
+    props[kEnableSSAO] = mSettings.enableSSAO;
+    props[kEnableDoF] = mSettings.enableDoF;
+    props[kEnableFog] = mSettings.enableFog;
+    props[kFogDensity] = mSettings.fogDensity;
+    props[kFogStart] = mSettings.fogStart;
+    props[kFogColor] = mSettings.fogColor;
+    props[kEnableSSR] = mSettings.enableSSR;
+    return props;
 }
 
 RenderPassReflection FilamentPostProcess::reflect(const CompileData& compileData)
 {
     RenderPassReflection reflector;
     reflector.addInput(kSrc, "Source texture").bindFlags(ResourceBindFlags::ShaderResource);
+    reflector.addInput(kDepth, "Depth buffer (enables DoF/TAA/fog/SSAO when connected)")
+        .bindFlags(ResourceBindFlags::ShaderResource)
+        .flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addInput(kMotionVec, "Motion vectors (for TAA when antiAliasing=2)")
+        .bindFlags(ResourceBindFlags::ShaderResource)
+        .flags(RenderPassReflection::Field::Flags::Optional);
+    reflector.addInput(kShadowMap, "Shadow map atlas (optional post-process shadow debug)")
+        .bindFlags(ResourceBindFlags::ShaderResource)
+        .flags(RenderPassReflection::Field::Flags::Optional);
     reflector.addOutput(kDst, "post-effected output texture")
         .bindFlags(ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess)
         .format(ResourceFormat::RGBA32Float);
@@ -605,11 +972,20 @@ void FilamentPostProcess::execute(RenderContext* pRenderContext, const RenderDat
 {
     auto pSrc = renderData.getTexture(kSrc);
     auto pDst = renderData.getTexture(kDst);
-    FilamentSettings defaultSettings;
-    executeCustom(pRenderContext, pSrc, nullptr, pDst, defaultSettings);
+    if (!pSrc || !pDst)
+    {
+        logWarning("FilamentPostProcess::execute() - missing src or dst texture.");
+        return;
+    }
+
+    auto pDepth = renderData.getTexture(kDepth);
+    auto pMotionVec = renderData.getTexture(kMotionVec);
+    auto pShadowMap = renderData.getTexture(kShadowMap);
+
+    executeCustom(pRenderContext, pSrc, pDepth, pDst, mSettings, pShadowMap, pMotionVec, nullptr);
 }
 
-void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pShadowMap, const ref<Texture>& pMotionVec)
+void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pShadowMap, const ref<Texture>& pMotionVec, const ref<Texture>& pShadowMoments)
 {
     if (!pSrc || !pDst) return;
 
@@ -628,7 +1004,7 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
 
     // --- Stage 0: Shadow visibility (debug only; forward pass applies shadows by default) ---
     if (settings.postProcessShadow && settings.enableShadows && pDepth && mpShadowMapPass)
-        executeShadowMap(pRenderContext, pDepth, settings, pShadowMap);
+        executeShadowMap(pRenderContext, pDepth, settings, pShadowMap, pShadowMoments);
 
     // --- Stage 1: SSAO (skipped when forward pass already computed AO in prepass) ---
     if (settings.enableSSAO && !settings.forwardSSAO && pDepth && mpSSAOPass)
@@ -657,6 +1033,18 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
         ensureTexture(mpDoFTarget);
         executeDoF(pRenderContext, currentInput, pDepth, mpDoFTarget, settings);
         currentInput = mpDoFTarget;
+    }
+
+    // --- Stage 4b: SSR stub (structure depth for future reflection pass) ---
+    if (settings.enableSSR && pDepth)
+        executeSSR(pRenderContext, pDepth, settings);
+
+    // --- Stage 4c: Fog (HDR, after DoF / before bloom + tone map) ---
+    if (settings.enableFog && pDepth && mpFogPass)
+    {
+        ensureTexture(mpFogTarget);
+        executeFog(pRenderContext, currentInput, pDepth, mpFogTarget, settings);
+        currentInput = mpFogTarget;
     }
 
     // --- Stage 5: Bloom ---
@@ -738,6 +1126,15 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     else if (cgTarget != pDst)
     {
         pRenderContext->blit(cgTarget->getSRV(), pDst->getRTV());
+        finalColor = pDst;
+    }
+
+    // --- Stage 8: FSR RCAS sharpen (optional, after FXAA/TAA output) ---
+    if (settings.enableFSR && mpFSRPass)
+    {
+        ensureTexture(mpFSRTarget);
+        executeFSR(pRenderContext, finalColor, mpFSRTarget, settings);
+        pRenderContext->blit(mpFSRTarget->getSRV(), pDst->getRTV());
         finalColor = pDst;
     }
 

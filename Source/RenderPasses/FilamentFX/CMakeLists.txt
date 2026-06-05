@@ -21,7 +21,11 @@ add_library(FilamentPostProcessLib STATIC
     StructurePass.cs.slang
     SSAO.cs.slang
     ShadowMap.cs.slang
+    ShadowEVSM.cs.slang
     DoF.cs.slang
+    Fog.cs.slang
+    FSR.cs.slang
+    GTAO.cs.slang
     TAA.cs.slang
 )
 
@@ -50,7 +54,11 @@ target_sources(FilamentFX PRIVATE
     StructurePass.cs.slang
     SSAO.cs.slang
     ShadowMap.cs.slang
+    ShadowEVSM.cs.slang
     DoF.cs.slang
+    Fog.cs.slang
+    FSR.cs.slang
+    GTAO.cs.slang
     TAA.cs.slang
 )
 

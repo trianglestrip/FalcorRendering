@@ -457,18 +457,18 @@ TAA / FXAA
 
 ---
 
-## 12. 总结
+## 12. 总结（2026-06 更新）
 
 | 层级 | 对齐程度 | 说明 |
 |------|----------|------|
-| **UI 布局** | ★★★★☆ | 分组贴近 `gltf_viewer`；部分参数未接线 |
-| **后处理 Shader 数学** | ★★★☆☆ | Bloom/SAO/FXAA 较完整；DoF/TAA/Grading 简化 |
-| **后处理管线顺序** | ★★☆☆☆ | DoF/TAA 顺序与 Filament 相反；无 Structure/SSR |
-| **光照模型** | ★★☆☆☆ | PBRT 路径；无 Filament Standard + IBL |
-| **阴影** | ★☆☆☆☆ | 单图 + 后处理 PCF；无 CSM/VSM/SSCS |
-| **SSAO 数据流** | ★★☆☆☆ | 生成较对齐；**应用点**仍与 Filament 不同 |
+| **UI 布局** | ★★★★★ | 分组贴近 `gltf_viewer`；Sun/IBL/阴影/后处理已接线 |
+| **后处理 Shader 数学** | ★★★★☆ | Bloom/SAO/GTAO/Fog/3D LUT/FXAA/TAA；FSR 为 RCAS 简化版 |
+| **后处理管线顺序** | ★★★★☆ | TAA→DoF→Fog→Bloom→Grading→FXAA→FSR；SSR 为 stub |
+| **光照模型** | ★★★☆☆ | PBRT `mi.eval` + Filament IBL split-sum；非完整 Standard |
+| **阴影** | ★★★★☆ | CSM 图集 + PCF/VSM(EVSM)；无 SSCS |
+| **SSAO 数据流** | ★★★★☆ | Depth prepass→SAO/GTAO→Forward `evaluateSSAO`；半分辨率双边上采样 |
 
-**一句话：** 当前 FalcorRendering 是「**PBRT 前向渲染 + Filament 风格后处理叠层**」，而非 Filament 的「**统一 Forward + FrameGraph + Surface 内 SSAO/阴影/IBL**」。后处理层可作为继续严格对齐的坚实基础；若要达到 Filament 观感一致，下一步应优先把 **SSAO 与阴影移回光照阶段**，并补齐 **Structure Pass 与 CSM**。
+**一句话：** 已实现 Filament 第 10 节 Wave 0–3 主体：Forward 内 IBL/SSAO/CSM，Structure Pass，TAA 管线重排，VSM/EVSM，3D LUT，Fog，GTAO 可选路径，FSR RCAS，Mogwai `execute()` 可选 depth 输入。剩余差距：完整 SSR/EASU 超分、Froxel 点光、SSCT/Bent Normals、Lens Flare。
 
 ---
 

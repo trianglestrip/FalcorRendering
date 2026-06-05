@@ -15,6 +15,8 @@ cbuffer PerFrameCB
     float gAOEnabled;          // 1.0 = enabled, 0.0 = disabled
     float gPostProcessShadow;  // 1.0 = debug multiply, 0.0 = forward shadows only (default)
     float gDithering;          // 1.0 = enabled
+    float gUseLUT;             // 1.0 = sample 3D LUT instead of ColorGrade()
+    float2 gLUTSize;           // x = 0.5/size, y = (size-1)/size (Filament pixel-center remap)
 };
 
 float interleavedGradientNoise(float2 screenPos)
@@ -27,7 +29,9 @@ Texture2D<float4> gSrc;
 Texture2D<float4> gBloom; // Mip 0 from bloom upsample
 Texture2D<float>  gAO;     // Ambient occlusion (R channel, 0-1)
 Texture2D<float>  gShadow; // Shadow visibility (R channel, 0-1)
+Texture3D<float4> gColorLUT;
 SamplerState gSampler;
+SamplerState gLUTSampler;
 RWTexture2D<float4> gDst;
 
 // ACES Tone mapping (Narkowicz 2015)
@@ -67,6 +71,13 @@ float3 ColorGrade(float3 color) {
     color = lerp(float3(luma), color, 1.0f + (gVibrance * (1.0f - (sign(maxColor) * sat))));
 
     return color;
+}
+
+// Filament-style 3D LUT sampling with pixel-center remap
+float3 SampleColorLUT(float3 color)
+{
+    float3 coord = gLUTSize.x + saturate(color) * gLUTSize.y;
+    return gColorLUT.SampleLevel(gLUTSampler, coord, 0).rgb;
 }
 
 // Pre-TAA pass: apply SSAO and shadow visibility to HDR color (Filament applies AO before TAA).
@@ -127,8 +138,12 @@ void colorGradingMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         color = lerp(color, gVignetteColor, vfactor);
     }
 
-    // Apply Color Grading
-    color = ColorGrade(color);
+    // Apply Color Grading (3D LUT path or real-time formula)
+    if (gUseLUT > 0.5f) {
+        color = SampleColorLUT(color);
+    } else {
+        color = ColorGrade(color);
+    }
 
     // Apply Tone Mapping
     if (gToneMapping == 0.0f) {

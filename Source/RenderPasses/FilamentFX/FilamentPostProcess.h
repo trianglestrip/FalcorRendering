@@ -52,6 +52,15 @@ public:
         float ssaoMinHorizonAngleSineSquared = 0.0f;
         float ssaoPeak2 = 0.0001f;
         float ssaoProjectionScale = 1.0f;
+        int ssaoMode = 0; // 0: SAO (Filament default), 1: GTAO horizon-based
+        int gtaoSlices = 4;
+        int gtaoSteps = 4;
+        float gtaoRadius = 0.3f;
+
+        // FSR / sharpening (RCAS post-pass; full EASU upsample when DSR < 1 is future work)
+        bool enableFSR = false;
+        float fsrSharpness = 0.5f;
+        float dynamicResolutionScale = 1.0f; // placeholder for DSR integration
 
         // Shadow (CSM atlas rendered in forward pass; post-process shadow is optional debug)
         bool enableShadows = true;
@@ -61,6 +70,10 @@ public:
         float shadowBias = 0.001f;
         float4 cascadeSplits = float4(5.0f, 15.0f, 40.0f, 100.0f);
         uint32_t shadowMapSize = 2048;
+        float vsmExponent = 5.2f;
+        float vsmMaxMoment = 65504.f;
+        float vsmLightBleedReduction = 0.15f;
+        float vsmBlurWidth = 3.0f;
         float4x4 shadowLightViewProj[4] = {};
         float4 cascadeAtlasRect[4] = {};
 
@@ -69,6 +82,15 @@ public:
         float dofFocalDistance = 10.0f;
         float dofAperture = 2.8f;
         float dofMaxCoC = 5.0f;
+
+        // Fog (exponential distance + height, HDR pre-tone-map)
+        bool enableFog = false;
+        float fogDensity = 0.02f;
+        float fogStart = 0.0f;
+        float3 fogColor = float3(0.7f, 0.75f, 0.8f);
+
+        // SSR (stub: structure depth only until reflection pass is implemented)
+        bool enableSSR = false;
 
         // Vignette
         bool enableVignette = true;
@@ -83,6 +105,8 @@ public:
         float contrast = 1.0f;
         float vibrance = 1.0f;
         float saturation = 1.0f;
+        bool enableColorGradingLUT = true;
+        int lutSize = 32; // 16 or 32
 
         // TAA
         float taaFeedback = 0.9f;
@@ -90,6 +114,7 @@ public:
 
         // Camera (set each frame by PBRTOfflineRenderer)
         float4x4 invViewProj = float4x4();
+        float4x4 invView = float4x4();
         float4x4 invProj = float4x4();
         float nearPlane = 0.1f;
         float farPlane = 1000.0f;
@@ -99,7 +124,10 @@ public:
     };
 
     // Custom execution for PBRTOfflineRenderer
-    void executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pShadowMap = nullptr, const ref<Texture>& pMotionVec = nullptr);
+    void executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pShadowMap = nullptr, const ref<Texture>& pMotionVec = nullptr, const ref<Texture>& pShadowMoments = nullptr);
+
+    // EVSM separable Gaussian blur on RG32F shadow moments atlas (per-cascade tiles)
+    void blurShadowMoments(RenderContext* pRenderContext, const ref<Texture>& pMoments, const ref<Texture>& pTemp, const FilamentSettings& settings);
 
     // Pre-pass SSAO (depth prepass -> structure -> SSAO), consumed by forward shader via getAOTexture().
     void executePrePassSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
@@ -117,6 +145,9 @@ private:
     ref<ComputePass> mpBloomUpsamplePass;
     ref<ComputePass> mpFXAAPass;
     ref<ComputePass> mpDoFPass;
+    ref<ComputePass> mpFogPass;
+    ref<ComputePass> mpFSRPass;
+    ref<ComputePass> mpGTAOPass;
     ref<ComputePass> mpTAAPass;
 
     // Structure depth pyramid (SSAO LOD)
@@ -129,8 +160,9 @@ private:
     ref<ComputePass> mpSSAOPass;
     ref<ComputePass> mpSSAOBlurPass;
 
-    // Shadow map pass
+    // Shadow map + EVSM blur passes
     ref<ComputePass> mpShadowMapPass;
+    ref<ComputePass> mpShadowEVSMBlurPass;
 
     // Intermediate textures
     static const uint32_t kMaxBloomLevels = 7;
@@ -140,6 +172,8 @@ private:
     ref<Texture> mpPrepTarget;
     ref<Texture> mpTAATarget;
     ref<Texture> mpDoFTarget;
+    ref<Texture> mpFogTarget;
+    ref<Texture> mpFSRTarget;
     ref<Texture> mpZeroMotionTexture;
     ref<Texture> mpHistoryColor;
     ref<Texture> mpHistoryDepth;
@@ -156,16 +190,24 @@ private:
     // Fallback white texture for AO/Shadow when disabled
     ref<Texture> mpWhiteTexture;
     ref<Texture> mpDummyShadowMap;     // 1x1 shadow map to prevent null binding
+    ref<Texture> mpDummyShadowMoments; // 1x1 EVSM moments fallback
+    ref<Texture> mpColorLUT;
+    ref<Texture> mpIdentityLUT;        // 1x1x1 fallback when LUT path disabled
 
     // Helper functions
+    void updateColorGradingLUT(ref<Device> pDevice, const FilamentSettings& settings);
     void updateBloomTextures(ref<Device> pDevice, uint32_t width, uint32_t height, uint32_t levels);
     void updateStructureTextures(ref<Device> pDevice, uint32_t width, uint32_t height);
     void executeStructure(RenderContext* pRenderContext, const ref<Texture>& pDepth);
     void updateAOTextures(ref<Device> pDevice, uint32_t width, uint32_t height, float resolutionScale);
     void createNoiseTexture(ref<Device> pDevice);
     void executeSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
-    void executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings, const ref<Texture>& pShadowMapDepth = nullptr);
+    void executeGTAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
+    void executeFSR(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings);
+    void executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings, const ref<Texture>& pShadowMapDepth = nullptr, const ref<Texture>& pShadowMoments = nullptr);
     void executeDoF(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings);
+    void executeFog(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings);
+    void executeSSR(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
     void executeTAA(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pMotionVec);
     void executeColorGradingPrep(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings);
     void executeColorGradingComposite(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings);
@@ -174,4 +216,12 @@ private:
     uint32_t mHistoryHeight = 0;
     uint32_t mAOBufferWidth = 0;
     uint32_t mAOBufferHeight = 0;
+    uint32_t mLUTSize = 0;
+    float mLUTExposure = 0.0f;
+    float mLUTContrast = 1.0f;
+    float mLUTVibrance = 1.0f;
+    float mLUTSaturation = 1.0f;
+
+    FilamentSettings mSettings;
+    void parseProperties(const Properties& props);
 };

@@ -199,7 +199,14 @@ void PBRTOfflineRenderer::ensureShadowMapResources()
         mpShadowMapDepth = getDevice()->createTexture2D(
             mShadowMapSize, mShadowMapSize, ResourceFormat::D32Float, 1, 1, nullptr,
             ResourceBindFlags::DepthStencil | ResourceBindFlags::ShaderResource);
-        mpShadowFbo = Fbo::create(getDevice(), {}, mpShadowMapDepth);
+        mpShadowMapMoments = getDevice()->createTexture2D(
+            mShadowMapSize, mShadowMapSize, ResourceFormat::RG32Float, 1, 1, nullptr,
+            ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+        mpShadowMapMomentsBlur = getDevice()->createTexture2D(
+            mShadowMapSize, mShadowMapSize, ResourceFormat::RG32Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+        mpShadowFbo = Fbo::create(getDevice(), {mpShadowMapMoments}, mpShadowMapDepth);
+        mpShadowMomentsSample = nullptr;
     }
 }
 
@@ -264,6 +271,7 @@ void PBRTOfflineRenderer::syncFilamentCameraSettings()
 
     auto pCam = mpScene->getCamera();
     mFilamentSettings.invViewProj = pCam->getInvViewProjMatrix();
+    mFilamentSettings.invView = inverse(pCam->getViewMatrix());
     mFilamentSettings.nearPlane = pCam->getNearPlane();
     mFilamentSettings.farPlane = pCam->getFarPlane();
     auto proj = pCam->getProjMatrix();
@@ -306,6 +314,8 @@ void PBRTOfflineRenderer::setShadowShaderVars(const ShaderVar& var)
         cb["gCascadeSplits"] = mFilamentSettings.cascadeSplits;
         cb["gShadowAtlasSize"] = float2((float)mShadowMapSize, (float)mShadowMapSize);
         cb["gShadowSunDir"] = normalize(mFilamentSettings.sunDirection);
+        cb["gVsmExponent"] = mFilamentSettings.vsmExponent;
+        cb["gVsmLightBleedReduction"] = mFilamentSettings.vsmLightBleedReduction;
         for (int i = 0; i < 4; ++i)
         {
             cb["gLightViewProj"][i] = mFilamentSettings.shadowLightViewProj[i];
@@ -315,6 +325,12 @@ void PBRTOfflineRenderer::setShadowShaderVars(const ShaderVar& var)
 
     if (var["gShadowMap"].isValid() && mpShadowMapDepth)
         var["gShadowMap"] = mpShadowMapDepth;
+    if (var["gShadowMoments"].isValid())
+    {
+        ref<Texture> pMoments = mpShadowMomentsSample ? mpShadowMomentsSample : mpShadowMapMoments;
+        if (pMoments)
+            var["gShadowMoments"] = pMoments;
+    }
     if (var["gShadowPointSampler"].isValid() && mpShadowPointSampler)
         var["gShadowPointSampler"] = mpShadowPointSampler;
 }
@@ -324,7 +340,16 @@ void PBRTOfflineRenderer::renderShadowMap(RenderContext* pCtx)
     if (!mpShadowFbo || !mpShadowRasterPass || !mpScene) return;
 
     ensureShadowMapResources();
-    pCtx->clearFbo(mpShadowFbo.get(), float4(0, 0, 0, 0), 1.f, 0, FboAttachmentType::Depth);
+    const bool useVsm = (mFilamentSettings.shadowType == 2);
+    pCtx->clearFbo(mpShadowFbo.get(), float4(0, 0, 0, 0), 1.f, 0, FboAttachmentType::All);
+
+    ShaderVar depthCB = mpShadowRasterPass->getVars()->getRootVar()["ShadowDepthCB"];
+    if (depthCB.isValid())
+    {
+        depthCB["gOutputMoments"] = useVsm ? 1u : 0u;
+        depthCB["gVsmExponent"] = mFilamentSettings.vsmExponent;
+        depthCB["gVsmMaxMoment"] = mFilamentSettings.vsmMaxMoment;
+    }
 
     auto pCam = mpScene->getCamera();
     const auto origView = pCam->getViewMatrix();
@@ -420,6 +445,17 @@ void PBRTOfflineRenderer::renderShadowMap(RenderContext* pCtx)
     pCam->setViewMatrix(origView);
     pCam->setProjectionMatrix(origProj);
     mpShadowRasterPass->getState()->setViewport(0, GraphicsState::Viewport(0.f, 0.f, float(mShadowMapSize), float(mShadowMapSize), 0.f, 1.f), true);
+
+    if (useVsm && mpFilamentPostProcess && mpShadowMapMoments && mpShadowMapMomentsBlur)
+    {
+        if (mFilamentSettings.vsmBlurWidth > 0.f)
+            mpFilamentPostProcess->blurShadowMoments(pCtx, mpShadowMapMoments, mpShadowMapMomentsBlur, mFilamentSettings);
+        mpShadowMomentsSample = mpShadowMapMoments;
+    }
+    else
+    {
+        mpShadowMomentsSample = nullptr;
+    }
 }
 
 void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFbo)
@@ -507,7 +543,8 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     {
         const ref<Texture> pMotionVec = (mFilamentSettings.antiAliasing == 2) ? mpVelocityTexture : nullptr;
         mpFilamentPostProcess->executeCustom(pCtx, mpIntermediateTexture, mpIntermediateDepth, mpPostProcessOutput, mFilamentSettings,
-            mFilamentSettings.enableShadows ? mpShadowMapDepth : nullptr, pMotionVec);
+            mFilamentSettings.enableShadows ? mpShadowMapDepth : nullptr, pMotionVec,
+            mFilamentSettings.enableShadows ? mpShadowMomentsSample : nullptr);
         pCtx->blit(mpPostProcessOutput->getSRV(), pTarget->getRTV());
     }
     else
@@ -643,6 +680,13 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                         ssaoGroup.slider("Spiral Turns", mFilamentSettings.ssaoSpiralTurns, 1, 15);
                         ssaoGroup.slider("Resolution", mFilamentSettings.ssaoResolution, 0.25f, 1.0f);
                         ssaoGroup.slider("Upsample Edge", mFilamentSettings.ssaoBilateralEdgeDistance, 0.01f, 1.0f);
+                        Gui::DropdownList aoModes = {{0, "SAO"}, {1, "GTAO"}};
+                        ssaoGroup.dropdown("AO Mode", aoModes, (uint32_t&)mFilamentSettings.ssaoMode);
+                        if (mFilamentSettings.ssaoMode == 1) {
+                            ssaoGroup.slider("GTAO Radius", mFilamentSettings.gtaoRadius, 0.05f, 2.0f);
+                            ssaoGroup.slider("GTAO Slices", mFilamentSettings.gtaoSlices, 1, 8);
+                            ssaoGroup.slider("GTAO Steps", mFilamentSettings.gtaoSteps, 1, 8);
+                        }
                     }
                 }
                 
@@ -665,6 +709,25 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                         dofGroup.slider("Max CoC", mFilamentSettings.dofMaxCoC, 1.0f, 32.0f);
                     }
                 }
+
+                if (auto fogGroup = ppGroup.group("Fog")) {
+                    fogGroup.checkbox("Enable", mFilamentSettings.enableFog);
+                    if (mFilamentSettings.enableFog) {
+                        fogGroup.slider("Density", mFilamentSettings.fogDensity, 0.0f, 0.2f);
+                        fogGroup.slider("Start", mFilamentSettings.fogStart, 0.0f, 100.0f);
+                        fogGroup.rgbColor("Color", mFilamentSettings.fogColor);
+                    }
+                }
+
+                if (auto ssrGroup = ppGroup.group("SSR (stub)")) {
+                    ssrGroup.checkbox("Enable", mFilamentSettings.enableSSR);
+                }
+
+                if (auto fsrGroup = ppGroup.group("FSR (RCAS)")) {
+                    fsrGroup.checkbox("Enable", mFilamentSettings.enableFSR);
+                    if (mFilamentSettings.enableFSR)
+                        fsrGroup.slider("Sharpness", mFilamentSettings.fsrSharpness, 0.0f, 2.0f);
+                }
                 
                 if (auto vigGroup = ppGroup.group("Vignette")) {
                     vigGroup.checkbox("Enable", mFilamentSettings.enableVignette);
@@ -679,6 +742,11 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                 if (auto cgGroup = ppGroup.group("Color Grading")) {
                     Gui::DropdownList tmModes = {{0, "ACES"}, {1, "Filmic"}, {2, "Linear"}, {3, "Display"}};
                     cgGroup.dropdown("Tone Mapping", tmModes, (uint32_t&)mFilamentSettings.toneMapping);
+                    cgGroup.checkbox("3D LUT", mFilamentSettings.enableColorGradingLUT);
+                    if (mFilamentSettings.enableColorGradingLUT) {
+                        Gui::DropdownList lutSizes = {{16, "16"}, {32, "32"}};
+                        cgGroup.dropdown("LUT Size", lutSizes, (uint32_t&)mFilamentSettings.lutSize);
+                    }
                     cgGroup.slider("Exposure (EV)", mFilamentSettings.exposure, -10.0f, 10.0f);
                     cgGroup.slider("Contrast", mFilamentSettings.contrast, 0.0f, 2.0f);
                     cgGroup.slider("Vibrance", mFilamentSettings.vibrance, 0.0f, 2.0f);

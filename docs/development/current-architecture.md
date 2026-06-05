@@ -90,3 +90,15 @@ Release 编译后，主要可执行文件位于：
 - 应用层与能力层解耦，便于研究功能快速迭代。
 - 通过 CMake 子目录拆分，实现多目标并行构建与独立维护。
 
+## 7. PBRTOfflineRenderer + FilamentFX（Filament 对齐）
+
+样例 `Source/Samples/PBRTOfflineRenderer` 使用静态库 `FilamentPostProcessLib`（`Source/RenderPasses/FilamentFX`）：
+
+**帧序：** Shadow CSM → Depth prepass → Structure+SSAO/GTAO → Forward(Color+IBL+AO+Shadow) → Post(TAA→DoF→Fog→Bloom→Grading→FXAA→FSR)
+
+**主要 Shader：** `StructurePass.cs.slang`、`SSAO.cs.slang`、`GTAO.cs.slang`、`ShadowEVSM.cs.slang`、`Fog.cs.slang`、`ColorGrading.cs.slang`、`FSR.cs.slang`、`FilamentIBL.slangh`、`FilamentAO.slangh`
+
+**构建：** `build_pbrt_renderer.bat`（单线程 MSBuild，避免 PCH 竞争）
+
+**资产：** `data/ibl/lightroom_14b/` 部署至 `bin/Release/data/ibl/`
+

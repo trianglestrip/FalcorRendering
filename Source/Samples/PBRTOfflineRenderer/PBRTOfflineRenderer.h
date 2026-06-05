@@ -57,9 +57,12 @@ private:
 
     // Shadow map resources
     ref<Texture> mpShadowMapDepth;
+    ref<Texture> mpShadowMapMoments;
+    ref<Texture> mpShadowMapMomentsBlur;
     ref<Fbo> mpShadowFbo;
     ref<RasterPass> mpShadowRasterPass;
     ref<Sampler> mpShadowPointSampler;
+    ref<Texture> mpShadowMomentsSample; // blurred moments bound for shading (VSM)
     uint32_t mShadowMapSize = 2048;
 
     uint32_t mFrameCount = 0;

@@ -10,6 +10,8 @@ cbuffer PerFrameCB
     float gShadowBias;
     float gShadowSlopeScaleBias;
     uint2 gShadowAtlasSize;
+    float gVsmExponent;
+    float gVsmLightBleedReduction;
 };
 
 cbuffer CameraCB
@@ -21,6 +23,7 @@ cbuffer CameraCB
 
 Texture2D<float> gDepth;
 Texture2D<float> gShadowMap;
+Texture2D<float2> gShadowMoments;
 RWTexture2D<float> gDst;
 
 SamplerState gPointSampler;
@@ -63,7 +66,10 @@ void shadowMapMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         gCascadeAtlasRect,
         float2(gShadowAtlasSize),
         gShadowMap,
-        gPointSampler);
+        gShadowMoments,
+        gPointSampler,
+        gVsmExponent,
+        gVsmLightBleedReduction);
 
     gDst[coord] = visibility;
 }
