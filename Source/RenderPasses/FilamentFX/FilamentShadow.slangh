@@ -76,8 +76,8 @@ float evaluateEVSM(float2 moments, float zReceiver, float2 dzduv, float2 texelSi
 // Receiver-plane depth bias (GDC 2006) - derivatives of light-space depth w.r.t. UV
 float2 computeReceiverPlaneDepthBias(float3 position)
 {
-    float3 duvzDx = dFdx(position);
-    float3 duvzDy = dFdy(position);
+    float3 duvzDx = ddx(position);
+    float3 duvzDy = ddy(position);
     float2x2 duv = float2x2(duvzDx.xy, duvzDy.xy);
     float det = duv[0][0] * duv[1][1] - duv[0][1] * duv[1][0];
     if (abs(det) < 1e-8)
@@ -163,8 +163,8 @@ float2 computeDepthMomentsVSM(float depth, float c, float maxMoment)
     float m1 = z;
     float m2 = z * z;
 
-    float dzdx = dFdx(wrappedDepth);
-    float dzdy = dFdy(wrappedDepth);
+    float dzdx = ddx(wrappedDepth);
+    float dzdy = ddy(wrappedDepth);
     float linearVariance = 0.25 * (dzdx * dzdx + dzdy * dzdy);
     float analyticVariance = c * c * m2 * linearVariance;
     m2 = min(m2 + analyticVariance, maxMoment);

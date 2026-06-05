@@ -48,6 +48,23 @@ bool FilamentIBL::loadDefault()
     const auto iblRoot = getIblDataRoot();
     const auto lightroomDir = iblRoot / "lightroom_14b";
 
+    // The generated DDS cubemap currently terminates the process inside Falcor's
+    // DDS texture creation path on some devices. Keep the renderer usable and
+    // preserve Filament's diffuse SH while the packed cubemap path is fixed.
+    logWarning("FilamentIBL: DDS IBL loading is disabled. Using procedural specular and analytic DFG fallback.");
+    createPlaceholderSpecularCubemap();
+    createFallbackDfgLut();
+    mUsingPlaceholder = true;
+
+    if (!tryLoadSphericalHarmonics(lightroomDir / "sh.txt"))
+    {
+        mUseSH = false;
+        mSH[0] = float3(kShSentinel, 0.f, 0.f);
+    }
+
+    return isLoaded();
+
+#if 0
     const std::filesystem::path specularCandidates[] = {
         lightroomDir / "lightroom_14b_ibl.dds",
         lightroomDir / "ibl_specular.dds",
@@ -85,6 +102,7 @@ bool FilamentIBL::loadDefault()
     }
 
     return isLoaded();
+#endif
 }
 
 bool FilamentIBL::tryLoadSpecularCubemap(const std::filesystem::path& path)
@@ -92,7 +110,23 @@ bool FilamentIBL::tryLoadSpecularCubemap(const std::filesystem::path& path)
     if (!fileExists(path))
         return false;
 
-    auto pTex = ImageIO::loadTextureFromDDS(mpDevice, path, false);
+    ref<Texture> pTex;
+    try
+    {
+        logInfo("FilamentIBL: Loading specular cubemap '{}'.", path.string());
+        pTex = ImageIO::loadTextureFromDDS(mpDevice, path, false);
+    }
+    catch (const std::exception& e)
+    {
+        logWarning("FilamentIBL: Failed to load specular cubemap '{}': {}", path.string(), e.what());
+        return false;
+    }
+    catch (...)
+    {
+        logWarning("FilamentIBL: Failed to load specular cubemap '{}'.", path.string());
+        return false;
+    }
+
     if (!pTex || pTex->getType() != Texture::Type::TextureCube)
     {
         logWarning("FilamentIBL: '{}' is not a valid cubemap DDS.", path.string());
@@ -111,7 +145,23 @@ bool FilamentIBL::tryLoadDfgLut(const std::filesystem::path& path)
     if (!fileExists(path))
         return false;
 
-    auto pTex = ImageIO::loadTextureFromDDS(mpDevice, path, false);
+    ref<Texture> pTex;
+    try
+    {
+        logInfo("FilamentIBL: Loading DFG LUT '{}'.", path.string());
+        pTex = ImageIO::loadTextureFromDDS(mpDevice, path, false);
+    }
+    catch (const std::exception& e)
+    {
+        logWarning("FilamentIBL: Failed to load DFG LUT '{}': {}", path.string(), e.what());
+        return false;
+    }
+    catch (...)
+    {
+        logWarning("FilamentIBL: Failed to load DFG LUT '{}'.", path.string());
+        return false;
+    }
+
     if (!pTex || pTex->getType() != Texture::Type::Texture2D)
     {
         logWarning("FilamentIBL: '{}' is not a valid 2D DFG LUT DDS.", path.string());

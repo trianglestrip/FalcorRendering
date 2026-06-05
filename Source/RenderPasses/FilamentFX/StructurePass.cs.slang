@@ -1,6 +1,6 @@
 // Filament Structure depth pyramid - aligns with PostProcessManager::structure() + mipmapDepth.mat
 // Pass 1: copy main depth to structure mip 0
-// Pass 2: min-depth 2x2 downsample chain for SSAO LOD (NEAREST_MIPMAP_NEAREST sampling)
+// Pass 2: rotated-grid depth mip chain used by Filament SSAO.
 
 cbuffer PerFrameCB
 {
@@ -35,11 +35,8 @@ void structureMipmap(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint2 ocoord = dispatchThreadId.xy;
     uint2 base = ocoord * 2;
 
-    // Min-depth downsample: preserve closest surface in D3D [0,1] depth (0=near, 1=far)
-    float d0 = sampleStructureMip(base + uint2(0, 0), gSrcMip);
-    float d1 = sampleStructureMip(base + uint2(1, 0), gSrcMip);
-    float d2 = sampleStructureMip(base + uint2(0, 1), gSrcMip);
-    float d3 = sampleStructureMip(base + uint2(1, 1), gSrcMip);
-
-    gDst[ocoord] = min(min(d0, d1), min(d2, d3));
+    // Filament mipmapDepth.mat uses a rotated grid single subsample:
+    // texelFetch(depth, 2 * icoord + ivec2(icoord.y & 1, icoord.x & 1), 0).
+    uint2 rotated = base + uint2(ocoord.y & 1u, ocoord.x & 1u);
+    gDst[ocoord] = sampleStructureMip(rotated, gSrcMip);
 }

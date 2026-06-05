@@ -466,6 +466,9 @@ if(plugin_targets)
     add_dependencies(Mogwai ${plugin_targets})
     add_dependencies(FalcorPython ${plugin_targets})
     add_dependencies(Mogwai FalcorPython)
+    if(TARGET PBRTOfflineRenderer)
+        add_dependencies(PBRTOfflineRenderer ${plugin_targets})
+    endif()
 endif()
 
 # Make Mogwai the default startup project in VS.

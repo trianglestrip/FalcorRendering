@@ -16,6 +16,8 @@ cbuffer PerFrameCB
 {
     uint2 gFrameDim;
     uint gSSAOEnabled;
+    float gSunIntensity;
+    float3 gSunColor;
 };
 
 cbuffer ShadowCB
@@ -40,7 +42,6 @@ SamplerState gShadowPointSampler;
 struct PSOut
 {
     float4 color : SV_TARGET0;
-    float2 motion : SV_TARGET1;
 };
 
 VSOut vsMain(VSIn vIn) { return defaultVS(vIn); }
@@ -100,19 +101,16 @@ PSOut psMain(VSOut vsOut, uint triangleIndex: SV_PrimitiveID)
         gVsmExponent,
         gVsmLightBleedReduction);
 
-    for (int i = 0; i < gScene.getLightCount(); i++)
+    float3 sunL = normalize(-gShadowSunDir);
+    float NoL = saturate(dot(N, sunL));
+    if (NoL > 0.0f && gSunIntensity > 0.0f)
     {
-        AnalyticLightSample ls;
-        evalLightApproximate(sd.posW, gScene.getLight(i), ls);
-        float3 contrib = mi.eval(sd, ls.dir, sg) * ls.Li;
-        if (gShadowEnabled != 0u && dot(normalize(ls.dir), normalize(-gShadowSunDir)) > 0.9)
-            contrib *= shadowVis;
-        color += contrib;
+        float3 sunRadiance = gSunColor * gSunIntensity;
+        color += mi.eval(sd, sunL, sg) * sunRadiance * shadowVis;
     }
 
     PSOut out;
     out.color = float4(color, 1.0f);
-    out.motion = computeMotionVector(vsOut, int2(vsOut.posH.xy));
     return out;
 }
 

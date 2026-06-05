@@ -27,6 +27,20 @@ echo Scene : %SCENE%
 echo Output: %OUTPUT%
 echo.
 
-"%EXE%" --scene "%SCENE%" --output "%OUTPUT%"
+"%EXE%" --headless --single-frame --scene "%SCENE%" --output "%OUTPUT%"
+if errorlevel 1 (
+    if exist "%OUTPUT%" (
+        echo.
+        echo Render process returned a non-zero code, but output exists:
+        echo %OUTPUT%
+        exit /b 0
+    )
+    echo.
+    echo Render failed.
+    pause
+    exit /b 1
+)
 
-pause
+echo.
+echo Render complete: %OUTPUT%
+exit /b 0

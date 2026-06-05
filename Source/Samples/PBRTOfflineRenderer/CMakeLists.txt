@@ -7,6 +7,7 @@ target_sources(PBRTOfflineRenderer PRIVATE
     PBRTOfflineRenderer.cpp
     PBRTOfflineRenderer.h
     PBRTOfflineRenderer.3d.slang
+    ForwardFlat.3d.slang
     ShadowDepth.3d.slang
     DepthPrepass.3d.slang
 )

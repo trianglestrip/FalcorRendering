@@ -38,6 +38,70 @@ namespace
     const uint32_t kNoiseTextureSize = 4; // 4x4 noise texture for SSAO
     const uint32_t kMaxStructureLevels = 8;
 
+    struct AOQualityParams
+    {
+        float sampleCount = 7.0f;
+        float spiralTurns = 3.0f;
+        float standardDeviation = 8.0f;
+        uint32_t kernelSize = 11;
+        float blurScale = 2.0f;
+    };
+
+    AOQualityParams getAOQualityParams(const FilamentPostProcess::FilamentSettings& settings)
+    {
+        AOQualityParams params;
+        const int sampleCount = std::clamp(settings.ssaoSampleCount, 4, 64);
+
+        if (sampleCount <= 7)
+        {
+            params.sampleCount = 7.0f;
+            params.spiralTurns = 3.0f;
+            params.standardDeviation = 8.0f;
+        }
+        else if (sampleCount <= 11)
+        {
+            params.sampleCount = 11.0f;
+            params.spiralTurns = 6.0f;
+            params.standardDeviation = 8.0f;
+        }
+        else if (sampleCount <= 16)
+        {
+            params.sampleCount = 16.0f;
+            params.spiralTurns = 7.0f;
+            params.standardDeviation = 6.0f;
+        }
+        else
+        {
+            params.sampleCount = 32.0f;
+            params.spiralTurns = 14.0f;
+            params.standardDeviation = 4.0f;
+        }
+
+        params.kernelSize = 11;
+        params.standardDeviation *= 0.5f;
+        params.blurScale = 2.0f;
+        return params;
+    }
+
+    float getProjectionScale(float2 positionParams, uint2 resolution)
+    {
+        const float proj00 = 2.0f / std::max(positionParams.x, 1e-6f);
+        const float proj11 = 2.0f / std::max(positionParams.y, 1e-6f);
+        return std::min(0.5f * proj00 * float(resolution.x), 0.5f * proj11 * float(resolution.y));
+    }
+
+    uint32_t makeGaussianKernel(float* outKernel, uint32_t kernelSize, float standardDeviation)
+    {
+        constexpr uint32_t kKernelArraySize = 16;
+        const uint32_t sampleCount = std::min(kKernelArraySize, (kernelSize + 1u) / 2u);
+        for (uint32_t i = 0; i < sampleCount; ++i)
+        {
+            const float x = float(i);
+            outKernel[i] = std::exp(-(x * x) / (2.0f * standardDeviation * standardDeviation));
+        }
+        return sampleCount;
+    }
+
     float3 colorGradeCPU(float3 color, float exposure, float contrast, float saturation, float vibrance)
     {
         color *= std::exp2(exposure);
@@ -429,14 +493,15 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
     updateAOTextures(mpDevice, fullResolution.x, fullResolution.y, settings.ssaoResolution);
     const uint2 resolution = uint2(mAOBufferWidth, mAOBufferHeight);
 
-    // Filament SAO parameters (matching PostProcessManager screenSpaceAmbientOcclusion)
-    float sampleCount = (float)settings.ssaoSampleCount;
+    // Filament SAO parameters (matching PostProcessManager::screenSpaceAmbientOcclusion)
+    const AOQualityParams quality = getAOQualityParams(settings);
+    float sampleCount = quality.sampleCount;
     float radius = settings.ssaoRadius;
     float invRadiusSquared = 1.0f / (radius * radius);
-    float angleInc = (2.0f * 3.14159265f) / (sampleCount - 0.5f) * (float)settings.ssaoSpiralTurns;
+    float angleInc = (2.0f * 3.14159265f) / (sampleCount - 0.5f) * quality.spiralTurns;
     
     float2 posParams = settings.positionParams;
-    float projectionScale = 0.5f * posParams.x * (float)resolution.x;
+    float projectionScale = getProjectionScale(posParams, resolution);
     float projectionScaleRadius = projectionScale * radius;
 
     // peak: from Filament = 0.1 * radius
@@ -466,7 +531,7 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
             cb["gProjectionScaleRadius"] = projectionScaleRadius;
             cb["gIntensity"] = intensity;
             cb["gPower"]     = power;
-            cb["gSpiralTurns"] = (float)settings.ssaoSpiralTurns;
+            cb["gSpiralTurns"] = quality.spiralTurns;
             cb["gSampleCount"]  = float2(sampleCount, 1.0f / (sampleCount - 0.5f));
             cb["gAngleIncCosSin"] = float2(cos(angleInc), sin(angleInc));
             // Filament: invFarPlane = 1 / -zf (view-space far is negative in their convention)
@@ -488,19 +553,14 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
         mpSSAOPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
     }
 
-    // Filament bilateral separable blur (MEDIUM: kernel 11, stddev 4)
-    const float bilateralStdDev = 4.0f;
-    const uint32_t kernelSize = 11;
-    const uint32_t gaussianSampleCount = (kernelSize + 1) / 2;
     float kGaussianSamples[16] = {};
-    for (uint32_t i = 0; i < gaussianSampleCount; ++i)
-    {
-        float x = (float)i;
-        kGaussianSamples[i] = std::exp(-(x * x) / (2.0f * bilateralStdDev * bilateralStdDev));
-    }
+    const uint32_t gaussianSampleCount = makeGaussianKernel(kGaussianSamples, quality.kernelSize, quality.standardDeviation);
 
     const float farPlaneOverEdgeDistance = settings.farPlane / std::max(settings.ssaoBilateralThreshold, 1e-4f);
-    const float2 axes[2] = { float2(1.f / resolution.x, 0.f), float2(0.f, 1.f / resolution.y) };
+    const float2 axes[2] = {
+        float2(quality.blurScale / resolution.x, 0.f),
+        float2(0.f, quality.blurScale / resolution.y)
+    };
     ref<Texture> blurInput = mpAOBuffer;
     ref<Texture> blurOutputs[2] = { mpAOBlurTemp, mpAOBlurTarget };
 
@@ -757,11 +817,14 @@ void FilamentPostProcess::executeGTAO(RenderContext* pRenderContext, const ref<T
     updateAOTextures(mpDevice, fullResolution.x, fullResolution.y, settings.ssaoResolution);
     const uint2 resolution = uint2(mAOBufferWidth, mAOBufferHeight);
 
-    float sampleCount = (float)settings.ssaoSampleCount;
-    float radius = settings.gtaoRadius;
-    float peak = 0.1f * radius;
-    float intensity = (6.283185307f * peak * settings.ssaoIntensity) / sampleCount;
-    float power = settings.ssaoPower * 2.0f;
+    const AOQualityParams quality = getAOQualityParams(settings);
+    const float radius = settings.gtaoRadius;
+    const float invRadiusSquared = 1.0f / std::max(radius * radius, 1e-6f);
+    const float projectionScale = getProjectionScale(settings.positionParams, resolution);
+    const float projectionScaleRadius = projectionScale * radius;
+    const float sliceCount = (float)std::clamp(settings.gtaoSlices, 1, 16);
+    const float stepsPerSlice = (float)std::clamp(settings.gtaoSteps, 1, 16);
+    const float power = settings.ssaoPower;
 
     {
         auto var = mpGTAOPass->getRootVar();
@@ -769,13 +832,17 @@ void FilamentPostProcess::executeGTAO(RenderContext* pRenderContext, const ref<T
         if (cb.isValid())
         {
             cb["gResolution"] = float4((float)resolution.x, (float)resolution.y, 1.f / resolution.x, 1.f / resolution.y);
-            cb["gIntensity"] = intensity;
-            cb["gPower"] = power;
-            cb["gInvFarPlane"] = 1.0f / std::max(settings.farPlane, 1.0f);
             cb["gPositionParams"] = settings.positionParams;
-            cb["gGtaoRadius"] = settings.gtaoRadius;
-            cb["gGtaoSlices"] = settings.gtaoSlices;
-            cb["gGtaoSteps"] = settings.gtaoSteps;
+            cb["gInvFarPlane"] = 1.0f / std::max(settings.farPlane, 1.0f);
+            cb["gMaxLevel"] = (int)std::max(0u, mStructureLevelCount - 1);
+            cb["gProjectionScaleRadius"] = projectionScaleRadius;
+            cb["gIntensity"] = settings.ssaoIntensity;
+            cb["gSliceCount"] = float2(sliceCount, 1.0f / sliceCount);
+            cb["gStepsPerSlice"] = stepsPerSlice;
+            cb["gRadius"] = radius;
+            cb["gInvRadiusSquared"] = invRadiusSquared;
+            cb["gPower"] = power;
+            cb["gThicknessHeuristic"] = settings.gtaoThicknessHeuristic;
         }
         auto camCB = var["CameraCB"];
         if (camCB.isValid())
@@ -787,12 +854,12 @@ void FilamentPostProcess::executeGTAO(RenderContext* pRenderContext, const ref<T
     }
 
     const float farPlaneOverEdgeDistance = settings.farPlane / std::max(settings.ssaoBilateralThreshold, 1e-4f);
-    const float2 axes[2] = { float2(1.f / resolution.x, 0.f), float2(0.f, 1.f / resolution.y) };
-    const float bilateralStdDev = 4.0f;
-    const uint32_t gaussianSampleCount = 6;
+    const float2 axes[2] = {
+        float2(quality.blurScale / resolution.x, 0.f),
+        float2(0.f, quality.blurScale / resolution.y)
+    };
     float kGaussianSamples[16] = {};
-    for (uint32_t i = 0; i < gaussianSampleCount; ++i)
-        kGaussianSamples[i] = std::exp(-(float(i) * float(i)) / (2.0f * bilateralStdDev * bilateralStdDev));
+    const uint32_t gaussianSampleCount = makeGaussianKernel(kGaussianSamples, quality.kernelSize, quality.standardDeviation);
 
     ref<Texture> blurInput = mpAOBuffer;
     ref<Texture> blurOutputs[2] = { mpAOBlurTemp, mpAOBlurTarget };

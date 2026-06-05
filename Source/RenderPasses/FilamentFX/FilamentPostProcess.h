@@ -32,7 +32,7 @@ public:
         float3 sunDirection = float3(0.0f, -1.0f, 0.0f);
 
         // Bloom
-        bool enableBloom = true;
+        bool enableBloom = false;
         float bloomStrength = 0.25f;
         int bloomLevels = 6;
         int bloomBlendMode = 0; // 0: Add, 1: Screen
@@ -54,8 +54,9 @@ public:
         float ssaoProjectionScale = 1.0f;
         int ssaoMode = 0; // 0: SAO (Filament default), 1: GTAO horizon-based
         int gtaoSlices = 4;
-        int gtaoSteps = 4;
+        int gtaoSteps = 3;
         float gtaoRadius = 0.3f;
+        float gtaoThicknessHeuristic = 0.004f;
 
         // FSR / sharpening (RCAS post-pass; full EASU upsample when DSR < 1 is future work)
         bool enableFSR = false;
@@ -93,7 +94,7 @@ public:
         bool enableSSR = false;
 
         // Vignette
-        bool enableVignette = true;
+        bool enableVignette = false;
         float vignetteMidpoint = 0.5f;
         float vignetteRoundness = 0.5f;
         float vignetteFeather = 0.5f;
@@ -105,7 +106,7 @@ public:
         float contrast = 1.0f;
         float vibrance = 1.0f;
         float saturation = 1.0f;
-        bool enableColorGradingLUT = true;
+        bool enableColorGradingLUT = false;
         int lutSize = 32; // 16 or 32
 
         // TAA

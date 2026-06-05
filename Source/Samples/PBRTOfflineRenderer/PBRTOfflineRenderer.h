@@ -29,6 +29,8 @@ public:
     void onDroppedFile(const std::filesystem::path& p) override;
     void setScenePath(const std::filesystem::path& p) { mScenePath = p; }
     void setOutputPath(const std::filesystem::path& p) { mOutputPath = p; }
+    void setSingleFrame(bool enabled) { mSingleFrame = enabled; }
+    void setHeadlessProbeMode(bool enabled);
 
 private:
     void loadScene(RenderContext* pCtx);
@@ -41,6 +43,7 @@ private:
     void syncFilamentCameraSettings();
     void syncFilamentSunLight();
     void initSunFromScene();
+    void updateInteractiveCamera();
 
     std::filesystem::path mScenePath, mOutputPath;
     ref<Scene> mpScene;
@@ -73,9 +76,22 @@ private:
     tf::Executor mExecutor;
     tf::Taskflow mTaskflow;
     bool mSavePending = false;
+    bool mSingleFrame = false;
     std::mutex mSaveMutex;
     std::filesystem::path mSavePath;
     ref<Texture> mSaveTexture;
+
+    bool mMoveForward = false;
+    bool mMoveBackward = false;
+    bool mMoveLeft = false;
+    bool mMoveRight = false;
+    bool mMoveUp = false;
+    bool mMoveDown = false;
+    bool mMoveFast = false;
+    bool mMouseLook = false;
+    float2 mLastMousePos = float2(0.f);
+    float2 mPendingMouseDelta = float2(0.f);
+    double mLastCameraUpdateTime = 0.0;
 
     FilamentPostProcess::FilamentSettings mFilamentSettings;
 };
