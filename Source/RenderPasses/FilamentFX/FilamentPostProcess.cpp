@@ -232,31 +232,60 @@ void FilamentPostProcess::executeStructure(RenderContext* pRenderContext, const 
     }
 }
 
-void FilamentPostProcess::updateAOTextures(ref<Device> pDevice, uint32_t width, uint32_t height)
+void FilamentPostProcess::updateAOTextures(ref<Device> pDevice, uint32_t width, uint32_t height, float resolutionScale)
 {
-    if (!mpAOBuffer || mpAOBuffer->getWidth() != width || mpAOBuffer->getHeight() != height)
+    const float scale = std::clamp(resolutionScale, 0.25f, 1.0f);
+    const uint32_t aoW = std::max(1u, uint32_t(std::round(float(width) * scale)));
+    const uint32_t aoH = std::max(1u, uint32_t(std::round(float(height) * scale)));
+    mAOBufferWidth = aoW;
+    mAOBufferHeight = aoH;
+
+    if (!mpAOBuffer || mpAOBuffer->getWidth() != aoW || mpAOBuffer->getHeight() != aoH)
     {
-        mpAOBuffer = pDevice->createTexture2D(width, height, ResourceFormat::RG32Float, 1, 1, nullptr,
+        mpAOBuffer = pDevice->createTexture2D(aoW, aoH, ResourceFormat::RG32Float, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
     }
-    if (!mpAOBlurTarget || mpAOBlurTarget->getWidth() != width || mpAOBlurTarget->getHeight() != height)
+    if (!mpAOBlurTarget || mpAOBlurTarget->getWidth() != aoW || mpAOBlurTarget->getHeight() != aoH)
     {
-        mpAOBlurTarget = pDevice->createTexture2D(width, height, ResourceFormat::RG32Float, 1, 1, nullptr,
+        mpAOBlurTarget = pDevice->createTexture2D(aoW, aoH, ResourceFormat::RG32Float, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
     }
-    if (!mpAOBlurTemp || mpAOBlurTemp->getWidth() != width || mpAOBlurTemp->getHeight() != height)
+    if (!mpAOBlurTemp || mpAOBlurTemp->getWidth() != aoW || mpAOBlurTemp->getHeight() != aoH)
     {
-        mpAOBlurTemp = pDevice->createTexture2D(width, height, ResourceFormat::RG32Float, 1, 1, nullptr,
+        mpAOBlurTemp = pDevice->createTexture2D(aoW, aoH, ResourceFormat::RG32Float, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
     }
+}
+
+void FilamentPostProcess::bindAOShaderVars(const ShaderVar& var, const FilamentSettings& settings, const ref<Texture>& pDepthPrepass) const
+{
+    if (!var.isValid()) return;
+
+    const bool halfRes = settings.enableSSAO && settings.ssaoResolution < 0.999f;
+    auto cb = var["AODataCB"];
+    if (cb.isValid())
+    {
+        cb["gSSAOHalfResEnabled"] = halfRes ? 1u : 0u;
+        cb["gSSAOBufferSize"] = float2(float(mAOBufferWidth), float(mAOBufferHeight));
+        cb["gAOBilateralEdgeDist"] = settings.ssaoBilateralEdgeDistance;
+        cb["gInvFarPlane"] = 1.0f / std::max(settings.farPlane, 1.0f);
+        cb["gInvProj"] = settings.invProj;
+        cb["gPositionParams"] = settings.positionParams;
+    }
+
+    if (var["gAODepth"].isValid())
+        var["gAODepth"] = pDepthPrepass ? pDepthPrepass : mpWhiteTexture;
+    if (var["gAODepthPointSampler"].isValid())
+        var["gAODepthPointSampler"] = mpPointSampler;
 }
 
 void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings)
 {
     if (!mpSSAOPass || !mpSSAOBlurPass || !pDepth || !mpStructureDepth) return;
 
-    const uint2 resolution = uint2(pDepth->getWidth(), pDepth->getHeight());
-    updateAOTextures(mpDevice, resolution.x, resolution.y);
+    const uint2 fullResolution = uint2(pDepth->getWidth(), pDepth->getHeight());
+    updateAOTextures(mpDevice, fullResolution.x, fullResolution.y, settings.ssaoResolution);
+    const uint2 resolution = uint2(mAOBufferWidth, mAOBufferHeight);
 
     // Filament SAO parameters (matching PostProcessManager screenSpaceAmbientOcclusion)
     float sampleCount = (float)settings.ssaoSampleCount;

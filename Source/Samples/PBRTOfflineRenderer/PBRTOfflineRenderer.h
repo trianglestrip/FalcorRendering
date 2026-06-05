@@ -51,6 +51,7 @@ private:
     ref<Texture> mpIntermediateTexture;
     ref<Texture> mpVelocityTexture;
     ref<Texture> mpIntermediateDepth;
+    ref<Texture> mpDepthPrepass;
     ref<Texture> mpPostProcessOutput;
     ref<CPUSampleGenerator> mpHaltonJitter;
 

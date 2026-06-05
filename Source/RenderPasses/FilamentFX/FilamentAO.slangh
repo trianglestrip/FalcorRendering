@@ -1,17 +1,77 @@
 // Filament ambient occlusion - ported from surface_ambient_occlusion.fs
-// Forward pass samples precomputed SSAO buffer (full-res path; half-res upsample is Task-F).
+// Supports full-res and half-res SSAO with bilateral upscale in forward pass.
+
+cbuffer AODataCB
+{
+    uint gSSAOHalfResEnabled;
+    float2 gSSAOBufferSize;
+    float gAOBilateralEdgeDist;
+    float gInvFarPlane;
+    float4x4 gInvProj;
+    float2 gPositionParams;
+};
 
 Texture2D<float2> gSSAO;
+Texture2D<float> gAODepth;
 SamplerState gSSAOLinearSampler;
+SamplerState gAODepthPointSampler;
 
-float evaluateSSAO(float2 uv)
+float linearizeAODepth(float depth)
+{
+    const float preventDiv0 = 1.0 / 16777216.0;
+    float4 p = gInvProj[2];
+    float4 q = gInvProj[3];
+    return (depth * p.z + q.z) / max(depth * p.w + q.w, preventDiv0);
+}
+
+float packAODepth(float linearZ)
+{
+    return saturate(linearZ * gInvFarPlane);
+}
+
+float evaluateSSAOBilinear(float2 uv)
 {
     return gSSAO.SampleLevel(gSSAOLinearSampler, uv, 0).r;
 }
 
+float evaluateSSAOHalfResUpsample(float2 uv)
+{
+    float2 size = gSSAOBufferSize;
+    float2 f = frac(uv * size - 0.5);
+    float4 b;
+    b.x = (1.0 - f.x) * f.y;
+    b.y = f.x * f.y;
+    b.z = f.x * (1.0 - f.y);
+    b.w = (1.0 - f.x) * (1.0 - f.y);
+
+    int2 base = int2(floor(uv * size - 0.5));
+    float2 s01 = gSSAO.Load(int3(base + int2(0, 1), 0)).rg;
+    float2 s11 = gSSAO.Load(int3(base + int2(1, 1), 0)).rg;
+    float2 s10 = gSSAO.Load(int3(base + int2(1, 0), 0)).rg;
+    float2 s00 = gSSAO.Load(int3(base + int2(0, 0), 0)).rg;
+    float4 aoSamples = float4(s01.r, s11.r, s10.r, s00.r);
+    float4 depthSamples = float4(s01.g, s11.g, s10.g, s00.g);
+
+    float depth = gAODepth.SampleLevel(gAODepthPointSampler, uv, 0);
+    if (depth > 0.9999)
+        return 1.0;
+
+    float pixelPacked = packAODepth(linearizeAODepth(depth));
+    float4 diff = (pixelPacked - depthSamples) * gAOBilateralEdgeDist;
+    float4 w = max(float4(1e-6), 1.0 - diff * diff) * b;
+    float weightSum = w.x + w.y + w.z + w.w;
+    return dot(aoSamples, w) / weightSum;
+}
+
+float evaluateSSAO(float2 uv)
+{
+    if (gSSAOHalfResEnabled != 0u)
+        return evaluateSSAOHalfResUpsample(uv);
+    return evaluateSSAOBilinear(uv);
+}
+
 float SpecularAO_Lagarde(float NoV, float visibility, float roughness)
 {
-    // Lagarde and de Rousiers 2014, "Moving Frostbite to PBR"
     return saturate(pow(NoV + visibility, exp2(-16.0 * roughness - 1.0)) - 1.0 + visibility);
 }
 

@@ -288,6 +288,8 @@ void PBRTOfflineRenderer::setAOShaderVars(const ShaderVar& var)
         var["gSSAO"] = mpFilamentPostProcess->getAOTexture(mFilamentSettings);
     if (var["gSSAOLinearSampler"].isValid())
         var["gSSAOLinearSampler"] = mpFilamentPostProcess->getLinearSampler();
+
+    mpFilamentPostProcess->bindAOShaderVars(var, mFilamentSettings, mpDepthPrepass);
 }
 
 void PBRTOfflineRenderer::setShadowShaderVars(const ShaderVar& var)
@@ -457,6 +459,9 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
         mpIntermediateDepth = getDevice()->createTexture2D(
             frameDim.x, frameDim.y, ResourceFormat::D32Float, 1, 1, nullptr,
             ResourceBindFlags::DepthStencil | ResourceBindFlags::ShaderResource);
+        mpDepthPrepass = getDevice()->createTexture2D(
+            frameDim.x, frameDim.y, ResourceFormat::D32Float, 1, 1, nullptr,
+            ResourceBindFlags::DepthStencil | ResourceBindFlags::ShaderResource);
         mpPostProcessOutput = getDevice()->createTexture2D(
             frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
             ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
@@ -469,11 +474,11 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     // Depth prepass -> SSAO (Filament: structure + SSAO before color pass)
     if (mpDepthPrepassPass && mFilamentSettings.postProcessingEnabled && mFilamentSettings.enableSSAO && mFilamentSettings.forwardSSAO && mpFilamentPostProcess)
     {
-        auto pDepthFbo = Fbo::create(getDevice(), {}, mpIntermediateDepth);
+        auto pDepthFbo = Fbo::create(getDevice(), {}, mpDepthPrepass);
         pCtx->clearFbo(pDepthFbo.get(), float4(0.f, 0.f, 0.f, 0.f), 1.f, 1.f, FboAttachmentType::Depth);
         mpDepthPrepassPass->getState()->setFbo(pDepthFbo);
         mpScene->rasterize(pCtx, mpDepthPrepassPass->getState().get(), mpDepthPrepassPass->getVars().get());
-        mpFilamentPostProcess->executePrePassSSAO(pCtx, mpIntermediateDepth, mFilamentSettings);
+        mpFilamentPostProcess->executePrePassSSAO(pCtx, mpDepthPrepass, mFilamentSettings);
     }
 
     auto pInterFbo = Fbo::create(getDevice(), {mpIntermediateTexture, mpVelocityTexture}, mpIntermediateDepth);
@@ -636,6 +641,8 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                         ssaoGroup.slider("Intensity", mFilamentSettings.ssaoIntensity, 0.0f, 3.0f);
                         ssaoGroup.slider("Samples", mFilamentSettings.ssaoSampleCount, 4, 64);
                         ssaoGroup.slider("Spiral Turns", mFilamentSettings.ssaoSpiralTurns, 1, 15);
+                        ssaoGroup.slider("Resolution", mFilamentSettings.ssaoResolution, 0.25f, 1.0f);
+                        ssaoGroup.slider("Upsample Edge", mFilamentSettings.ssaoBilateralEdgeDistance, 0.01f, 1.0f);
                     }
                 }
                 

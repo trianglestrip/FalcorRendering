@@ -41,6 +41,8 @@ public:
         // SSAO (Filament SAO parameters)
         bool enableSSAO = true;
         bool forwardSSAO = true; // When true, SSAO is applied in forward pass (not colorGradingPrep)
+        float ssaoResolution = 0.5f;      // Filament AmbientOcclusionOptions.resolution (0.5 = half-res)
+        float ssaoBilateralEdgeDistance = 0.1f; // Forward upscale edge distance (Filament aoSamplingQualityAndEdgeDistance)
         float ssaoRadius = 0.3f;          // Filament default radius
         float ssaoBias = 0.001f;          // Filament default bias
         float ssaoPower = 1.0f;           // power curve (doubled internally)
@@ -103,6 +105,9 @@ public:
     void executePrePassSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
     ref<Texture> getAOTexture(const FilamentSettings& settings) const;
     ref<Sampler> getLinearSampler() const { return mpLinearSampler; }
+    ref<Sampler> getPointSampler() const { return mpPointSampler; }
+    uint2 getAOBufferSize() const { return uint2(mAOBufferWidth, mAOBufferHeight); }
+    void bindAOShaderVars(const ShaderVar& var, const FilamentSettings& settings, const ref<Texture>& pDepthPrepass) const;
 
 private:
     // Post-processing passes
@@ -156,7 +161,7 @@ private:
     void updateBloomTextures(ref<Device> pDevice, uint32_t width, uint32_t height, uint32_t levels);
     void updateStructureTextures(ref<Device> pDevice, uint32_t width, uint32_t height);
     void executeStructure(RenderContext* pRenderContext, const ref<Texture>& pDepth);
-    void updateAOTextures(ref<Device> pDevice, uint32_t width, uint32_t height);
+    void updateAOTextures(ref<Device> pDevice, uint32_t width, uint32_t height, float resolutionScale);
     void createNoiseTexture(ref<Device> pDevice);
     void executeSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
     void executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings, const ref<Texture>& pShadowMapDepth = nullptr);
@@ -167,4 +172,6 @@ private:
     void updateHistory(RenderContext* pRenderContext, const ref<Texture>& pColor, const ref<Texture>& pDepth, uint32_t width, uint32_t height);
     uint32_t mHistoryWidth = 0;
     uint32_t mHistoryHeight = 0;
+    uint32_t mAOBufferWidth = 0;
+    uint32_t mAOBufferHeight = 0;
 };
