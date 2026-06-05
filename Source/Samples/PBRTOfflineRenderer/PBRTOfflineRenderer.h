@@ -6,7 +6,10 @@
 #include "Core/SampleApp.h"
 #include "Core/Pass/RasterPass.h"
 #include "Scene/Scene.h"
+#include "Scene/Lights/Light.h"
 #include "FilamentPostProcess.h"
+#include "FilamentIBL.h"
+#include "Utils/SampleGenerators/CPUSampleGenerator.h"
 #include <taskflow.hpp>
 
 using namespace Falcor;
@@ -32,19 +35,30 @@ private:
     void saveOutput(RenderContext* pCtx);
     void buildTaskGraph();
     void renderShadowMap(RenderContext* pCtx);
+    void ensureShadowMapResources();
+    void setShadowShaderVars(const ShaderVar& var);
+    void setAOShaderVars(const ShaderVar& var);
+    void syncFilamentCameraSettings();
+    void syncFilamentSunLight();
+    void initSunFromScene();
 
     std::filesystem::path mScenePath, mOutputPath;
     ref<Scene> mpScene;
     ref<RasterPass> mpRasterPass;
+    ref<RasterPass> mpDepthPrepassPass;
     ref<FilamentPostProcess> mpFilamentPostProcess;
+    ref<FilamentIBL> mpFilamentIBL;
     ref<Texture> mpIntermediateTexture;
+    ref<Texture> mpVelocityTexture;
     ref<Texture> mpIntermediateDepth;
     ref<Texture> mpPostProcessOutput;
+    ref<CPUSampleGenerator> mpHaltonJitter;
 
     // Shadow map resources
     ref<Texture> mpShadowMapDepth;
     ref<Fbo> mpShadowFbo;
     ref<RasterPass> mpShadowRasterPass;
+    ref<Sampler> mpShadowPointSampler;
     uint32_t mShadowMapSize = 2048;
 
     uint32_t mFrameCount = 0;

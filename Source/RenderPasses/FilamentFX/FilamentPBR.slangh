@@ -8,6 +8,7 @@ struct PixelParams
     float perceptualRoughness;
     float roughness;
     float3 f0;
+    float3 dfg;
     float3 energyCompensation;
 };
 
@@ -77,20 +78,8 @@ float3 surfaceShading(PixelParams pixel, float3 lightDir, float3 viewDir, float3
     return color * NoL * occlusion;
 }
 
-// ---- Energy compensation (Filament simplified from DFG LUT) ----
-float3 computeEnergyCompensation(float3 f0, float roughness)
+// ---- Energy compensation (Filament: from prefilteredDFG LUT channel y) ----
+float3 computeEnergyCompensation(float3 f0, float3 dfg)
 {
-    // Filament's energyCompensation term from prefilteredDFG LUT
-    // Approximated as 1 + f0*(1/roughness - 1)
-    return 1.0 + f0 * (1.0 / max(roughness, 0.01) - 1.0);
-}
-
-// ---- IBL DFG approximation (Filament's prefilteredDFG LUT simplified) ----
-float3 prefilteredDFG(float3 f0, float perceptualRoughness, float NoV)
-{
-    float lod = perceptualRoughness;
-    float3 a = f0 * (1.0 - lod);
-    float3 b = 1.0 - f0 * lod;
-    float e = exp2((-5.55473 * NoV - 6.98316) * NoV);
-    return a * e + b;
+    return 1.0 + f0 * (1.0 / max(dfg.y, 1e-4) - 1.0);
 }

@@ -40,6 +40,7 @@ public:
 
         // SSAO (Filament SAO parameters)
         bool enableSSAO = true;
+        bool forwardSSAO = true; // When true, SSAO is applied in forward pass (not colorGradingPrep)
         float ssaoRadius = 0.3f;          // Filament default radius
         float ssaoBias = 0.001f;          // Filament default bias
         float ssaoPower = 1.0f;           // power curve (doubled internally)
@@ -50,14 +51,16 @@ public:
         float ssaoPeak2 = 0.0001f;
         float ssaoProjectionScale = 1.0f;
 
-        // Shadow (safe dummy shadow map + identity matrices, toggle won't crash)
+        // Shadow (CSM atlas rendered in forward pass; post-process shadow is optional debug)
         bool enableShadows = true;
+        bool postProcessShadow = false;
         int shadowType = 1; // 0: PCF Hard, 1: PCF Low (3x3), 2: VSM
         int shadowCascades = 4;
         float shadowBias = 0.001f;
         float4 cascadeSplits = float4(5.0f, 15.0f, 40.0f, 100.0f);
         uint32_t shadowMapSize = 2048;
-        float4x4 shadowLightViewProj = float4x4(); // Set by renderShadowMap
+        float4x4 shadowLightViewProj[4] = {};
+        float4 cascadeAtlasRect[4] = {};
 
         // Depth of Field
         bool enableDoF = false;
@@ -81,6 +84,7 @@ public:
 
         // TAA
         float taaFeedback = 0.9f;
+        float2 cameraJitter = float2(0.f, 0.f); // Subpixel jitter (normalized), set when antiAliasing==2
 
         // Camera (set each frame by PBRTOfflineRenderer)
         float4x4 invViewProj = float4x4();
@@ -89,19 +93,32 @@ public:
         float farPlane = 1000.0f;
         float ssaoBilateralThreshold = 0.05f;
         float2 positionParams = float2(1.155f, 0.649f); // invProj scale * 2 for x,y
+        float3 cameraPos = float3(0.f);
     };
 
     // Custom execution for PBRTOfflineRenderer
-    void executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pShadowMap = nullptr);
+    void executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pShadowMap = nullptr, const ref<Texture>& pMotionVec = nullptr);
+
+    // Pre-pass SSAO (depth prepass -> structure -> SSAO), consumed by forward shader via getAOTexture().
+    void executePrePassSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
+    ref<Texture> getAOTexture(const FilamentSettings& settings) const;
+    ref<Sampler> getLinearSampler() const { return mpLinearSampler; }
 
 private:
     // Post-processing passes
     ref<ComputePass> mpColorGradingPass;
+    ref<ComputePass> mpColorGradingPrepPass;
     ref<ComputePass> mpBloomDownsamplePass;
     ref<ComputePass> mpBloomUpsamplePass;
     ref<ComputePass> mpFXAAPass;
     ref<ComputePass> mpDoFPass;
     ref<ComputePass> mpTAAPass;
+
+    // Structure depth pyramid (SSAO LOD)
+    ref<ComputePass> mpStructureCopyPass;
+    ref<ComputePass> mpStructureMipmapPass;
+    ref<Texture> mpStructureDepth;
+    uint32_t mStructureLevelCount = 1;
 
     // SSAO passes
     ref<ComputePass> mpSSAOPass;
@@ -112,9 +129,13 @@ private:
 
     // Intermediate textures
     static const uint32_t kMaxBloomLevels = 7;
+    static const uint32_t kMaxStructureLevels = 8;
     ref<Texture> mpBloomMips[kMaxBloomLevels];
     ref<Texture> mpColorGradingTarget;
+    ref<Texture> mpPrepTarget;
+    ref<Texture> mpTAATarget;
     ref<Texture> mpDoFTarget;
+    ref<Texture> mpZeroMotionTexture;
     ref<Texture> mpHistoryColor;
     ref<Texture> mpHistoryDepth;
     ref<Texture> mpAOBuffer;
@@ -133,12 +154,16 @@ private:
 
     // Helper functions
     void updateBloomTextures(ref<Device> pDevice, uint32_t width, uint32_t height, uint32_t levels);
+    void updateStructureTextures(ref<Device> pDevice, uint32_t width, uint32_t height);
+    void executeStructure(RenderContext* pRenderContext, const ref<Texture>& pDepth);
     void updateAOTextures(ref<Device> pDevice, uint32_t width, uint32_t height);
     void createNoiseTexture(ref<Device> pDevice);
     void executeSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
     void executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings, const ref<Texture>& pShadowMapDepth = nullptr);
     void executeDoF(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings);
-    void executeTAA(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings);
+    void executeTAA(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pMotionVec);
+    void executeColorGradingPrep(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings);
+    void executeColorGradingComposite(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings);
     void updateHistory(RenderContext* pRenderContext, const ref<Texture>& pColor, const ref<Texture>& pDepth, uint32_t width, uint32_t height);
     uint32_t mHistoryWidth = 0;
     uint32_t mHistoryHeight = 0;

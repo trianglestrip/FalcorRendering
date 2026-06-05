@@ -31,6 +31,7 @@ cbuffer CameraCB
 };
 
 Texture2D<float> gDepth;
+Texture2D<float> gStructureDepth;
 Texture2D<float2> gAOBuffer;
 RWTexture2D<float2> gDst;
 RWTexture2D<float2> gBlurredAO;
@@ -59,7 +60,7 @@ bool isSkyDepth(float depth)
 
 float sampleDepthLinear(float2 uv, float lod)
 {
-    return linearizeDepth(gDepth.SampleLevel(gPointSampler, uv, lod).r);
+    return linearizeDepth(gStructureDepth.SampleLevel(gPointSampler, uv, lod).r);
 }
 
 // geometry.fs
@@ -154,7 +155,7 @@ void ssaoMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     float2 coord = float2(dispatchThreadId.xy);
     float2 uv = (coord + 0.5) * gResolution.zw;
 
-    float depth = gDepth.SampleLevel(gPointSampler, uv, 0).r;
+    float depth = gStructureDepth.SampleLevel(gPointSampler, uv, 0).r;
     if (isSkyDepth(depth))
     {
         gDst[dispatchThreadId.xy] = float2(1.0, 1.0);

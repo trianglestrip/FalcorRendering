@@ -1,5 +1,6 @@
 /***************************************************************************
- # Shadow depth-only pass - renders geometry from light's perspective
+ # Shadow depth-only pass - renders geometry from light's perspective.
+ # C++ drives multi-cascade atlas rendering via per-cascade viewport + camera matrices.
  **************************************************************************/
 import Scene.Raster;
 

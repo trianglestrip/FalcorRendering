@@ -12,9 +12,9 @@ cbuffer PerFrameCB
     float3 gVignetteColor;
     float gBloomStrength;
     float gBloomBlendMode; // 0: Add, 1: Screen
-    float gAOEnabled;      // 1.0 = enabled, 0.0 = disabled
-    float gShadowEnabled;  // 1.0 = enabled, 0.0 = disabled
-    float gDithering;      // 1.0 = enabled
+    float gAOEnabled;          // 1.0 = enabled, 0.0 = disabled
+    float gPostProcessShadow;  // 1.0 = debug multiply, 0.0 = forward shadows only (default)
+    float gDithering;          // 1.0 = enabled
 };
 
 float interleavedGradientNoise(float2 screenPos)
@@ -69,6 +69,32 @@ float3 ColorGrade(float3 color) {
     return color;
 }
 
+// Pre-TAA pass: apply SSAO and shadow visibility to HDR color (Filament applies AO before TAA).
+[numthreads(16, 16, 1)]
+void colorGradingPrep(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    if (any(dispatchThreadId.xy >= gResolution))
+        return;
+
+    int2 coord = int2(dispatchThreadId.xy);
+    float4 src = gSrc.Load(int3(coord, 0));
+    float3 color = src.rgb;
+    float ambientWeight = src.a;
+
+    if (gAOEnabled > 0.5f) {
+        float ao = gAO.Load(int3(coord, 0)).r;
+        ao = saturate(ao);
+        color *= (1.0 - ambientWeight + ambientWeight * ao);
+    }
+
+    if (gPostProcessShadow > 0.5f) {
+        float shadow = gShadow.Load(int3(coord, 0)).r;
+        color *= shadow;
+    }
+
+    gDst[coord] = float4(color, ambientWeight);
+}
+
 [numthreads(16, 16, 1)]
 void colorGradingMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
@@ -80,21 +106,6 @@ void colorGradingMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     
     float4 src = gSrc.Load(int3(coord, 0));
     float3 color = src.rgb;
-    // Alpha stores ambient/indirect weight (Filament applies SSAO to indirect only, not direct sun)
-    float ambientWeight = src.a;
-
-    // Apply SSAO to indirect term: result = direct + ambient * ao
-    if (gAOEnabled > 0.5f) {
-        float ao = gAO.Load(int3(coord, 0)).r;
-        ao = saturate(ao);
-        color *= (1.0 - ambientWeight + ambientWeight * ao);
-    }
-
-    // Apply Shadow Visibility
-    if (gShadowEnabled > 0.5f) {
-        float shadow = gShadow.Load(int3(coord, 0)).r;
-        color *= shadow;
-    }
 
     // Apply Bloom Composite
     if (gBloomStrength > 0.0f) {

@@ -2,9 +2,114 @@
  # Copyright (c) 2015-24, NVIDIA CORPORATION. All rights reserved.
  **************************************************************************/
 #include "PBRTOfflineRenderer.h"
+#include "Utils/Math/FalcorMath.h"
+#include "Utils/SampleGenerators/HaltonSamplePattern.h"
+#include <cmath>
+#include <limits>
 
 FALCOR_EXPORT_D3D12_AGILITY_SDK
 static const float4 kClear = float4(0.1f, 0.1f, 0.12f, 1.f);
+
+namespace
+{
+    struct CascadeAtlasLayout { uint32_t cols; uint32_t rows; };
+
+    CascadeAtlasLayout getAtlasLayout(uint32_t cascadeCount)
+    {
+        switch (cascadeCount)
+        {
+        case 1: return {1, 1};
+        case 2: return {2, 1};
+        case 3: return {2, 2};
+        default: return {2, 2};
+        }
+    }
+
+    float4 getAtlasTileRect(uint32_t cascadeIndex, const CascadeAtlasLayout& layout)
+    {
+        const float tileW = 1.f / float(layout.cols);
+        const float tileH = 1.f / float(layout.rows);
+        const uint32_t col = cascadeIndex % layout.cols;
+        const uint32_t row = cascadeIndex / layout.cols;
+        return float4(col * tileW, row * tileH, tileW, tileH);
+    }
+
+    float4x4 buildLightViewMatrix(float3 lightPos, float3 lightDir, float3 cameraFwd)
+    {
+        float3 f = normalize(-lightDir);
+        float3 s = normalize(cross(f, cameraFwd));
+        if (length(s) < 1e-4f)
+            s = normalize(cross(f, float3(0, 1, 0)));
+        float3 u = cross(s, f);
+
+        float4x4 view = float4x4::identity();
+        view[0] = float4(s.x, u.x, -f.x, 0.f);
+        view[1] = float4(s.y, u.y, -f.y, 0.f);
+        view[2] = float4(s.z, u.z, -f.z, 0.f);
+        view[3] = float4(-dot(s, lightPos), -dot(u, lightPos), dot(f, lightPos), 1.f);
+        return view;
+    }
+
+    float4x4 buildOrthoProjMatrix(float left, float right, float bottom, float top, float nearP, float farP)
+    {
+        const float rcpRange = 1.f / (farP - nearP);
+        float4x4 proj = float4x4::identity();
+        proj[0][0] = 2.f / (right - left);
+        proj[1][1] = 2.f / (top - bottom);
+        proj[2][2] = rcpRange;
+        proj[3][0] = -(right + left) / (right - left);
+        proj[3][1] = -(top + bottom) / (top - bottom);
+        proj[3][2] = -nearP * rcpRange;
+        return proj;
+    }
+
+    float3 transformPoint(const float4x4& m, float3 p)
+    {
+        return mul(float4(p, 1.f), m).xyz();
+    }
+
+    void getFrustumSliceCorners(const ref<Camera>& pCam, float sliceNear, float sliceFar, float3 corners[8])
+    {
+        float3 camPos = pCam->getPosition();
+        float3 fwd = normalize(pCam->getTarget() - camPos);
+        float3 up = float3(0, 1, 0);
+        float3 right = normalize(cross(fwd, up));
+        up = cross(right, fwd);
+
+        const float fovY = focalLengthToFovY(pCam->getFocalLength(), Camera::kDefaultFrameHeight);
+        const float tanHalfY = std::tan(fovY * 0.5f);
+        const float aspect = pCam->getAspectRatio();
+        const float tanHalfX = tanHalfY * aspect;
+
+        auto cornerAt = [&](float dist, int ix, int iy) -> float3
+        {
+            const float x = (ix == 0 ? -1.f : 1.f) * dist * tanHalfX;
+            const float y = (iy == 0 ? -1.f : 1.f) * dist * tanHalfY;
+            return camPos + fwd * dist + right * x + up * y;
+        };
+
+        int idx = 0;
+        for (int z = 0; z < 2; ++z)
+        {
+            const float dist = (z == 0) ? sliceNear : sliceFar;
+            for (int iy = 0; iy < 2; ++iy)
+                for (int ix = 0; ix < 2; ++ix)
+                    corners[idx++] = cornerAt(dist, ix, iy);
+        }
+    }
+
+    void appendAabbCorners(const AABB& box, float3* corners, uint32_t& count)
+    {
+        const float3 c = box.center();
+        const float3 e = box.extent() * 0.5f;
+        const float3 offsets[8] = {
+            {-1, -1, -1}, {1, -1, -1}, {-1, 1, -1}, {1, 1, -1},
+            {-1, -1, 1}, {1, -1, 1}, {-1, 1, 1}, {1, 1, 1},
+        };
+        for (const auto& o : offsets)
+            corners[count++] = c + o * e;
+    }
+}
 
 PBRTOfflineRenderer::PBRTOfflineRenderer(const SampleAppConfig& c) : SampleApp(c), mExecutor(std::thread::hardware_concurrency()) { buildTaskGraph(); }
 PBRTOfflineRenderer::~PBRTOfflineRenderer() { mExecutor.wait_for_all(); }
@@ -50,12 +155,7 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         d.addTypeConformances(mpScene->getTypeConformances());
         mpRasterPass = RasterPass::create(getDevice(), d, mpScene->getSceneDefines());
 
-        // Create shadow map resources
-        mShadowMapSize = mFilamentSettings.shadowMapSize;
-        mpShadowMapDepth = getDevice()->createTexture2D(
-            mShadowMapSize, mShadowMapSize, ResourceFormat::D32Float, 1, 1, nullptr,
-            ResourceBindFlags::DepthStencil | ResourceBindFlags::ShaderResource);
-        mpShadowFbo = Fbo::create(getDevice(), {}, mpShadowMapDepth);
+        ensureShadowMapResources();
 
         // Create shadow depth raster pass (depth-only from light POV)
         ProgramDesc sd;
@@ -65,8 +165,25 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         sd.addTypeConformances(mpScene->getTypeConformances());
         mpShadowRasterPass = RasterPass::create(getDevice(), sd, mpScene->getSceneDefines());
 
+        ProgramDesc depthDesc;
+        depthDesc.addCompilerArguments({"-Wno-30081"});
+        depthDesc.addShaderModules(mpScene->getShaderModules());
+        depthDesc.addShaderLibrary("Samples/PBRTOfflineRenderer/DepthPrepass.3d.slang").vsEntry("vsMain").psEntry("psMain");
+        depthDesc.addTypeConformances(mpScene->getTypeConformances());
+        mpDepthPrepassPass = RasterPass::create(getDevice(), depthDesc, mpScene->getSceneDefines());
+
+        Sampler::Desc shadowSamplerDesc;
+        shadowSamplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point);
+        shadowSamplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+        mpShadowPointSampler = getDevice()->createSampler(shadowSamplerDesc);
+
         Properties props;
         mpFilamentPostProcess = FilamentPostProcess::create(getDevice(), props);
+
+        mpFilamentIBL = FilamentIBL::create(getDevice());
+        mpFilamentIBL->loadDefault();
+
+        initSunFromScene();
     }
     catch (const std::exception& e)
     {
@@ -74,50 +191,233 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
     }
 }
 
+void PBRTOfflineRenderer::ensureShadowMapResources()
+{
+    if (mShadowMapSize != mFilamentSettings.shadowMapSize || !mpShadowMapDepth)
+    {
+        mShadowMapSize = mFilamentSettings.shadowMapSize;
+        mpShadowMapDepth = getDevice()->createTexture2D(
+            mShadowMapSize, mShadowMapSize, ResourceFormat::D32Float, 1, 1, nullptr,
+            ResourceBindFlags::DepthStencil | ResourceBindFlags::ShaderResource);
+        mpShadowFbo = Fbo::create(getDevice(), {}, mpShadowMapDepth);
+    }
+}
+
+void PBRTOfflineRenderer::initSunFromScene()
+{
+    if (!mpScene) return;
+
+    for (const auto& pLight : mpScene->getLights())
+    {
+        if (!pLight || !pLight->isActive()) continue;
+        const auto type = pLight->getType();
+        if (type != LightType::Directional && type != LightType::Distant) continue;
+
+        const float3 intensity = pLight->getIntensity();
+        const float lum = std::max(dot(intensity, float3(0.2126f, 0.7152f, 0.0722f)), 1e-6f);
+        mFilamentSettings.sunDirection = pLight->getData().dirW;
+        mFilamentSettings.sunIntensity = lum;
+        if (lum > 1e-6f)
+            mFilamentSettings.sunColor = intensity / lum;
+        return;
+    }
+}
+
+void PBRTOfflineRenderer::syncFilamentSunLight()
+{
+    if (!mpScene) return;
+
+    const float3 sunDir = normalize(mFilamentSettings.sunDirection);
+    const float3 intensity = mFilamentSettings.sunColor * mFilamentSettings.sunIntensity;
+
+    ref<Light> pSun;
+    for (const auto& pLight : mpScene->getLights())
+    {
+        if (!pLight || !pLight->isActive()) continue;
+        const auto type = pLight->getType();
+        if (type == LightType::Directional || type == LightType::Distant)
+        {
+            pSun = pLight;
+            break;
+        }
+    }
+
+    if (!pSun) return;
+
+    switch (pSun->getType())
+    {
+    case LightType::Directional:
+        static_cast<DirectionalLight*>(pSun.get())->setWorldDirection(sunDir);
+        break;
+    case LightType::Distant:
+        static_cast<DistantLight*>(pSun.get())->setWorldDirection(sunDir);
+        break;
+    default:
+        break;
+    }
+    pSun->setIntensity(intensity);
+}
+
+void PBRTOfflineRenderer::syncFilamentCameraSettings()
+{
+    if (!mpScene) return;
+
+    auto pCam = mpScene->getCamera();
+    mFilamentSettings.invViewProj = pCam->getInvViewProjMatrix();
+    mFilamentSettings.nearPlane = pCam->getNearPlane();
+    mFilamentSettings.farPlane = pCam->getFarPlane();
+    auto proj = pCam->getProjMatrix();
+    mFilamentSettings.positionParams = float2(2.0f / proj[0][0], 2.0f / proj[1][1]);
+    mFilamentSettings.invProj = inverse(proj);
+    mFilamentSettings.cameraPos = pCam->getPosition();
+    mFilamentSettings.cameraJitter = float2(pCam->getJitterX(), pCam->getJitterY());
+}
+
+void PBRTOfflineRenderer::setAOShaderVars(const ShaderVar& var)
+{
+    if (!var.isValid() || !mpFilamentPostProcess) return;
+
+    const bool useForwardSSAO = mFilamentSettings.postProcessingEnabled
+        && mFilamentSettings.enableSSAO
+        && mFilamentSettings.forwardSSAO;
+
+    if (var["PerFrameCB"]["gSSAOEnabled"].isValid())
+        var["PerFrameCB"]["gSSAOEnabled"] = useForwardSSAO ? 1u : 0u;
+
+    if (var["gSSAO"].isValid())
+        var["gSSAO"] = mpFilamentPostProcess->getAOTexture(mFilamentSettings);
+    if (var["gSSAOLinearSampler"].isValid())
+        var["gSSAOLinearSampler"] = mpFilamentPostProcess->getLinearSampler();
+}
+
+void PBRTOfflineRenderer::setShadowShaderVars(const ShaderVar& var)
+{
+    if (!var.isValid()) return;
+
+    auto cb = var["ShadowCB"];
+    if (cb.isValid())
+    {
+        cb["gShadowEnabled"] = mFilamentSettings.enableShadows ? 1u : 0u;
+        cb["gShadowType"] = (uint32_t)mFilamentSettings.shadowType;
+        cb["gCascadeCount"] = (uint32_t)std::clamp(mFilamentSettings.shadowCascades, 1, 4);
+        cb["gShadowBias"] = mFilamentSettings.shadowBias;
+        cb["gCascadeSplits"] = mFilamentSettings.cascadeSplits;
+        cb["gShadowAtlasSize"] = float2((float)mShadowMapSize, (float)mShadowMapSize);
+        cb["gShadowSunDir"] = normalize(mFilamentSettings.sunDirection);
+        for (int i = 0; i < 4; ++i)
+        {
+            cb["gLightViewProj"][i] = mFilamentSettings.shadowLightViewProj[i];
+            cb["gCascadeAtlasRect"][i] = mFilamentSettings.cascadeAtlasRect[i];
+        }
+    }
+
+    if (var["gShadowMap"].isValid() && mpShadowMapDepth)
+        var["gShadowMap"] = mpShadowMapDepth;
+    if (var["gShadowPointSampler"].isValid() && mpShadowPointSampler)
+        var["gShadowPointSampler"] = mpShadowPointSampler;
+}
+
 void PBRTOfflineRenderer::renderShadowMap(RenderContext* pCtx)
 {
     if (!mpShadowFbo || !mpShadowRasterPass || !mpScene) return;
 
-    pCtx->clearFbo(mpShadowFbo.get(), float4(0,0,0,0), 1.f, 0, FboAttachmentType::Depth);
-
-    float3 lightDir = normalize(mFilamentSettings.sunDirection);
-    float sceneRadius = mpScene->getSceneBounds().radius();
-    float3 sceneCenter = mpScene->getSceneBounds().center();
-    float3 lightPos = sceneCenter - lightDir * sceneRadius * 2.f;
-    float3 lightTarget = sceneCenter;
-
-    float3 f = normalize(lightTarget - lightPos);
-    float3 s = normalize(cross(f, float3(0,1,0)));
-    float3 u = cross(s, f);
-    float4x4 lightView;
-    lightView[0] = float4(s.x, u.x, -f.x, 0);
-    lightView[1] = float4(s.y, u.y, -f.y, 0);
-    lightView[2] = float4(s.z, u.z, -f.z, 0);
-    lightView[3] = float4(-dot(s,lightPos), -dot(u,lightPos), dot(f,lightPos), 1);
-
-    float orthoSize = sceneRadius * 1.5f;
-    float nearP = 0.1f, farP = sceneRadius * 5.f;
-    float rcpRange = 1.f / (farP - nearP);
-    float4x4 lightProj;
-    lightProj[0] = float4(1.f/orthoSize, 0, 0, 0);
-    lightProj[1] = float4(0, 1.f/orthoSize, 0, 0);
-    lightProj[2] = float4(0, 0, rcpRange, 0);
-    lightProj[3] = float4(0, 0, -nearP*rcpRange, 1);
-
-    float4x4 lightViewProj = mul(lightProj, lightView);
-    mFilamentSettings.shadowLightViewProj = lightViewProj;
+    ensureShadowMapResources();
+    pCtx->clearFbo(mpShadowFbo.get(), float4(0, 0, 0, 0), 1.f, 0, FboAttachmentType::Depth);
 
     auto pCam = mpScene->getCamera();
-    auto origView = pCam->getViewMatrix();
-    auto origProj = pCam->getProjMatrix();
-    pCam->setViewMatrix(lightView);
-    pCam->setProjectionMatrix(lightProj);
+    const auto origView = pCam->getViewMatrix();
+    const auto origProj = pCam->getProjMatrix();
+
+    const float3 lightDir = normalize(mFilamentSettings.sunDirection);
+    const float3 camPos = pCam->getPosition();
+    const float3 camFwd = normalize(pCam->getTarget() - camPos);
+    const AABB sceneBounds = mpScene->getSceneBounds();
+    const float3 sceneCenter = sceneBounds.center();
+    const float sceneRadius = sceneBounds.radius();
+
+    const uint32_t cascadeCount = (uint32_t)std::clamp(mFilamentSettings.shadowCascades, 1, 4);
+    const CascadeAtlasLayout atlasLayout = getAtlasLayout(cascadeCount);
+    const float camNear = pCam->getNearPlane();
+    const float camFar = std::min(pCam->getFarPlane(), mFilamentSettings.cascadeSplits[cascadeCount - 1] * 2.f);
+
+    float splits[4] = {
+        mFilamentSettings.cascadeSplits.x,
+        mFilamentSettings.cascadeSplits.y,
+        mFilamentSettings.cascadeSplits.z,
+        mFilamentSettings.cascadeSplits.w,
+    };
+    for (uint32_t i = 0; i < cascadeCount; ++i)
+        splits[i] = std::clamp(splits[i], camNear + 0.01f, camFar);
+
+    for (int i = 0; i < 4; ++i)
+    {
+        mFilamentSettings.shadowLightViewProj[i] = float4x4::identity();
+        mFilamentSettings.cascadeAtlasRect[i] = float4(0, 0, 1, 1);
+    }
 
     mpShadowRasterPass->getState()->setFbo(mpShadowFbo);
-    mpScene->rasterize(pCtx, mpShadowRasterPass->getState().get(), mpShadowRasterPass->getVars().get());
+
+    for (uint32_t c = 0; c < cascadeCount; ++c)
+    {
+        const float sliceNear = (c == 0) ? camNear : splits[c - 1];
+        const float sliceFar = splits[c];
+
+        float3 frustumCorners[8];
+        getFrustumSliceCorners(pCam, sliceNear, sliceFar, frustumCorners);
+
+        float3 samplePoints[24];
+        uint32_t pointCount = 8;
+        for (int i = 0; i < 8; ++i)
+            samplePoints[i] = frustumCorners[i];
+        appendAabbCorners(sceneBounds, samplePoints, pointCount);
+
+        float3 sliceCenter = float3(0.f);
+        for (uint32_t i = 0; i < pointCount; ++i)
+            sliceCenter += samplePoints[i];
+        sliceCenter /= float(pointCount);
+
+        const float3 lightPos = sliceCenter - lightDir * (sceneRadius * 2.f + sliceFar);
+        const float4x4 lightView = buildLightViewMatrix(lightPos, lightDir, camFwd);
+
+        float minX = std::numeric_limits<float>::max();
+        float minY = std::numeric_limits<float>::max();
+        float minZ = std::numeric_limits<float>::max();
+        float maxX = -std::numeric_limits<float>::max();
+        float maxY = -std::numeric_limits<float>::max();
+        float maxZ = -std::numeric_limits<float>::max();
+        for (uint32_t i = 0; i < pointCount; ++i)
+        {
+            const float3 ls = transformPoint(lightView, samplePoints[i]);
+            minX = std::min(minX, ls.x); maxX = std::max(maxX, ls.x);
+            minY = std::min(minY, ls.y); maxY = std::max(maxY, ls.y);
+            minZ = std::min(minZ, ls.z); maxZ = std::max(maxZ, ls.z);
+        }
+
+        const float margin = 0.05f * std::max(maxX - minX, maxY - minY);
+        const float left = minX - margin, right = maxX + margin;
+        const float bottom = minY - margin, top = maxY + margin;
+        const float nearP = minZ - margin;
+        const float farP = maxZ + margin + sceneRadius * 0.5f;
+
+        const float4x4 lightProj = buildOrthoProjMatrix(left, right, bottom, top, nearP, farP);
+        mFilamentSettings.shadowLightViewProj[c] = mul(lightProj, lightView);
+        mFilamentSettings.cascadeAtlasRect[c] = getAtlasTileRect(c, atlasLayout);
+
+        const uint32_t tileW = mShadowMapSize / atlasLayout.cols;
+        const uint32_t tileH = mShadowMapSize / atlasLayout.rows;
+        const uint32_t col = c % atlasLayout.cols;
+        const uint32_t row = c / atlasLayout.cols;
+        GraphicsState::Viewport vp(float(col * tileW), float(row * tileH), float(tileW), float(tileH), 0.f, 1.f);
+        mpShadowRasterPass->getState()->setViewport(0, vp, true);
+
+        pCam->setViewMatrix(lightView);
+        pCam->setProjectionMatrix(lightProj);
+        mpScene->rasterize(pCtx, mpShadowRasterPass->getState().get(), mpShadowRasterPass->getVars().get());
+    }
 
     pCam->setViewMatrix(origView);
     pCam->setProjectionMatrix(origProj);
+    mpShadowRasterPass->getState()->setViewport(0, GraphicsState::Viewport(0.f, 0.f, float(mShadowMapSize), float(mShadowMapSize), 0.f, 1.f), true);
 }
 
 void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFbo)
@@ -125,51 +425,84 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     pCtx->clearFbo(pFbo.get(), kClear, 1.f, 0, FboAttachmentType::All);
     if (!mSceneLoaded || !mpScene || !mpRasterPass) return;
 
+    auto pTarget = pFbo->getColorTexture(0);
+    const uint2 frameDim = uint2(pTarget->getWidth(), pTarget->getHeight());
+
+    // Halton(2,3) jitter for TAA (Filament sHaltonSamples)
+    auto pCam = mpScene->getCamera();
+    if (mFilamentSettings.antiAliasing == 2)
+    {
+        if (!mpHaltonJitter)
+            mpHaltonJitter = HaltonSamplePattern::create(32);
+        pCam->setPatternGenerator(mpHaltonJitter, 1.f / float2(frameDim));
+    }
+    else
+    {
+        pCam->setPatternGenerator(nullptr, float2(0.f));
+    }
+
     // --- Stage 0: Render shadow map ---
     if (mFilamentSettings.enableShadows && mpShadowRasterPass)
         renderShadowMap(pCtx);
 
-    // Ensure intermediate texture is correct size
-    auto pTarget = pFbo->getColorTexture(0);
-    if (!mpIntermediateTexture || mpIntermediateTexture->getWidth() != pTarget->getWidth() || mpIntermediateTexture->getHeight() != pTarget->getHeight())
+    // Ensure intermediate textures are correct size
+    if (!mpIntermediateTexture || mpIntermediateTexture->getWidth() != frameDim.x || mpIntermediateTexture->getHeight() != frameDim.y)
     {
         mpIntermediateTexture = getDevice()->createTexture2D(
-            pTarget->getWidth(), pTarget->getHeight(), ResourceFormat::RGBA32Float, 1, 1, nullptr,
+            frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
             ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+        mpVelocityTexture = getDevice()->createTexture2D(
+            frameDim.x, frameDim.y, ResourceFormat::RG32Float, 1, 1, nullptr,
+            ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
         mpIntermediateDepth = getDevice()->createTexture2D(
-            pTarget->getWidth(), pTarget->getHeight(), ResourceFormat::D32Float, 1, 1, nullptr,
+            frameDim.x, frameDim.y, ResourceFormat::D32Float, 1, 1, nullptr,
             ResourceBindFlags::DepthStencil | ResourceBindFlags::ShaderResource);
         mpPostProcessOutput = getDevice()->createTexture2D(
-            pTarget->getWidth(), pTarget->getHeight(), ResourceFormat::RGBA32Float, 1, 1, nullptr,
+            frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
             ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
     }
 
-    auto pInterFbo = Fbo::create(getDevice(), {mpIntermediateTexture}, mpIntermediateDepth);
-    // D3D depth [0,1]: clear to 1 (far/sky) so SSAO skips background correctly
-    pCtx->clearFbo(pInterFbo.get(), kClear, 1.f, 1.f, FboAttachmentType::All);
-
+    syncFilamentCameraSettings();
+    syncFilamentSunLight();
     mpScene->update(pCtx, getGlobalClock().getTime());
 
-    mpRasterPass->getState()->setFbo(pInterFbo);
-    mpScene->rasterize(pCtx, mpRasterPass->getState().get(), mpRasterPass->getVars().get());
-
-    // Camera matrices for shadow / SSAO
-    if (mpScene)
+    // Depth prepass -> SSAO (Filament: structure + SSAO before color pass)
+    if (mpDepthPrepassPass && mFilamentSettings.postProcessingEnabled && mFilamentSettings.enableSSAO && mFilamentSettings.forwardSSAO && mpFilamentPostProcess)
     {
-        auto pCam = mpScene->getCamera();
-        mFilamentSettings.invViewProj = pCam->getInvViewProjMatrix();
-        mFilamentSettings.nearPlane = pCam->getNearPlane();
-        mFilamentSettings.farPlane = pCam->getFarPlane();
-        auto proj = pCam->getProjMatrix();
-        mFilamentSettings.positionParams = float2(2.0f / proj[0][0], 2.0f / proj[1][1]);
-        mFilamentSettings.invProj = inverse(proj);
+        auto pDepthFbo = Fbo::create(getDevice(), {}, mpIntermediateDepth);
+        pCtx->clearFbo(pDepthFbo.get(), float4(0.f, 0.f, 0.f, 0.f), 1.f, 1.f, FboAttachmentType::Depth);
+        mpDepthPrepassPass->getState()->setFbo(pDepthFbo);
+        mpScene->rasterize(pCtx, mpDepthPrepassPass->getState().get(), mpDepthPrepassPass->getVars().get());
+        mpFilamentPostProcess->executePrePassSSAO(pCtx, mpIntermediateDepth, mFilamentSettings);
     }
+
+    auto pInterFbo = Fbo::create(getDevice(), {mpIntermediateTexture, mpVelocityTexture}, mpIntermediateDepth);
+    pCtx->clearFbo(pInterFbo.get(), kClear, 1.f, 1.f, FboAttachmentType::All);
+    pCtx->clearTexture(mpVelocityTexture.get(), float4(0.f, 0.f, 0.f, 0.f));
+
+    {
+        auto vars = mpRasterPass->getVars();
+        if (vars)
+        {
+            auto root = vars->getRootVar();
+            setShadowShaderVars(root);
+            setAOShaderVars(root);
+            if (root["PerFrameCB"].isValid())
+                root["PerFrameCB"]["gFrameDim"] = frameDim;
+        }
+    }
+
+    mpRasterPass->getState()->setFbo(pInterFbo);
+    if (mpFilamentIBL)
+        mpFilamentIBL->bindShaderVars(mpRasterPass->getRootVar(), mFilamentSettings);
+    mpScene->rasterize(pCtx, mpRasterPass->getState().get(), mpRasterPass->getVars().get());
 
     // Sync FilamentSettings to FilamentPostProcess pass
     if (mpFilamentPostProcess && mFilamentSettings.postProcessingEnabled)
     {
+        const ref<Texture> pMotionVec = (mFilamentSettings.antiAliasing == 2) ? mpVelocityTexture : nullptr;
         mpFilamentPostProcess->executeCustom(pCtx, mpIntermediateTexture, mpIntermediateDepth, mpPostProcessOutput, mFilamentSettings,
-            mFilamentSettings.enableShadows ? mpShadowMapDepth : nullptr);
+            mFilamentSettings.enableShadows ? mpShadowMapDepth : nullptr, pMotionVec);
         pCtx->blit(mpPostProcessOutput->getSRV(), pTarget->getRTV());
     }
     else
@@ -252,9 +585,21 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                 mFilamentSettings.sunDirection = normalize(mFilamentSettings.sunDirection);
         }
 
+        if (auto iblGroup = g.group("Filament IBL"))
+        {
+            iblGroup.slider("IBL Intensity", mFilamentSettings.iblIntensity, 0.0f, 100000.0f);
+            iblGroup.slider("IBL Rotation", mFilamentSettings.iblRotation, -3.14159f, 3.14159f);
+            if (mpFilamentIBL)
+            {
+                iblGroup.text(mpFilamentIBL->usingPlaceholder()
+                    ? "Source: procedural placeholder (awaiting data/ibl assets)"
+                    : "Source: data/ibl/lightroom_14b");
+            }
+        }
+
         if (mpScene && mpScene->getEnvMap())
         {
-            if (auto envGroup = g.group("Environment Map (IBL)"))
+            if (auto envGroup = g.group("Environment Map (Scene)"))
             {
                 mpScene->getEnvMap()->renderUI(envGroup);
             }
@@ -266,8 +611,16 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                 Gui::DropdownList shadowTypes = {{0, "PCF Hard"}, {1, "PCF Low (3x3)"}, {2, "VSM"}};
                 shadowGroup.dropdown("Shadow Type", shadowTypes, (uint32_t&)mFilamentSettings.shadowType);
                 shadowGroup.slider("Cascades", mFilamentSettings.shadowCascades, 1, 4);
+                shadowGroup.slider("Split 1", mFilamentSettings.cascadeSplits.x, 1.0f, 500.0f);
+                if (mFilamentSettings.shadowCascades >= 2)
+                    shadowGroup.slider("Split 2", mFilamentSettings.cascadeSplits.y, 1.0f, 500.0f);
+                if (mFilamentSettings.shadowCascades >= 3)
+                    shadowGroup.slider("Split 3", mFilamentSettings.cascadeSplits.z, 1.0f, 500.0f);
+                if (mFilamentSettings.shadowCascades >= 4)
+                    shadowGroup.slider("Split 4", mFilamentSettings.cascadeSplits.w, 1.0f, 500.0f);
                 shadowGroup.slider("Bias", mFilamentSettings.shadowBias, 0.0f, 0.01f);
                 shadowGroup.slider("Map Size", mFilamentSettings.shadowMapSize, 512u, 4096u);
+                shadowGroup.checkbox("Post-Process Shadow (debug)", mFilamentSettings.postProcessShadow);
             }
         }
 

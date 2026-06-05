@@ -7,10 +7,13 @@ set SCENE=D:\gitProject\VLR_WF\models\kitchen\scene-v4.pbrt
 set OUTPUT=D:\gitProject\VLR_WF\models\kitchen\scene-v4_render.png
 
 if not exist "%EXE%" (
-    echo [ERROR] PBRTOfflineRenderer.exe not found!
-    echo Please build the project first.
-    pause
-    exit /b 1
+    echo [INFO] PBRTOfflineRenderer.exe not found, building...
+    call "%~dp0build_pbrt_renderer.bat"
+    if errorlevel 1 (
+        echo [ERROR] Build failed.
+        pause
+        exit /b 1
+    )
 )
 
 if not exist "%SCENE%" (

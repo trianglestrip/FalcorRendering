@@ -8,9 +8,17 @@ add_plugin(FilamentFX)
 add_library(FilamentPostProcessLib STATIC
     FilamentPostProcess.cpp
     FilamentPostProcess.h
+    FilamentIBL.cpp
+    FilamentIBL.h
+    FilamentShadow.slangh
+    FilamentAO.slangh
+    FilamentPBR.slangh
+    FilamentIBL.slangh
+    FilamentIBLData.slang
     Bloom.cs.slang
     ColorGrading.cs.slang
     FXAA.cs.slang
+    StructurePass.cs.slang
     SSAO.cs.slang
     ShadowMap.cs.slang
     DoF.cs.slang
@@ -28,11 +36,18 @@ target_sources(FilamentFX PRIVATE
     FilamentFX.cpp
     FilamentPostProcess.cpp
     FilamentPostProcess.h
+    FilamentIBL.cpp
+    FilamentIBL.h
     FilamentPostProcess.cs.slang
     FilamentPBR.slangh
+    FilamentIBL.slangh
+    FilamentIBLData.slang
+    FilamentShadow.slangh
+    FilamentAO.slangh
     Bloom.cs.slang
     ColorGrading.cs.slang
     FXAA.cs.slang
+    StructurePass.cs.slang
     SSAO.cs.slang
     ShadowMap.cs.slang
     DoF.cs.slang

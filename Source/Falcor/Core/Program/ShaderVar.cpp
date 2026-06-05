@@ -391,6 +391,11 @@ void ShaderVar::setImpl(const ref<Buffer>& pBuffer) const
     mpBlock->setBuffer(mOffset, pBuffer);
 }
 
+void ShaderVar::setImpl(const ref<UnorderedAccessView>& pUav) const
+{
+    mpBlock->setUav(mOffset, pUav);
+}
+
 void ShaderVar::setImpl(const ref<ParameterBlock>& pBlock) const
 {
     mpBlock->setParameterBlock(mOffset, pBlock);

@@ -1,0 +1,117 @@
+// Filament IBL - ported from filament/shaders/src/surface_light_indirect.fs
+// Prefiltered cubemap integration (IBL_INTEGRATION_PREFILTERED_CUBEMAP).
+
+#include "RenderPasses/FilamentFX/FilamentPBR.slangh"
+
+#define MIN_PERCEPTUAL_ROUGHNESS 0.045
+#define IBL_SH_SENTINEL 65504.0
+
+float perceptualRoughnessToRoughness(float perceptualRoughness)
+{
+    return perceptualRoughness * perceptualRoughness;
+}
+
+float3 decodeDataForIBL(float4 data)
+{
+    return data.rgb;
+}
+
+float3 rotateY(float3 v, float angle)
+{
+    float c = cos(angle);
+    float s = sin(angle);
+    return float3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
+}
+
+float3 prefilteredDFG_LUT(float perceptualRoughness, float NoV)
+{
+    // coord = sqrt(linear_roughness), which is the mapping used by cmgen.
+    return gIblDFG.SampleLevel(gIblLinearSampler, float2(NoV, perceptualRoughness), 0).rgb;
+}
+
+float3 prefilteredDFG(float perceptualRoughness, float NoV)
+{
+    return prefilteredDFG_LUT(perceptualRoughness, NoV);
+}
+
+float perceptualRoughnessToLod(float perceptualRoughness)
+{
+    return gIblRoughnessOneLevel * perceptualRoughness * (2.0 - perceptualRoughness);
+}
+
+float3 prefilteredRadiance(float3 r, float lod)
+{
+    return decodeDataForIBL(gIblSpecular.SampleLevel(gIblLinearSampler, r, lod));
+}
+
+float3 getSpecularDominantDirection(float3 n, float3 r, float roughness)
+{
+    return lerp(r, n, roughness * roughness);
+}
+
+float3 specularDFG(PixelParams pixel)
+{
+    return lerp(pixel.dfg.xxx, pixel.dfg.yyy, pixel.f0);
+}
+
+float3 getReflectedVector(float3 n, float3 v, float roughness)
+{
+    float3 r = reflect(-v, n);
+    return getSpecularDominantDirection(n, r, roughness);
+}
+
+float3 Irradiance_SphericalHarmonics(float3 n)
+{
+    float3 sphericalHarmonics = gIblSH[0];
+    sphericalHarmonics += gIblSH[1] * (n.y) + gIblSH[2] * (n.z) + gIblSH[3] * (n.x);
+    sphericalHarmonics += gIblSH[4] * (n.y * n.x) + gIblSH[5] * (n.y * n.z)
+        + gIblSH[6] * (3.0 * n.z * n.z - 1.0) + gIblSH[7] * (n.z * n.x)
+        + gIblSH[8] * (n.x * n.x - n.y * n.y);
+    return max(sphericalHarmonics, 0.0);
+}
+
+float3 Irradiance_RoughnessOne(float3 n)
+{
+    return decodeDataForIBL(gIblSpecular.SampleLevel(gIblLinearSampler, n, gIblRoughnessOneLevel));
+}
+
+float3 diffuseIrradiance(float3 n)
+{
+    if (gUseSH != 0)
+        return Irradiance_SphericalHarmonics(n);
+
+    if (gIblSH[0].x == IBL_SH_SENTINEL)
+        return Irradiance_RoughnessOne(n);
+
+    return Irradiance_RoughnessOne(n);
+}
+
+void getEnergyCompensationPixelParams(float NoV, inout PixelParams pixel)
+{
+    pixel.dfg = prefilteredDFG(pixel.perceptualRoughness, NoV);
+    pixel.energyCompensation = 1.0 + pixel.f0 * (1.0 / max(pixel.dfg.y, 1e-4) - 1.0);
+}
+
+// Simplified evaluateIBL (no SSR/SSAO/cloth/clearcoat - those are separate tasks).
+float3 evaluateIBL(PixelParams pixel, float3 N, float3 V, float ambientOcclusion)
+{
+    float NoV = abs(dot(N, V)) + 1e-4;
+    getEnergyCompensationPixelParams(NoV, pixel);
+
+    float3 Nibl = rotateY(N, gIblRotation);
+
+    float3 E = specularDFG(pixel);
+    float3 r = rotateY(getReflectedVector(Nibl, V, pixel.roughness), gIblRotation);
+    float3 Fr = E * prefilteredRadiance(r, perceptualRoughnessToLod(pixel.perceptualRoughness));
+
+    float diffuseBRDF = ambientOcclusion;
+    float specAO = saturate(pow(NoV + ambientOcclusion, exp2(-16.0 * pixel.perceptualRoughness - 1.0)) - 1.0 + ambientOcclusion);
+    float3 irradiance = diffuseIrradiance(Nibl);
+    float3 Fd = pixel.diffuseColor * irradiance * (1.0 - E) * diffuseBRDF;
+
+    Fr *= specAO;
+    Fr *= gIblLuminance;
+    Fd *= gIblLuminance;
+
+    return Fr + Fd;
+}

@@ -461,6 +461,7 @@ private:
     void setImpl(const ref<Texture>& pTexture) const;
     void setImpl(const ref<Sampler>& pSampler) const;
     void setImpl(const ref<Buffer>& pBuffer) const;
+    void setImpl(const ref<UnorderedAccessView>& pUav) const;
     void setImpl(const ref<ParameterBlock>& pBlock) const;
 
     template<typename T>

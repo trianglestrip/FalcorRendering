@@ -8,19 +8,26 @@ namespace
     const char kColorGradingShader[] = "RenderPasses/FilamentFX/ColorGrading.cs.slang";
     const char kBloomShader[] = "RenderPasses/FilamentFX/Bloom.cs.slang";
     const char kFXAAShader[] = "RenderPasses/FilamentFX/FXAA.cs.slang";
+    const char kStructureShader[] = "RenderPasses/FilamentFX/StructurePass.cs.slang";
     const char kSSAOShader[] = "RenderPasses/FilamentFX/SSAO.cs.slang";
     const char kShadowMapShader[] = "RenderPasses/FilamentFX/ShadowMap.cs.slang";
     const char kDoFShader[] = "RenderPasses/FilamentFX/DoF.cs.slang";
     const char kTAAShader[] = "RenderPasses/FilamentFX/TAA.cs.slang";
 
     const uint32_t kNoiseTextureSize = 4; // 4x4 noise texture for SSAO
+    const uint32_t kMaxStructureLevels = 8;
 }
 
 FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 {
     DefineList defines;
     
-    // Color Grading + Tone Mapping
+    // Color Grading prep (AO/shadow before TAA) + composite (bloom/grading after DoF)
+    ProgramDesc cgPrepDesc;
+    cgPrepDesc.addShaderLibrary(kColorGradingShader).csEntry("colorGradingPrep");
+    cgPrepDesc.addCompilerArguments({"-Wno-30081"});
+    mpColorGradingPrepPass = ComputePass::create(mpDevice, cgPrepDesc, defines);
+
     ProgramDesc cgDesc;
     cgDesc.addShaderLibrary(kColorGradingShader).csEntry("colorGradingMain");
     cgDesc.addCompilerArguments({"-Wno-30081"});
@@ -42,6 +49,17 @@ FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& 
     fxaaDesc.addShaderLibrary(kFXAAShader).csEntry("fxaaMain");
     fxaaDesc.addCompilerArguments({"-Wno-30081"});
     mpFXAAPass = ComputePass::create(mpDevice, fxaaDesc, defines);
+
+    // Structure depth pyramid
+    ProgramDesc structureCopyDesc;
+    structureCopyDesc.addShaderLibrary(kStructureShader).csEntry("structureCopy");
+    structureCopyDesc.addCompilerArguments({"-Wno-30081"});
+    mpStructureCopyPass = ComputePass::create(mpDevice, structureCopyDesc, defines);
+
+    ProgramDesc structureMipmapDesc;
+    structureMipmapDesc.addShaderLibrary(kStructureShader).csEntry("structureMipmap");
+    structureMipmapDesc.addCompilerArguments({"-Wno-30081"});
+    mpStructureMipmapPass = ComputePass::create(mpDevice, structureMipmapDesc, defines);
 
     // SSAO
     ProgramDesc ssaoDesc;
@@ -95,6 +113,11 @@ FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& 
     float onePixel = 1.f;
     mpDummyShadowMap = pDevice->createTexture2D(1, 1, ResourceFormat::R32Float, 1, 1, &onePixel,
         ResourceBindFlags::ShaderResource);
+
+    // Zero motion vector fallback (RG32Float)
+    float zeroMotion[2] = {0.f, 0.f};
+    mpZeroMotionTexture = pDevice->createTexture2D(1, 1, ResourceFormat::RG32Float, 1, 1, zeroMotion,
+        ResourceBindFlags::ShaderResource);
 }
 
 void FilamentPostProcess::createNoiseTexture(ref<Device> pDevice)
@@ -142,6 +165,73 @@ void FilamentPostProcess::updateBloomTextures(ref<Device> pDevice, uint32_t widt
     }
 }
 
+uint32_t calcStructureLevelCount(uint32_t width, uint32_t height)
+{
+    // Filament: min(8, FTexture::maxLevelCount(w,h) - 5), lowest mip >= 32px
+    const uint32_t maxDim = std::max(width, height);
+    const uint32_t maxLevelCount = std::max(1u, (uint32_t)std::floor(std::log2((float)maxDim)) + 1u);
+    const int32_t reduced = (int32_t)maxLevelCount - 5;
+    return std::min(kMaxStructureLevels, (uint32_t)std::max(1, reduced));
+}
+
+void FilamentPostProcess::updateStructureTextures(ref<Device> pDevice, uint32_t width, uint32_t height)
+{
+    mStructureLevelCount = calcStructureLevelCount(width, height);
+
+    if (!mpStructureDepth || mpStructureDepth->getWidth() != width || mpStructureDepth->getHeight() != height ||
+        mpStructureDepth->getMipCount() != mStructureLevelCount)
+    {
+        mpStructureDepth = pDevice->createTexture2D(
+            width, height, ResourceFormat::R32Float, 1, mStructureLevelCount, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+    }
+}
+
+void FilamentPostProcess::executeStructure(RenderContext* pRenderContext, const ref<Texture>& pDepth)
+{
+    if (!pDepth || !mpStructureCopyPass || !mpStructureMipmapPass) return;
+
+    const uint32_t width = pDepth->getWidth();
+    const uint32_t height = pDepth->getHeight();
+    updateStructureTextures(mpDevice, width, height);
+
+    if (!mpStructureDepth) return;
+
+    // Copy main depth into structure mip 0
+    {
+        auto var = mpStructureCopyPass->getRootVar();
+        auto cb = var["PerFrameCB"];
+        if (cb.isValid())
+            cb["gDstRes"] = uint2(width, height);
+        var["gSrcDepth"] = pDepth;
+        var["gDst"].setUav(mpStructureDepth->getUAV(0));
+        mpStructureCopyPass->execute(pRenderContext, uint3(width, height, 1));
+    }
+
+    // Min-depth mip chain (mipmapDepth.mat equivalent)
+    for (uint32_t level = 0; level + 1 < mStructureLevelCount; ++level)
+    {
+        const uint32_t srcW = mpStructureDepth->getWidth(level);
+        const uint32_t srcH = mpStructureDepth->getHeight(level);
+        const uint32_t dstW = mpStructureDepth->getWidth(level + 1);
+        const uint32_t dstH = mpStructureDepth->getHeight(level + 1);
+
+        auto var = mpStructureMipmapPass->getRootVar();
+        auto cb = var["PerFrameCB"];
+        if (cb.isValid())
+        {
+            cb["gSrcRes"] = uint2(srcW, srcH);
+            cb["gDstRes"] = uint2(dstW, dstH);
+            cb["gSrcMip"] = level;
+        }
+        var["gStructureDepth"] = mpStructureDepth;
+        var["gDst"].setUav(mpStructureDepth->getUAV(level + 1));
+        var["gPointSampler"] = mpPointSampler;
+
+        mpStructureMipmapPass->execute(pRenderContext, uint3(dstW, dstH, 1));
+    }
+}
+
 void FilamentPostProcess::updateAOTextures(ref<Device> pDevice, uint32_t width, uint32_t height)
 {
     if (!mpAOBuffer || mpAOBuffer->getWidth() != width || mpAOBuffer->getHeight() != height)
@@ -163,7 +253,7 @@ void FilamentPostProcess::updateAOTextures(ref<Device> pDevice, uint32_t width, 
 
 void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings)
 {
-    if (!mpSSAOPass || !mpSSAOBlurPass || !pDepth) return;
+    if (!mpSSAOPass || !mpSSAOBlurPass || !pDepth || !mpStructureDepth) return;
 
     const uint2 resolution = uint2(pDepth->getWidth(), pDepth->getHeight());
     updateAOTextures(mpDevice, resolution.x, resolution.y);
@@ -210,7 +300,7 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
             cb["gAngleIncCosSin"] = float2(cos(angleInc), sin(angleInc));
             // Filament: invFarPlane = 1 / -zf (view-space far is negative in their convention)
             cb["gInvFarPlane"] = 1.0f / std::max(settings.farPlane, 1.0f);
-            cb["gMaxLevel"]   = 0;
+            cb["gMaxLevel"]   = (int)std::max(0u, mStructureLevelCount - 1);
         }
         auto camCB = var["CameraCB"];
         if (camCB.isValid())
@@ -220,6 +310,7 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
             camCB["gInvProj"] = settings.invProj;
         }
         var["gDepth"] = pDepth;
+        var["gStructureDepth"] = mpStructureDepth;
         var["gDst"] = mpAOBuffer;
         var["gPointSampler"] = mpPointSampler;
 
@@ -293,19 +384,24 @@ void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const 
 
     auto camCB = var["CameraCB"];
     if (camCB.isValid())
+    {
         camCB["gInvViewProj"] = settings.invViewProj;
+        camCB["gCameraPos"] = settings.cameraPos;
+    }
 
     var["gDepth"] = pDepth;
     var["gShadowMap"] = pShadowMapDepth ? pShadowMapDepth : mpDummyShadowMap;
     var["gDst"] = mpShadowVisibility;
     var["gPointSampler"] = mpPointSampler;
-    var["gLinearSampler"] = mpLinearSampler;
 
     auto shadowCB = var["ShadowCameraCB"];
     if (shadowCB.isValid())
     {
         for (int i = 0; i < 4; i++)
-            shadowCB["gLightViewProj"][i] = (pShadowMapDepth && i == 0) ? settings.shadowLightViewProj : float4x4::identity();
+        {
+            shadowCB["gLightViewProj"][i] = pShadowMapDepth ? settings.shadowLightViewProj[i] : float4x4::identity();
+            shadowCB["gCascadeAtlasRect"][i] = pShadowMapDepth ? settings.cascadeAtlasRect[i] : float4(0, 0, 1, 1);
+        }
     }
 
     mpShadowMapPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
@@ -349,7 +445,7 @@ void FilamentPostProcess::updateHistory(RenderContext* pRenderContext, const ref
     pRenderContext->blit(pDepth->getSRV(), mpHistoryDepth->getRTV());
 }
 
-void FilamentPostProcess::executeTAA(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings)
+void FilamentPostProcess::executeTAA(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pMotionVec)
 {
     if (!mpTAAPass || !pSrc || !pDepth || !pDst) return;
     const uint2 resolution = uint2(pSrc->getWidth(), pSrc->getHeight());
@@ -361,6 +457,7 @@ void FilamentPostProcess::executeTAA(RenderContext* pRenderContext, const ref<Te
         return;
     }
 
+    const bool useMotionVec = (pMotionVec != nullptr);
     auto var = mpTAAPass->getRootVar();
     auto cb = var["PerFrameCB"];
     if (cb.isValid())
@@ -368,14 +465,96 @@ void FilamentPostProcess::executeTAA(RenderContext* pRenderContext, const ref<Te
         cb["gResolution"] = resolution;
         cb["gFeedback"] = settings.taaFeedback;
         cb["gEnabled"] = 1.0f;
+        cb["gJitter"] = settings.cameraJitter;
+        cb["gUseMotionVec"] = useMotionVec ? 1.0f : 0.0f;
     }
     var["gSrc"] = pSrc;
     var["gHistory"] = mpHistoryColor;
     var["gDepth"] = pDepth;
     var["gHistoryDepth"] = mpHistoryDepth;
+    var["gMotionVec"] = useMotionVec ? pMotionVec : mpZeroMotionTexture;
     var["gDst"] = pDst;
     var["gLinearSampler"] = mpLinearSampler;
     mpTAAPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
+}
+
+void FilamentPostProcess::executePrePassSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings)
+{
+    if (!settings.enableSSAO || !pDepth || !mpSSAOPass) return;
+    executeStructure(pRenderContext, pDepth);
+    executeSSAO(pRenderContext, pDepth, settings);
+}
+
+ref<Texture> FilamentPostProcess::getAOTexture(const FilamentSettings& settings) const
+{
+    if (settings.enableSSAO && mpAOBlurTarget)
+        return mpAOBlurTarget;
+    return mpWhiteTexture;
+}
+
+void FilamentPostProcess::executeColorGradingPrep(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings)
+{
+    if (!mpColorGradingPrepPass || !pSrc || !pDst) return;
+    const uint2 resolution = uint2(pSrc->getWidth(), pSrc->getHeight());
+
+    auto var = mpColorGradingPrepPass->getRootVar();
+    auto cb = var["PerFrameCB"];
+    if (cb.isValid())
+    {
+        cb["gResolution"] = resolution;
+        const bool postAO = settings.enableSSAO && !settings.forwardSSAO && mpAOBlurTarget;
+        cb["gAOEnabled"] = postAO ? 1.0f : 0.0f;
+        cb["gPostProcessShadow"] = (settings.postProcessShadow && settings.enableShadows && mpShadowVisibility) ? 1.0f : 0.0f;
+    }
+    var["gSrc"] = pSrc;
+    var["gDst"] = pDst;
+    var["gAO"] = (settings.enableSSAO && mpAOBlurTarget) ? mpAOBlurTarget : mpWhiteTexture;
+    var["gShadow"] = (settings.postProcessShadow && settings.enableShadows && mpShadowVisibility) ? mpShadowVisibility : mpWhiteTexture;
+    mpColorGradingPrepPass->execute(pRenderContext, uint3(resolution, 1));
+}
+
+void FilamentPostProcess::executeColorGradingComposite(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings)
+{
+    if (!mpColorGradingPass || !pSrc || !pDst) return;
+    const uint2 resolution = uint2(pSrc->getWidth(), pSrc->getHeight());
+
+    auto var = mpColorGradingPass->getRootVar();
+    auto cb = var["PerFrameCB"];
+    if (cb.isValid())
+    {
+        cb["gResolution"] = resolution;
+        cb["gToneMapping"] = (float)settings.toneMapping;
+        cb["gExposure"] = settings.exposure;
+        cb["gContrast"] = settings.contrast;
+        cb["gVibrance"] = settings.vibrance;
+        cb["gSaturation"] = settings.saturation;
+        cb["gVignetteMidpoint"] = settings.enableVignette ? settings.vignetteMidpoint : 0.0f;
+        cb["gVignetteRoundness"] = settings.vignetteRoundness;
+        cb["gVignetteFeather"] = settings.vignetteFeather;
+        cb["gVignetteColor"] = settings.vignetteColor;
+        cb["gBloomStrength"] = settings.enableBloom ? settings.bloomStrength : 0.0f;
+        cb["gBloomBlendMode"] = (float)settings.bloomBlendMode;
+        cb["gPostProcessShadow"] = 0.0f;
+        cb["gDithering"] = settings.dithering ? 1.0f : 0.0f;
+    }
+
+    var["gSrc"] = pSrc;
+    var["gDst"] = pDst;
+    var["gAO"] = mpWhiteTexture;
+    var["gShadow"] = mpWhiteTexture;
+
+    if (settings.enableBloom && mpBloomMips[0])
+    {
+        var["gBloom"] = mpBloomMips[0];
+        var["gSampler"] = mpLinearSampler;
+    }
+    else
+    {
+        var["gBloom"] = pSrc;
+        var["gSampler"] = mpLinearSampler;
+    }
+
+    mpColorGradingPass->execute(pRenderContext, uint3(resolution, 1));
 }
 
 Properties FilamentPostProcess::getProperties() const
@@ -401,44 +580,62 @@ void FilamentPostProcess::execute(RenderContext* pRenderContext, const RenderDat
     executeCustom(pRenderContext, pSrc, nullptr, pDst, defaultSettings);
 }
 
-void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pShadowMap)
+void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pShadowMap, const ref<Texture>& pMotionVec)
 {
     if (!pSrc || !pDst) return;
 
     const uint2 resolution = uint2(pSrc->getWidth(), pSrc->getHeight());
     ref<Texture> currentInput = pSrc;
+    const bool doFXAA = (settings.antiAliasing == 1);
+    const bool doTAA = (settings.antiAliasing == 2);
 
-    // --- Pipeline Stage 0: Shadow Map (if enabled + depth available) ---
-    if (settings.enableShadows && pDepth && mpShadowMapPass)
-    {
+    auto ensureTexture = [&](ref<Texture>& tex) {
+        if (!tex || tex->getWidth() != resolution.x || tex->getHeight() != resolution.y)
+        {
+            tex = mpDevice->createTexture2D(resolution.x, resolution.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+        }
+    };
+
+    // --- Stage 0: Shadow visibility (debug only; forward pass applies shadows by default) ---
+    if (settings.postProcessShadow && settings.enableShadows && pDepth && mpShadowMapPass)
         executeShadowMap(pRenderContext, pDepth, settings, pShadowMap);
-    }
 
-    // --- Pipeline Stage 1: SSAO (if enabled + depth available) ---
-    if (settings.enableSSAO && pDepth && mpSSAOPass)
+    // --- Stage 1: SSAO (skipped when forward pass already computed AO in prepass) ---
+    if (settings.enableSSAO && !settings.forwardSSAO && pDepth && mpSSAOPass)
     {
+        executeStructure(pRenderContext, pDepth);
         executeSSAO(pRenderContext, pDepth, settings);
     }
 
-    // --- Pipeline Stage 1b: Depth of Field ---
+    // --- Stage 2: Color grading prep (AO + shadow on HDR, before TAA) ---
+    ensureTexture(mpPrepTarget);
+    executeColorGradingPrep(pRenderContext, currentInput, mpPrepTarget, settings);
+    currentInput = mpPrepTarget;
+
+    // --- Stage 3: TAA (Filament: before DoF) ---
+    if (doTAA && mpTAAPass && pDepth)
+    {
+        ensureTexture(mpTAATarget);
+        executeTAA(pRenderContext, currentInput, pDepth, mpTAATarget, settings, pMotionVec);
+        currentInput = mpTAATarget;
+        updateHistory(pRenderContext, mpTAATarget, pDepth, resolution.x, resolution.y);
+    }
+
+    // --- Stage 4: Depth of Field (after TAA) ---
     if (settings.enableDoF && pDepth && mpDoFPass)
     {
-        if (!mpDoFTarget || mpDoFTarget->getWidth() != resolution.x || mpDoFTarget->getHeight() != resolution.y)
-        {
-            mpDoFTarget = mpDevice->createTexture2D(resolution.x, resolution.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
-        }
+        ensureTexture(mpDoFTarget);
         executeDoF(pRenderContext, currentInput, pDepth, mpDoFTarget, settings);
         currentInput = mpDoFTarget;
     }
 
-    // --- Pipeline Stage 2: Bloom ---
+    // --- Stage 5: Bloom ---
     if (settings.enableBloom && mpBloomDownsamplePass && mpBloomUpsamplePass)
     {
         uint32_t levels = std::min((uint32_t)settings.bloomLevels, kMaxBloomLevels);
         updateBloomTextures(mpDevice, resolution.x, resolution.y, levels);
 
-        // Downsample chain
         ref<Texture> downSrc = currentInput;
         for (uint32_t i = 0; i < levels; ++i)
         {
@@ -457,7 +654,6 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
             downSrc = mpBloomMips[i];
         }
 
-        // Upsample chain (tent filter reconstruction)
         ref<Texture> upSrc = downSrc;
         for (int32_t i = levels - 2; i >= 0; --i)
         {
@@ -484,73 +680,18 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
         }
     }
 
-    // --- Pipeline Stage 3: Color Grading, Tone Mapping, Vignette, Bloom Composite ---
+    // --- Stage 6: Color grading composite (bloom + vignette + tone map) ---
     ref<Texture> cgTarget = pDst;
-    bool doFXAA = (settings.antiAliasing == 1);
-    bool doTAA = (settings.antiAliasing == 2);
-    
-    if (doFXAA || doTAA)
+    if (doFXAA)
     {
-        if (!mpColorGradingTarget || mpColorGradingTarget->getWidth() != resolution.x || mpColorGradingTarget->getHeight() != resolution.y)
-        {
-            mpColorGradingTarget = mpDevice->createTexture2D(resolution.x, resolution.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
-        }
+        ensureTexture(mpColorGradingTarget);
         cgTarget = mpColorGradingTarget;
     }
+    executeColorGradingComposite(pRenderContext, currentInput, cgTarget, settings);
 
-    if (mpColorGradingPass)
-    {
-        auto var = mpColorGradingPass->getRootVar();
-        auto cb = var["PerFrameCB"];
-        if (cb.isValid())
-        {
-            cb["gResolution"] = resolution;
-            cb["gToneMapping"] = (float)settings.toneMapping;
-            cb["gExposure"] = settings.exposure;
-            cb["gContrast"] = settings.contrast;
-            cb["gVibrance"] = settings.vibrance;
-            cb["gSaturation"] = settings.saturation;
-            cb["gVignetteMidpoint"] = settings.enableVignette ? settings.vignetteMidpoint : 0.0f;
-            cb["gVignetteRoundness"] = settings.vignetteRoundness;
-            cb["gVignetteFeather"] = settings.vignetteFeather;
-            cb["gVignetteColor"] = settings.vignetteColor;
-            cb["gBloomStrength"] = settings.enableBloom ? settings.bloomStrength : 0.0f;
-            cb["gBloomBlendMode"] = (float)settings.bloomBlendMode;
-            cb["gAOEnabled"] = (settings.enableSSAO && mpAOBlurTarget) ? 1.0f : 0.0f;
-            cb["gShadowEnabled"] = (settings.enableShadows && mpShadowVisibility) ? 1.0f : 0.0f;
-            cb["gDithering"] = settings.dithering ? 1.0f : 0.0f;
-        }
-
-        var["gSrc"] = currentInput;
-        var["gDst"] = cgTarget;
-
-        var["gAO"] = (settings.enableSSAO && mpAOBlurTarget) ? mpAOBlurTarget : mpWhiteTexture;
-        var["gShadow"] = (settings.enableShadows && mpShadowVisibility) ? mpShadowVisibility : mpWhiteTexture;
-
-        if (settings.enableBloom && mpBloomMips[0])
-        {
-            var["gBloom"] = mpBloomMips[0];
-            var["gSampler"] = mpLinearSampler;
-        }
-        else
-        {
-            var["gBloom"] = currentInput;
-            var["gSampler"] = mpLinearSampler;
-        }
-
-        mpColorGradingPass->execute(pRenderContext, uint3(resolution, 1));
-    }
-
-    // --- Pipeline Stage 4: TAA or FXAA ---
+    // --- Stage 7: FXAA ---
     ref<Texture> finalColor = cgTarget;
-    if (doTAA && mpTAAPass && pDepth)
-    {
-        executeTAA(pRenderContext, cgTarget, pDepth, pDst, settings);
-        finalColor = pDst;
-        updateHistory(pRenderContext, pDst, pDepth, resolution.x, resolution.y);
-    }
-    else if (doFXAA && mpFXAAPass)
+    if (doFXAA && mpFXAAPass)
     {
         auto var = mpFXAAPass->getRootVar();
         var["PerFrameCB"]["gResolution"] = resolution;
@@ -558,6 +699,11 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
         var["gDst"] = pDst;
         var["gSampler"] = mpLinearSampler;
         mpFXAAPass->execute(pRenderContext, uint3(resolution, 1));
+        finalColor = pDst;
+    }
+    else if (doTAA)
+    {
+        pRenderContext->blit(cgTarget->getSRV(), pDst->getRTV());
         finalColor = pDst;
     }
     else if (cgTarget != pDst)
