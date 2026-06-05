@@ -98,7 +98,11 @@ Release 编译后，主要可执行文件位于：
 
 **主要 Shader：** `StructurePass.cs.slang`、`SSAO.cs.slang`、`GTAO.cs.slang`、`ShadowEVSM.cs.slang`、`Fog.cs.slang`、`ColorGrading.cs.slang`、`FSR.cs.slang`、`FilamentIBL.slangh`、`FilamentAO.slangh`
 
-**构建：** `build_pbrt_renderer.bat`（单线程 MSBuild，避免 PCH 竞争）
+**构建：**
+- 日常最小编译：`build_pbrt_renderer.bat`（仅增量编译 `PBRTOfflineRenderer` 及其变更依赖，`/m:1`）
+- 全量链式：`build_pbrt_renderer.bat full`（显式 Falcor → Lib → App）
+- 清缓存后编译：`build_pbrt_renderer.bat clean`
+- **禁止**对全 solution 使用 `-j` / `/m:8`，易触发 `LNK1104`/`LNK1181`（`ScriptBindings.obj`、`cmake_pch.obj` 竞争）
 
 **资产：** `data/ibl/lightroom_14b/` 部署至 `bin/Release/data/ibl/`
 
