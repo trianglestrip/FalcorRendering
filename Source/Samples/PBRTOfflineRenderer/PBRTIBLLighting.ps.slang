@@ -53,40 +53,15 @@ float3 evaluateStableFilamentIBL(float3 diffuseColor, float3 f0, float perceptua
     float NoV = saturate(abs(dot(N, V)) + 1e-4f);
 
     float3 irradiance = filamentSHIrradiance(Nibl);
-    float3 diffuse = diffuseColor * irradiance * ao;
+    float3 diffuse = diffuseColor * irradiance * singleBounceAO(ao);
 
     float3 R = rotateY(reflect(-V, N), gIblRotation);
     float3 specIrradiance = filamentSHIrradiance(normalize(lerp(R, Nibl, perceptualRoughness * perceptualRoughness)));
     float3 fresnel = f0 + (1.0f - f0) * pow(1.0f - NoV, 5.0f);
-    float specAO = saturate(pow(NoV + ao, exp2(-16.0f * perceptualRoughness - 1.0f)) - 1.0f + ao);
     float clearCoatWeight = lerp(0.12f, 0.65f, 1.0f - perceptualRoughness);
-    float3 specular = specIrradiance * fresnel * clearCoatWeight * specAO;
+    float3 specular = specIrradiance * fresnel * clearCoatWeight * specularAO(NoV, ao, perceptualRoughness);
 
     return (diffuse + specular) * gIblLuminance;
-}
-
-float evaluateContactAO(uint2 pixel, float3 N, float depth)
-{
-    if (depth >= 0.9999f) return 1.0f;
-
-    static const int2 offsets[8] = {
-        int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1),
-        int2(2, 1), int2(-2, 1), int2(2, -1), int2(-2, -1)
-    };
-
-    float occ = 0.0f;
-    int2 p = int2(pixel);
-    int2 maxPixel = int2(gFrameDim) - 1;
-    for (int i = 0; i < 8; ++i)
-    {
-        int2 q = clamp(p + offsets[i] * 3, int2(0, 0), maxPixel);
-        float d = gDepth.Load(int3(q, 0));
-        float closer = saturate((depth - d) * 3500.0f);
-        float normalWeight = saturate(1.0f - abs(N.z) * 0.35f);
-        occ += closer * normalWeight;
-    }
-
-    return saturate(1.0f - occ * 0.09f);
 }
 
 float4 main(float2 texC : TEXCOORD) : SV_TARGET
@@ -105,7 +80,6 @@ float4 main(float2 texC : TEXCOORD) : SV_TARGET
     float3 f0 = material.yzw;
     float perceptualRoughness = max(saturate(roughness), MIN_PERCEPTUAL_ROUGHNESS);
     float ao = (gSSAOEnabled != 0u) ? evaluateSSAO(texC) : 1.0f;
-    ao = min(ao, evaluateContactAO(pixel, N, depth));
 
     if (gDebugView == 1u) return float4(base.rgb, 1.0f);
     if (gDebugView == 2u) return float4(N * 0.5f + 0.5f, 1.0f);

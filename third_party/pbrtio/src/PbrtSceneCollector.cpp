@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
 namespace pbrtio {
 
@@ -280,6 +281,22 @@ static void addShape(const BasicScene& scene, const ShapeSceneEntity& shape,
     meshes.push_back(std::move(inst));
 }
 
+static void buildMeshResources(PbrtLoadedScene& scene) {
+    scene.meshResources.clear();
+    std::unordered_map<std::string, size_t> resourceMap;
+
+    for (auto& mesh : scene.meshes) {
+        const std::string key = mesh.plyPath.lexically_normal().string();
+        auto [it, inserted] = resourceMap.emplace(key, scene.meshResources.size());
+        if (inserted) {
+            PbrtMeshResource resource;
+            resource.plyPath = mesh.plyPath;
+            scene.meshResources.push_back(std::move(resource));
+        }
+        mesh.meshResourceIndex = it->second;
+    }
+}
+
 bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out) {
     if (!std::filesystem::exists(pbrtPath)) {
         return false;
@@ -307,6 +324,8 @@ bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out) 
             addShape(scene, instShape, out.meshes);
         }
     }
+
+    buildMeshResources(out);
 
     std::vector<ShapeSceneEntity> allShapes;
     collectAllShapes(scene, allShapes);

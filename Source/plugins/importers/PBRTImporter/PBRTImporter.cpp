@@ -89,6 +89,7 @@
 #include <pybind11/pybind11.h>
 
 #include <cmath>
+#include <limits>
 #include <unordered_map>
 
 namespace Falcor
@@ -242,6 +243,38 @@ struct Shape
     Falcor::ref<Falcor::Material> pMaterial;
 };
 
+struct PlyMeshKey
+{
+    std::string path;
+    const Falcor::Material* pMaterial = nullptr;
+    bool reverseOrientation = false;
+
+    bool operator==(const PlyMeshKey& other) const
+    {
+        return path == other.path && pMaterial == other.pMaterial && reverseOrientation == other.reverseOrientation;
+    }
+};
+
+struct PlyMeshKeyHash
+{
+    size_t operator()(const PlyMeshKey& key) const
+    {
+        size_t h = std::hash<std::string>{}(key.path);
+        h ^= std::hash<const void*>{}(key.pMaterial) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(key.reverseOrientation) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct PlyMeshJob
+{
+    std::string filename;
+    std::filesystem::path path;
+    Falcor::ref<Falcor::Material> pMaterial;
+    bool reverseOrientation = false;
+    Falcor::MeshID meshID;
+};
+
 /**
  * Holds a list of aggregated curve shapes (strands).
  * PBRT's curve shape only contains a single strand.
@@ -294,6 +327,7 @@ struct BuilderContext
 
     bool usePBRTMaterials = false;
     bool rotateImageTextures90 = false;
+    bool flipTextureV = true;
     uint32_t nonConstantRoughnessFallbackCount = 0;
     uint32_t anisotropicRoughnessFallbackCount = 0;
 
@@ -368,7 +402,7 @@ float3 spectrumToRGB(const Spectrum& spectrum, SpectrumType spectrumType)
     }
 }
 
-Transform createPbrtImageTextureTransform(const ParameterDictionary& params, const FileLoc& loc, bool rotate90)
+Transform createPbrtImageTextureTransform(const ParameterDictionary& params, const FileLoc& loc, bool rotate90, bool flipTextureV)
 {
     Transform transform;
 
@@ -392,10 +426,19 @@ Transform createPbrtImageTextureTransform(const ParameterDictionary& params, con
     // PBRT image textures apply UVMapping and then flip t at sample time:
     //   s = uscale * u + udelta
     //   t = 1 - (vscale * v + vdelta)
+    //
+    // Falcor's image upload / material sampling convention is opposite to PBRT's image-space
+    // vertical origin for these scene textures. Keep pbrtio renderer-agnostic and apply that
+    // backend adaptation here by optionally flipping the sampled texture V again:
+    //   t = vscale * v + vdelta
+    //
     // SceneBuilder stores inverse(material.textureTransform) into mesh UVs, so set
     // the material transform to the inverse of the desired PBRT sampling transform.
     if (rotate90)
     {
+        if (flipTextureV)
+            logWarning(loc, "PBRTImporter:flipTextureV is not applied to rotateImageTextures90 textures yet.");
+
         // Rotate the PBRT sampling coordinates 90 degrees around the UV center:
         //   s' = t
         //   t' = 1 - s
@@ -406,8 +449,16 @@ Transform createPbrtImageTextureTransform(const ParameterDictionary& params, con
     }
     else
     {
-        transform.setScaling(float3(1.f / uscale, -1.f / vscale, 1.f));
-        transform.setTranslation(float3(-udelta / uscale, (1.f - vdelta) / vscale, 0.f));
+        if (flipTextureV)
+        {
+            transform.setScaling(float3(1.f / uscale, 1.f / vscale, 1.f));
+            transform.setTranslation(float3(-udelta / uscale, -vdelta / vscale, 0.f));
+        }
+        else
+        {
+            transform.setScaling(float3(1.f / uscale, -1.f / vscale, 1.f));
+            transform.setTranslation(float3(-udelta / uscale, (1.f - vdelta) / vscale, 0.f));
+        }
     }
     return transform;
 }
@@ -972,7 +1023,7 @@ FloatTexture createFloatTexture(BuilderContext& ctx, const TextureSceneEntity& e
         }
         bool sRGB = encoding == "sRGB";
 
-        floatTexture.transform = createPbrtImageTextureTransform(params, entity.loc, ctx.rotateImageTextures90);
+        floatTexture.transform = createPbrtImageTextureTransform(params, entity.loc, ctx.rotateImageTextures90, ctx.flipTextureV);
         floatTexture.texture = Falcor::Texture::createFromFile(ctx.builder.getDevice(), path, generateMips, sRGB);
     }
     else if (type == "checkerboard")
@@ -1119,7 +1170,7 @@ SpectrumTexture createSpectrumTexture(BuilderContext& ctx, const TextureSceneEnt
         }
         bool sRGB = encoding == "sRGB";
 
-        spectrumTexture.transform = createPbrtImageTextureTransform(params, entity.loc, ctx.rotateImageTextures90);
+        spectrumTexture.transform = createPbrtImageTextureTransform(params, entity.loc, ctx.rotateImageTextures90, ctx.flipTextureV);
         spectrumTexture.texture = Falcor::Texture::createFromFile(ctx.builder.getDevice(), path, generateMips, sRGB);
     }
     else if (type == "checkerboard")
@@ -1858,6 +1909,43 @@ Shape createShape(BuilderContext& ctx, const ShapeSceneEntity& entity)
     return shape;
 }
 
+Falcor::SceneBuilder::ProcessedMesh processTriangleMesh(
+    const SceneBuilder& builder,
+    const Falcor::ref<Falcor::TriangleMesh>& pTriangleMesh,
+    const Falcor::ref<Falcor::Material>& pMaterial,
+    bool frontFaceCW
+)
+{
+    FALCOR_CHECK(pTriangleMesh != nullptr, "'pTriangleMesh' is missing");
+    FALCOR_CHECK(pMaterial != nullptr, "'pMaterial' is missing");
+
+    Falcor::SceneBuilder::Mesh mesh;
+    const auto& indices = pTriangleMesh->getIndices();
+    const auto& vertices = pTriangleMesh->getVertices();
+
+    mesh.name = pTriangleMesh->getName();
+    mesh.faceCount = (uint32_t)(indices.size() / 3);
+    mesh.vertexCount = (uint32_t)vertices.size();
+    mesh.indexCount = (uint32_t)indices.size();
+    mesh.pIndices = indices.data();
+    mesh.topology = Vao::Topology::TriangleList;
+    mesh.isFrontFaceCW = frontFaceCW;
+    mesh.pMaterial = pMaterial;
+
+    std::vector<float3> positions(vertices.size());
+    std::vector<float3> normals(vertices.size());
+    std::vector<float2> texCoords(vertices.size());
+    std::transform(vertices.begin(), vertices.end(), positions.begin(), [](const auto& v) { return v.position; });
+    std::transform(vertices.begin(), vertices.end(), normals.begin(), [](const auto& v) { return v.normal; });
+    std::transform(vertices.begin(), vertices.end(), texCoords.begin(), [](const auto& v) { return v.texCoord; });
+
+    mesh.positions = {positions.data(), SceneBuilder::Mesh::AttributeFrequency::Vertex};
+    mesh.normals = {normals.data(), SceneBuilder::Mesh::AttributeFrequency::Vertex};
+    mesh.texCrds = {texCoords.data(), SceneBuilder::Mesh::AttributeFrequency::Vertex};
+
+    return builder.processMesh(mesh);
+}
+
 /**
  * Create curve geometry from a curve aggregate.
  * This can either result in mesh or curve geometry depending on the tesselation mode.
@@ -2048,9 +2136,93 @@ void buildScene(BuilderContext& ctx)
         }
     }
 
-    // Process shapes and create meshes.
-    for (const auto& entity : ctx.scene.getShapes())
+    const auto& shapes = ctx.scene.getShapes();
+    std::vector<bool> usePlyResource(shapes.size(), false);
+    std::vector<size_t> shapeToPlyJob(shapes.size(), std::numeric_limits<size_t>::max());
+    std::vector<PlyMeshJob> plyJobs;
+    std::unordered_map<PlyMeshKey, size_t, PlyMeshKeyHash> plyJobMap;
+    std::unordered_map<std::string, Falcor::ref<Falcor::TriangleMesh>> plyGeometryCache;
+
+    for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
     {
+        const auto& entity = shapes[shapeIndex];
+        if (entity.name != "plymesh" || entity.lightIndex != -1)
+            continue;
+
+        warnUnsupportedParameters(entity.params, {"displacement", "displacement.edgelength"});
+
+        auto filename = entity.params.getString("filename", "");
+        if (filename.empty())
+        {
+            logWarning(entity.loc, "Missing plymesh filename. Skipping.");
+            usePlyResource[shapeIndex] = true;
+            continue;
+        }
+
+        const auto path = ctx.resolver(filename);
+        auto pMaterial = ctx.getMaterial(entity.materialRef);
+        const bool reverseOrientation = entity.reverseOrientation;
+        usePlyResource[shapeIndex] = true;
+
+        PlyMeshKey key{path.lexically_normal().string(), pMaterial.get(), reverseOrientation};
+        auto [it, inserted] = plyJobMap.emplace(key, plyJobs.size());
+        const size_t jobIndex = it->second;
+        shapeToPlyJob[shapeIndex] = jobIndex;
+
+        if (!inserted)
+            continue;
+
+        PlyMeshJob job;
+        job.filename = filename;
+        job.path = path;
+        job.pMaterial = pMaterial;
+        job.reverseOrientation = reverseOrientation;
+        plyJobs.push_back(std::move(job));
+    }
+
+    if (!plyJobs.empty())
+    {
+        for (auto& job : plyJobs)
+        {
+            const std::string pathKey = job.path.lexically_normal().string();
+            auto geometryIt = plyGeometryCache.find(pathKey);
+            if (geometryIt == plyGeometryCache.end())
+            {
+                auto pTriangleMesh = Falcor::TriangleMesh::createFromFile(job.path.string());
+                if (pTriangleMesh)
+                    pTriangleMesh->setName(job.filename);
+                geometryIt = plyGeometryCache.emplace(pathKey, pTriangleMesh).first;
+            }
+
+            auto pTriangleMesh = geometryIt->second;
+            if (!pTriangleMesh)
+                continue;
+
+            const bool frontFaceCW = job.reverseOrientation ? !pTriangleMesh->getFrontFaceCW() : pTriangleMesh->getFrontFaceCW();
+            auto processedMesh = processTriangleMesh(ctx.builder, pTriangleMesh, job.pMaterial, frontFaceCW);
+            job.meshID = ctx.builder.addProcessedMesh(processedMesh);
+        }
+    }
+
+    // Process shapes and create meshes.
+    for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
+    {
+        const auto& entity = shapes[shapeIndex];
+        if (usePlyResource[shapeIndex])
+        {
+            const size_t jobIndex = shapeToPlyJob[shapeIndex];
+            if (jobIndex != std::numeric_limits<size_t>::max())
+            {
+                const auto& job = plyJobs[jobIndex];
+                if (job.meshID.isValid())
+                {
+                    auto nodeID = ctx.builder.addNode({job.filename, toFalcor(entity.transform)});
+                    ctx.builder.addMeshInstance(nodeID, job.meshID);
+                }
+            }
+            continue;
+        }
+
         auto shape = createShape(ctx, entity);
         if (shape.pTriangleMesh)
         {
@@ -2144,6 +2316,7 @@ void PBRTImporter::importScene(
         pbrt::BuilderContext ctx{pbrtScene, builder};
         ctx.usePBRTMaterials = builder.getSettings().getOption("PBRTImporter:usePBRTMaterials", false);
         ctx.rotateImageTextures90 = builder.getSettings().getOption("PBRTImporter:rotateImageTextures90", false);
+        ctx.flipTextureV = builder.getSettings().getOption("PBRTImporter:flipTextureV", true);
         pbrt::buildScene(ctx);
         timeReport.measure("Building pbrt scene");
         timeReport.printToLog();

@@ -216,7 +216,7 @@ bool loadPbrtSceneResources(const std::filesystem::path& pbrtPath,
     out.timings.collectMs = elapsedMs(collectStart);
 
     std::vector<PbrtDecodedImage> decodedImages(textureJobs.size());
-    std::vector<bool> meshExists(out.scene.meshes.size(), true);
+    std::vector<bool> meshExists(out.scene.meshResources.size(), true);
 
     tf::Taskflow taskflow;
     taskflow.emplace([&](tf::Subflow& subflow) {
@@ -232,9 +232,9 @@ bool loadPbrtSceneResources(const std::filesystem::path& pbrtPath,
 
     taskflow.emplace([&](tf::Subflow& subflow) {
         const auto verifyStart = Clock::now();
-        for (size_t i = 0; i < out.scene.meshes.size(); ++i) {
+        for (size_t i = 0; i < out.scene.meshResources.size(); ++i) {
             subflow.emplace([&, i] {
-                meshExists[i] = std::filesystem::exists(out.scene.meshes[i].plyPath);
+                meshExists[i] = std::filesystem::exists(out.scene.meshResources[i].plyPath);
             });
         }
         subflow.join();
@@ -247,8 +247,13 @@ bool loadPbrtSceneResources(const std::filesystem::path& pbrtPath,
     for (size_t i = 0; i < textureJobs.size(); ++i) {
         out.textures.decoded.emplace(textureJobs[i].key, std::move(decodedImages[i]));
     }
-    for (size_t i = 0; i < out.scene.meshes.size(); ++i) {
-        out.scene.meshes[i].plyFileExists = meshExists[i];
+    for (size_t i = 0; i < out.scene.meshResources.size(); ++i) {
+        out.scene.meshResources[i].plyFileExists = meshExists[i];
+    }
+    for (auto& mesh : out.scene.meshes) {
+        if (mesh.meshResourceIndex < out.scene.meshResources.size()) {
+            mesh.plyFileExists = out.scene.meshResources[mesh.meshResourceIndex].plyFileExists;
+        }
     }
 
     out.timings.totalMs = elapsedMs(totalStart);

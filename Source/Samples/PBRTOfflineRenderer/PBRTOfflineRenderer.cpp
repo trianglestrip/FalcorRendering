@@ -15,6 +15,10 @@ static const float4 kClear = float4(0.1f, 0.1f, 0.12f, 1.f);
 
 namespace
 {
+    constexpr float kDefaultIblIntensityScale = 1.0f;
+    constexpr float kDefaultSSAORadius = 0.3f;
+    constexpr float kDefaultSSAOIntensity = 1.0f;
+
     struct CascadeAtlasLayout { uint32_t cols; uint32_t rows; };
 
     CascadeAtlasLayout getAtlasLayout(uint32_t cascadeCount)
@@ -120,12 +124,12 @@ PBRTOfflineRenderer::PBRTOfflineRenderer(const SampleAppConfig& c) : SampleApp(c
     mFilamentSettings.antiAliasing = 0;
     mFilamentSettings.enableSSAO = true;
     mFilamentSettings.forwardSSAO = true;
-    mFilamentSettings.ssaoRadius = 5.0f;
-    mFilamentSettings.ssaoIntensity = 1.4f;
-    mFilamentSettings.ssaoPower = 1.25f;
-    mFilamentSettings.ssaoResolution = 1.0f;
+    mFilamentSettings.ssaoRadius = kDefaultSSAORadius;
+    mFilamentSettings.ssaoIntensity = kDefaultSSAOIntensity;
+    mFilamentSettings.ssaoPower = 1.0f;
+    mFilamentSettings.ssaoResolution = 0.5f;
     mFilamentSettings.ssaoSampleCount = 11;
-    mFilamentSettings.iblIntensity = 0.85f;
+    mFilamentSettings.iblIntensity = kDefaultIblIntensityScale;
     mFilamentSettings.sunIntensity = 0.f;
     mFilamentSettings.enableShadows = false;
     mFilamentSettings.exposure = -1.0f;
@@ -155,12 +159,12 @@ void PBRTOfflineRenderer::setPreviewMode(bool enabled)
     mFilamentSettings.postProcessingEnabled = true;
     mFilamentSettings.enableSSAO = true;
     mFilamentSettings.forwardSSAO = true;
-    mFilamentSettings.ssaoRadius = 5.0f;
-    mFilamentSettings.ssaoIntensity = 1.4f;
-    mFilamentSettings.ssaoPower = 1.25f;
-    mFilamentSettings.ssaoResolution = 1.0f;
+    mFilamentSettings.ssaoRadius = kDefaultSSAORadius;
+    mFilamentSettings.ssaoIntensity = kDefaultSSAOIntensity;
+    mFilamentSettings.ssaoPower = 1.0f;
+    mFilamentSettings.ssaoResolution = 0.5f;
     mFilamentSettings.ssaoSampleCount = 11;
-    mFilamentSettings.iblIntensity = 0.85f;
+    mFilamentSettings.iblIntensity = kDefaultIblIntensityScale;
     mFilamentSettings.sunIntensity = 0.f;
     mFilamentSettings.enableShadows = false;
     mFilamentSettings.exposure = -1.0f; // ~ f/8, 1/125s, ISO 100
@@ -189,6 +193,7 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         Settings settings;
         settings.addOptions(nlohmann::json{
             {"PBRTImporter:rotateImageTextures90", false},
+            {"PBRTImporter:flipTextureV", true},
             {"PBRTImporter:usePBRTMaterials", true},
         });
         mpScene = Scene::create(getDevice(), mScenePath, settings);
@@ -806,7 +811,7 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
 
         if (auto iblGroup = g.group("Filament IBL"))
         {
-            iblGroup.slider("IBL Intensity", mFilamentSettings.iblIntensity, 0.0f, 100000.0f);
+            iblGroup.slider("IBL Intensity Scale", mFilamentSettings.iblIntensity, 0.0f, 1.0f);
             iblGroup.slider("IBL Rotation", mFilamentSettings.iblRotation, -3.14159f, 3.14159f);
             if (mpFilamentIBL)
             {
@@ -849,7 +854,7 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                 if (auto ssaoGroup = ppGroup.group("SSAO (Ambient Occlusion)")) {
                     ssaoGroup.checkbox("Enable", mFilamentSettings.enableSSAO);
                     if (mFilamentSettings.enableSSAO) {
-                        ssaoGroup.slider("Radius", mFilamentSettings.ssaoRadius, 0.01f, 20.0f);
+                        ssaoGroup.slider("Radius", mFilamentSettings.ssaoRadius, 0.01f, 2.0f);
                         ssaoGroup.slider("Bias", mFilamentSettings.ssaoBias, 0.0f, 0.1f);
                         ssaoGroup.slider("Power", mFilamentSettings.ssaoPower, 0.1f, 5.0f);
                         ssaoGroup.slider("Intensity", mFilamentSettings.ssaoIntensity, 0.0f, 3.0f);

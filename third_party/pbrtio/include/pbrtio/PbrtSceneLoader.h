@@ -17,6 +17,7 @@ namespace pbrtio {
 
 struct PbrtMeshInstance {
     std::filesystem::path plyPath;
+    size_t meshResourceIndex = SIZE_MAX;
     pbrt::mat4f transform;
     pbrt::float3 baseColor{ 0.75f, 0.75f, 0.75f };
     float roughness = 0.45f;
@@ -27,6 +28,12 @@ struct PbrtMeshInstance {
     bool baseColorTextureSRGB = true;
     /** PBRT UVMapping as (uscale, vscale, udelta, vdelta). Image textures flip v at sample time. */
     pbrt::float4 baseColorUvTransform{ 1.f, 1.f, 0.f, 0.f };
+    /** Set by parallel mesh verification during loadPbrtSceneResources. */
+    bool plyFileExists = true;
+};
+
+struct PbrtMeshResource {
+    std::filesystem::path plyPath;
     /** Set by parallel mesh verification during loadPbrtSceneResources. */
     bool plyFileExists = true;
 };
@@ -81,6 +88,7 @@ struct PbrtCameraSettings {
 
 struct PbrtLoadedScene {
     std::filesystem::path searchPath;
+    std::vector<PbrtMeshResource> meshResources;
     std::vector<PbrtMeshInstance> meshes;
     std::vector<PbrtLightInstance> lights;
     std::vector<PbrtRectAreaLight> areaLights;
