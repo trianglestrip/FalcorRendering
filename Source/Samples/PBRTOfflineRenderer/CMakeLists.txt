@@ -8,8 +8,9 @@ target_sources(PBRTOfflineRenderer PRIVATE
     PBRTOfflineRenderer.h
     PBRTOfflineRenderer.3d.slang
     ForwardFlat.3d.slang
+    PBRTGBuffer.3d.slang
+    PBRTIBLLighting.ps.slang
     ShadowDepth.3d.slang
-    DepthPrepass.3d.slang
 )
 
 # Link against FilamentPostProcessLib (standalone static library)

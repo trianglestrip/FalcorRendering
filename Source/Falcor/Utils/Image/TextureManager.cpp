@@ -93,7 +93,7 @@ TextureManager::CpuTextureHandle TextureManager::addTexture(const ref<Texture>& 
             }
             else
             {
-                logWarning(
+                logInfo(
                     "TextureManager::addTexture() - Texture loaded from '{}' appears to be identical to an already loaded texture. This "
                     "could be optimized by getting it from TextureManager.",
                     pTexture->getSourcePath()

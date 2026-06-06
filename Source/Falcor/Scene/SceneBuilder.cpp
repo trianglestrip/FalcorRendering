@@ -62,6 +62,57 @@ namespace Falcor
             else return 2;
         }
 
+        constexpr float kMaxReasonablePositionMagnitude = 1e4f;
+
+        bool hasInvalid(const float2& v)
+        {
+            return any(isinf(v) || isnan(v));
+        }
+
+        bool hasInvalid(const float3& v)
+        {
+            return any(isinf(v) || isnan(v));
+        }
+
+        bool hasInvalid(const float4& v)
+        {
+            return any(isinf(v) || isnan(v));
+        }
+
+        bool isUsablePosition(const float3& v)
+        {
+            return !hasInvalid(v) && !any(abs(v) > float3(kMaxReasonablePositionMagnitude));
+        }
+
+        float3 safeNormalize(const float3& v, const float3& fallback)
+        {
+            if (hasInvalid(v) || length(v) < 1e-8f)
+                return fallback;
+            return normalize(v);
+        }
+
+        float4 sanitizeTangent(const float4& tangent, const float3& normal)
+        {
+            const float3 fallback = perp_stark(normal);
+            const float3 xyz = safeNormalize(tangent.xyz(), fallback);
+            const float w = std::isfinite(tangent.w) && std::abs(tangent.w) > 1e-8f ? (tangent.w < 0.f ? -1.f : 1.f) : 1.f;
+            return float4(xyz, w);
+        }
+
+        void sanitizeVertex(SceneBuilder::Mesh::Vertex& v)
+        {
+            if (!isUsablePosition(v.position))
+                v.position = float3(0.f);
+
+            v.normal = safeNormalize(v.normal, float3(0.f, 1.f, 0.f));
+            v.tangent = sanitizeTangent(v.tangent, v.normal);
+
+            if (hasInvalid(v.texCrd))
+                v.texCrd = float2(0.f);
+            if (hasInvalid(v.boneWeights))
+                v.boneWeights = float4(0.f);
+        }
+
         class MikkTSpaceWrapper
         {
         public:
@@ -139,13 +190,16 @@ namespace Falcor
             std::vector<float3> mPositions;
             int32_t getFaceCount() const { return (int32_t)mMesh.faceCount; }
             void getPosition(float position[], int32_t face, int32_t vert) const { FALCOR_ASSERT_LT(size_t(face) * 3 + vert, mPositions.size()); memcpy(position, mPositions.data() + (face * 3 + vert), sizeof(float3)); }
-            void getNormal(float normal[], int32_t face, int32_t vert) { *reinterpret_cast<float3*>(normal) = mMesh.getNormal(face, vert); }
+            void getNormal(float normal[], int32_t face, int32_t vert)
+            {
+                *reinterpret_cast<float3*>(normal) = safeNormalize(mMesh.getNormal(face, vert), float3(0.f, 1.f, 0.f));
+            }
             void getTexCrd(float texCrd[], int32_t face, int32_t vert) { *reinterpret_cast<float2*>(texCrd) = mMesh.getTexCrd(face, vert); }
 
             void setTangent(const float tangent[], float sign, int32_t face, int32_t vert)
             {
                 float3 T = *reinterpret_cast<const float3*>(tangent);
-                mTangents[face * 3 + vert] = float4(normalize(T), sign);
+                mTangents[face * 3 + vert] = float4(safeNormalize(T, float3(1.f, 0.f, 0.f)), sign);
             }
         };
 
@@ -398,6 +452,20 @@ namespace Falcor
             timeReport.measure("Writing cache");
         }
 
+        const uint32_t invalidMeshWarnings = mMeshAttributeWarningStats.invalidMeshWarnings.load(std::memory_order_relaxed);
+        const uint32_t zeroMeshWarnings = mMeshAttributeWarningStats.zeroMeshWarnings.load(std::memory_order_relaxed);
+        if (invalidMeshWarnings > 0 || zeroMeshWarnings > 0)
+        {
+            logInfo(
+                "Mesh attribute validation summary: {} meshes have inf/nan vertex attributes ({} affected vertices); "
+                "{} meshes have zero-length normals/tangents ({} affected vertices).",
+                invalidMeshWarnings,
+                mMeshAttributeWarningStats.invalidVertices.load(std::memory_order_relaxed),
+                zeroMeshWarnings,
+                mMeshAttributeWarningStats.zeroVertices.load(std::memory_order_relaxed)
+            );
+        }
+
         // Create the scene object.
         mpScene = Scene::create(mpDevice, std::move(mSceneData));
         mSceneData = {};
@@ -563,7 +631,8 @@ namespace Falcor
             {
                 for (uint32_t vert = 0; vert < 3; vert++)
                 {
-                    const Mesh::Vertex v = mesh.getVertex(face, vert);
+                    Mesh::Vertex v = mesh.getVertex(face, vert);
+                    sanitizeVertex(v);
                     const uint32_t origIndex = mesh.pIndices[face * 3 + vert];
 
                     // Iterate over vertex list to check if it already exists.
@@ -610,7 +679,8 @@ namespace Falcor
             {
                 for (uint32_t vert = 0; vert < 3; vert++)
                 {
-                    const Mesh::Vertex v = mesh.getVertex(face, vert);
+                    Mesh::Vertex v = mesh.getVertex(face, vert);
+                    sanitizeVertex(v);
                     const uint32_t index = mesh.getAttributeIndex(mesh.positions, face, vert);
 
                     FALCOR_ASSERT(index < vertices.size());
@@ -645,8 +715,18 @@ namespace Falcor
         {
             validateVertex(v.first, invalidCount, zeroCount);
         }
-        if (invalidCount > 0) logWarning("The mesh '{}' has inf/nan vertex attributes at {} vertices. Please fix the asset.", mesh.name, invalidCount);
-        if (zeroCount > 0) logWarning("The mesh '{}' has zero-length normals/tangents at {} vertices. Please fix the asset.", mesh.name, zeroCount);
+        auto logMeshAttributeWarning = [&](bool isInvalidWarning, size_t vertexCount)
+        {
+            if (vertexCount == 0) return;
+
+            auto& meshWarningCount = isInvalidWarning ? mMeshAttributeWarningStats.invalidMeshWarnings : mMeshAttributeWarningStats.zeroMeshWarnings;
+            auto& affectedVertexCount = isInvalidWarning ? mMeshAttributeWarningStats.invalidVertices : mMeshAttributeWarningStats.zeroVertices;
+
+            affectedVertexCount.fetch_add(static_cast<uint64_t>(vertexCount), std::memory_order_relaxed);
+            meshWarningCount.fetch_add(1, std::memory_order_relaxed);
+        };
+        logMeshAttributeWarning(true, invalidCount);
+        logMeshAttributeWarning(false, zeroCount);
 
         // If the non-indexed vertices build flag is set, we will de-index the data below.
         const bool isIndexed = !is_set(mFlags, Flags::NonIndexedVertices);
@@ -719,7 +799,7 @@ namespace Falcor
                         return;
                     uint32_t faceIndex = fvIndex / 3;
                     uint32_t vertexIndex = fvIndex % 3;
-                    float3 normal = mesh.getNormal(faceIndex, vertexIndex);
+                    float3 normal = safeNormalize(mesh.getNormal(faceIndex, vertexIndex), float3(0.f, 1.f, 0.f));
                     tangents[fvIndex] = float4(perp_stark(normal), 1.f);
                 });
             }
@@ -1703,8 +1783,10 @@ namespace Falcor
                 for (auto& v : mesh.staticData)
                 {
                     v.position = transformPoint(transform, v.position);
-                    v.normal = normalize(transformVector(invTranspose3x3, v.normal));
-                    v.tangent = float4(normalize(transformVector(transform3x3, v.tangent.xyz())), v.tangent.w);
+                    if (!isUsablePosition(v.position))
+                        v.position = float3(0.f);
+                    v.normal = safeNormalize(transformVector(invTranspose3x3, v.normal), float3(0.f, 1.f, 0.f));
+                    v.tangent = sanitizeTangent(float4(transformVector(transform3x3, v.tangent.xyz()), v.tangent.w), v.normal);
                     // TODO: We should flip the sign of v.tangent.w if flippedWinding is true.
                     // Leaving that out for now for consistency with the shader code that needs the same fix.
 
@@ -1821,10 +1903,17 @@ namespace Falcor
             FALCOR_ASSERT((size_t)mesh.vertexCount == mesh.staticData.size());
 
             AABB meshBB;
+            bool hasValidPosition = false;
             for (auto& v : mesh.staticData)
             {
-                meshBB.include(v.position);
+                if (isUsablePosition(v.position))
+                {
+                    meshBB.include(v.position);
+                    hasValidPosition = true;
+                }
             }
+            if (!hasValidPosition)
+                meshBB.include(float3(0.f));
 
             mesh.boundingBox = meshBB;
         }
@@ -2108,7 +2197,17 @@ namespace Falcor
             if (m.use16BitIndices) m.indexData = compact16BitIndices(m.indexData);
 
             m.boundingBox = AABB();
-            for (auto& v : m.staticData) m.boundingBox.include(v.position);
+            bool hasValidPosition = false;
+            for (auto& v : m.staticData)
+            {
+                if (isUsablePosition(v.position))
+                {
+                    m.boundingBox.include(v.position);
+                    hasValidPosition = true;
+                }
+            }
+            if (!hasValidPosition)
+                m.boundingBox.include(float3(0.f));
         };
 
         finalizeMesh(leftMesh);

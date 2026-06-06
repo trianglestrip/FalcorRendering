@@ -59,11 +59,13 @@
  */
 
 #include "PBRTImporter.h"
-#include "Parser.h"
-#include "Builder.h"
-#include "Helpers.h"
-#include "LoopSubdivide.h"
 #include "EnvMapConverter.h"
+
+#include <pbrtio/Parser.h>
+#include <pbrtio/Builder.h>
+#include <pbrtio/Helpers.h>
+#include <pbrtio/LoopSubdivide.h>
+
 #include "Core/Error.h"
 #include "Core/API/Device.h"
 #include "Utils/Settings/Settings.h"
@@ -86,12 +88,74 @@
 
 #include <pybind11/pybind11.h>
 
+#include <cmath>
 #include <unordered_map>
 
 namespace Falcor
 {
 namespace pbrt
 {
+using namespace ::pbrtio::pbrt;
+namespace io = ::pbrtio::pbrt;
+
+float2 toFalcor(const io::float2& v)
+{
+    return float2(v.x, v.y);
+}
+
+float3 toFalcor(const io::float3& v)
+{
+    return float3(v.x, v.y, v.z);
+}
+
+float4 toFalcor(const io::float4& v)
+{
+    return float4(v.x, v.y, v.z, v.w);
+}
+
+float4x4 toFalcor(const io::float4x4& m)
+{
+    return float4x4{
+        m[0][0], m[1][0], m[2][0], m[3][0],
+        m[0][1], m[1][1], m[2][1], m[3][1],
+        m[0][2], m[1][2], m[2][2], m[3][2],
+        m[0][3], m[1][3], m[2][3], m[3][3],
+    };
+}
+
+io::float3 toPbrt(const float3& v)
+{
+    return io::float3(v.x, v.y, v.z);
+}
+
+io::Spectrum makePbrtSpectrum(const float3& v)
+{
+    return io::Spectrum(toPbrt(v));
+}
+
+io::Spectrum makePbrtSpectrum(float value)
+{
+    return io::Spectrum(io::float3(value));
+}
+
+std::vector<float2> toFalcor(const std::vector<io::float2>& values)
+{
+    std::vector<float2> result;
+    result.reserve(values.size());
+    for (const auto& value : values)
+        result.push_back(toFalcor(value));
+    return result;
+}
+
+std::vector<float3> toFalcor(const std::vector<io::float3>& values)
+{
+    std::vector<float3> result;
+    result.reserve(values.size());
+    for (const auto& value : values)
+        result.push_back(toFalcor(value));
+    return result;
+}
+
 const float4x4 kYtoZ = {
     // clang-format off
     1.f, 0.f, 0.f, 0.f,
@@ -136,7 +200,7 @@ struct Light
 struct FloatTexture
 {
     std::variant<std::monostate, float, Falcor::ref<Texture>> texture;
-    float4x4 transform = float4x4::identity();
+    Transform transform;
 
     bool isConstant() const { return std::holds_alternative<float>(texture); }
     float getConstant() const
@@ -155,7 +219,7 @@ struct SpectrumTexture
 {
     SpectrumType spectrumType = SpectrumType::Albedo;
     std::variant<std::monostate, Spectrum, Falcor::ref<Texture>> texture;
-    float4x4 transform = float4x4::identity();
+    Transform transform;
 
     bool isConstant() const { return std::holds_alternative<Spectrum>(texture); }
     Spectrum getConstant() const
@@ -229,6 +293,9 @@ struct BuilderContext
     size_t curveCount = 0;
 
     bool usePBRTMaterials = false;
+    bool rotateImageTextures90 = false;
+    uint32_t nonConstantRoughnessFallbackCount = 0;
+    uint32_t anisotropicRoughnessFallbackCount = 0;
 
     Falcor::ref<Falcor::Material> getMaterial(const MaterialRef& materialRef)
     {
@@ -281,22 +348,68 @@ inline void warnUnsupportedParameters(const ParameterDictionary& params, std::ve
 float3 spectrumToRGB(const Spectrum& spectrum, SpectrumType spectrumType)
 {
     // TODO: Handle spectrum type.
-    if (auto pRGB = std::get_if<float3>(&spectrum))
+    if (auto pRGB = std::get_if<io::float3>(&spectrum))
     {
-        return *pRGB;
+        return toFalcor(*pRGB);
     }
-    else if (auto pPiecewiseLinearSpectrum = std::get_if<PiecewiseLinearSpectrum>(&spectrum))
+    else if (auto pPiecewiseLinearSpectrum = std::get_if<io::PiecewiseLinearSpectrum>(&spectrum))
     {
-        return spectrumToRGB(*pPiecewiseLinearSpectrum);
+        (void)pPiecewiseLinearSpectrum;
+        return toFalcor(io::spectrumToRGB(spectrum));
     }
-    else if (auto pBlackbodySpectrum = std::get_if<BlackbodySpectrum>(&spectrum))
+    else if (auto pBlackbodySpectrum = std::get_if<io::BlackbodySpectrum>(&spectrum))
     {
-        return spectrumToRGB(*pBlackbodySpectrum);
+        (void)pBlackbodySpectrum;
+        return toFalcor(io::spectrumToRGB(spectrum));
     }
     else
     {
         FALCOR_THROW("Unhandled spectrum variant.");
     }
+}
+
+Transform createPbrtImageTextureTransform(const ParameterDictionary& params, const FileLoc& loc, bool rotate90)
+{
+    Transform transform;
+
+    const std::string mapping = params.getString("mapping", "uv");
+    if (mapping != "uv")
+    {
+        logWarning(loc, "Image texture mapping '{}' is currently not supported. Using 'uv' mapping instead.", mapping);
+    }
+
+    const float uscale = params.getFloat("uscale", 1.f);
+    const float vscale = params.getFloat("vscale", 1.f);
+    const float udelta = params.getFloat("udelta", 0.f);
+    const float vdelta = params.getFloat("vdelta", 0.f);
+
+    if (std::abs(uscale) < 1e-8f || std::abs(vscale) < 1e-8f)
+    {
+        logWarning(loc, "Image texture has a zero UV scale. Using default texture transform.");
+        return transform;
+    }
+
+    // PBRT image textures apply UVMapping and then flip t at sample time:
+    //   s = uscale * u + udelta
+    //   t = 1 - (vscale * v + vdelta)
+    // SceneBuilder stores inverse(material.textureTransform) into mesh UVs, so set
+    // the material transform to the inverse of the desired PBRT sampling transform.
+    if (rotate90)
+    {
+        // Rotate the PBRT sampling coordinates 90 degrees around the UV center:
+        //   s' = t
+        //   t' = 1 - s
+        // The values below are the inverse of that complete sampling transform.
+        transform.setScaling(float3(-1.f / vscale, 1.f / uscale, 1.f));
+        transform.setRotation(math::quatFromAngleAxis(math::radians(90.f), float3(0.f, 0.f, 1.f)));
+        transform.setTranslation(float3((1.f - udelta) / uscale, (1.f - vdelta) / vscale, 0.f));
+    }
+    else
+    {
+        transform.setScaling(float3(1.f / uscale, -1.f / vscale, 1.f));
+        transform.setTranslation(float3(-udelta / uscale, (1.f - vdelta) / vscale, 0.f));
+    }
+    return transform;
 }
 
 float3 getSpectrumAsRGB(
@@ -307,7 +420,7 @@ float3 getSpectrumAsRGB(
     SpectrumType spectrumType
 )
 {
-    auto spectrum = params.getSpectrum(name, Spectrum(def), ctx.resolver);
+    auto spectrum = params.getSpectrum(name, makePbrtSpectrum(def), ctx.resolver);
     return spectrumToRGB(spectrum, spectrumType);
 }
 
@@ -336,7 +449,7 @@ std::optional<SpectrumTexture> getSpectrumTextureOrNull(
     else if (params.hasSpectrum(name))
     {
         SpectrumTexture spectrumTexture;
-        spectrumTexture.texture = params.getSpectrum(name, Spectrum(float3(0.f)), ctx.resolver);
+        spectrumTexture.texture = params.getSpectrum(name, makePbrtSpectrum(float3(0.f)), ctx.resolver);
         spectrumTexture.spectrumType = spectrumType;
         return spectrumTexture;
     }
@@ -356,7 +469,7 @@ SpectrumTexture getSpectrumTexture(
         return *spectrumTexture;
 
     SpectrumTexture spectrumTexture;
-    spectrumTexture.texture = Spectrum(def);
+    spectrumTexture.texture = makePbrtSpectrum(def);
     spectrumTexture.spectrumType = spectrumType;
     return spectrumTexture;
 }
@@ -364,13 +477,18 @@ SpectrumTexture getSpectrumTexture(
 void assignSpectrumTexture(
     const SpectrumTexture& spectrumTexture,
     std::function<void(float3)> constantSetter,
-    std::function<void(Falcor::ref<Texture>)> textureSetter
+    std::function<void(Falcor::ref<Texture>)> textureSetter,
+    std::function<void(const Transform&)> textureTransformSetter = {}
 )
 {
     if (const auto* pSpectrum = std::get_if<Spectrum>(&spectrumTexture.texture))
         constantSetter(spectrumToRGB(*pSpectrum, spectrumTexture.spectrumType));
     else if (const auto* pTexture = std::get_if<Falcor::ref<Texture>>(&spectrumTexture.texture))
+    {
         textureSetter(*pTexture);
+        if (textureTransformSetter)
+            textureTransformSetter(spectrumTexture.transform);
+    }
 }
 
 std::optional<FloatTexture> getFloatTextureOrNull(BuilderContext& ctx, const ParameterDictionary& params, const std::string& name)
@@ -442,12 +560,7 @@ float2 getRoughness(
     if (!uroughness->isConstant() || !vroughness->isConstant())
     {
         float2 fallback{0.5f};
-        logWarning(
-            entity.loc,
-            "Non-constant roughness is currently not supported. Using constant roughness of {},{} instead.",
-            fallback.x,
-            fallback.y
-        );
+        ctx.nonConstantRoughnessFallbackCount++;
         return fallback;
     }
 
@@ -473,7 +586,7 @@ float getScalarRoughness(
     float2 roughness = getRoughness(ctx, entity, roughnessName, uroughnessName, vroughnessName);
 
     if (roughness.x != roughness.y)
-        logWarning(entity.loc, "Anisotropic roughness is currently not supported. Using average of u and v instead.");
+        ctx.anisotropicRoughnessFallbackCount++;
 
     return 0.5f * (roughness.x + roughness.y);
 }
@@ -548,8 +661,8 @@ std::pair<float3, float3> getConductorEtaK(
         return {etaRgb, kRgb};
     }
 
-    Spectrum etas = Spectrum(*Spectra::getNamedSpectrum("metal-Cu-eta"));
-    Spectrum ks = Spectrum(*Spectra::getNamedSpectrum("metal-Cu-k"));
+    Spectrum etas = makePbrtSpectrum(float3(0.27f, 0.68f, 1.32f));
+    Spectrum ks = makePbrtSpectrum(float3(3.61f, 2.62f, 2.29f));
 
     if (eta)
     {
@@ -599,20 +712,31 @@ Camera createCamera(BuilderContext& ctx, const CameraSceneEntity& entity)
     {
         // Parameters:
         // Float lensradius, Float focaldistance, Float fov, Float frameaspectratio, Float[4] screenwindow
-        warnUnsupportedParameters(params, {"frameaspectratio", "screenwindow"});
+        warnUnsupportedParameters(params, {"screenwindow"});
 
         auto lensradius = params.getFloat("lensradius", 0.f);
         auto focaldistance = params.getFloat("focaldistance", 1e6f);
         auto fov = params.getFloat("fov", 90.f);
+        const auto& film = ctx.scene.getFilm();
+        const int xres = film.params.getInt("xresolution", 1280);
+        const int yres = film.params.getInt("yresolution", 720);
+        const float defaultAspect = yres > 0 ? float(xres) / float(yres) : 16.f / 9.f;
+        const float frameAspectRatio = params.getFloat("frameaspectratio", defaultAspect);
+
+        // PBRT defines fov along the narrower image axis. Falcor stores vertical fov via focal length.
+        float fovY = fov;
+        if (frameAspectRatio < 1.f)
+            fovY = math::degrees(2.f * std::atan(std::tan(math::radians(fov) * 0.5f) / frameAspectRatio));
 
         auto pCamera = Falcor::Camera::create("Camera");
         pCamera->setApertureRadius(lensradius);
         pCamera->setFocalDistance(focaldistance);
-        float focalLength = fovYToFocalLength(math::radians(fov), 24.f);
+        pCamera->setAspectRatio(frameAspectRatio);
+        float focalLength = fovYToFocalLength(math::radians(fovY), 24.f);
         pCamera->setFocalLength(focalLength);
 
         camera.pCamera = pCamera;
-        camera.transform = entity.transform;
+        camera.transform = toFalcor(entity.transform);
     }
     else if (type == "orthographic")
     {
@@ -677,10 +801,10 @@ Light createLight(BuilderContext& ctx, const LightSceneEntity& entity)
     {
         // Parameters:
         // Spectrum L, Float scale, Point3 from, Point3 to, Float illuminance
-        auto L = params.getSpectrum("L", Spectrum(*Spectra::getNamedSpectrum("stdillum-D65")), ctx.resolver);
+        auto L = params.getSpectrum("L", makePbrtSpectrum(float3(1.f)), ctx.resolver);
         auto scale = params.getFloat("scale", 1.f);
-        auto from = params.getPoint3("from", float3(0.f, 0.f, 0.f));
-        auto to = params.getPoint3("to", float3(0.f, 0.f, 1.f));
+        auto from = toFalcor(params.getPoint3("from", io::float3(0.f, 0.f, 0.f)));
+        auto to = toFalcor(params.getPoint3("to", io::float3(0.f, 0.f, 1.f)));
         auto illuminance = params.getFloat("illuminance", -1.f);
 
         // TODO: Missing spectrum normalization to 1 nit
@@ -690,7 +814,7 @@ Light createLight(BuilderContext& ctx, const LightSceneEntity& entity)
         if (illuminance > 0.f)
             intensity *= illuminance;
 
-        float3 direction = normalize(transformVector(entity.transform, to - from));
+        float3 direction = normalize(transformVector(toFalcor(entity.transform), to - from));
 
         auto pDirectionalLight = Falcor::DirectionalLight::create("DirectionalLight");
         pDirectionalLight->setIntensity(intensity);
@@ -735,7 +859,7 @@ Light createLight(BuilderContext& ctx, const LightSceneEntity& entity)
             pEnvMap->setIntensity(scale);
 
             float3 rotation;
-            math::extractEulerAngleXYZ(entity.transform, rotation.x, rotation.y, rotation.z);
+            math::extractEulerAngleXYZ(toFalcor(entity.transform), rotation.x, rotation.y, rotation.z);
             pEnvMap->setRotation(math::degrees(rotation));
 
             light.pEnvMap = pEnvMap;
@@ -758,8 +882,8 @@ FloatTexture createFloatTexture(BuilderContext& ctx, const TextureSceneEntity& e
 
     FloatTexture floatTexture;
 
-    floatTexture.transform = entity.transform;
-    if (floatTexture.transform != float4x4::identity())
+    const float4x4 textureFromRender = toFalcor(entity.transform);
+    if (textureFromRender != float4x4::identity())
         logWarning(entity.loc, "Texture transforms are currently not supported and ignored.");
 
     if (type == "constant")
@@ -772,7 +896,32 @@ FloatTexture createFloatTexture(BuilderContext& ctx, const TextureSceneEntity& e
     {
         // Parameters:
         // FloatTexture tex, FloatTexture scale
-        warnUnsupported();
+        const float scale = params.hasFloat("scale") ? params.getFloat("scale", 1.f) : 1.f;
+        if (params.hasTexture("scale"))
+            (void)params.getTexture("scale");
+
+        bool scaleApplied = false;
+        if (params.hasFloat("tex"))
+        {
+            floatTexture.texture = params.getFloat("tex", 1.f) * scale;
+            scaleApplied = true;
+        }
+        else if (params.hasTexture("tex"))
+        {
+            const auto texName = params.getTexture("tex");
+            auto it = ctx.floatTextures.find(texName);
+            if (it != ctx.floatTextures.end())
+                floatTexture = it->second;
+            else
+                floatTexture.texture = scale;
+        }
+        else
+        {
+                floatTexture.texture = scale;
+        }
+
+        if (!scaleApplied && floatTexture.isConstant())
+            floatTexture.texture = floatTexture.getConstant() * scale;
     }
     else if (type == "mix")
     {
@@ -798,7 +947,9 @@ FloatTexture createFloatTexture(BuilderContext& ctx, const TextureSceneEntity& e
         // Float maxanisotropy, String filter, String wrap
         // Float scale, Bool invert
         // String filename, String encoding
-        warnUnsupportedParameters(params, {"maxanisotropy", "wrap", "scale", "invert"});
+        warnUnsupportedParameters(params, {"maxanisotropy", "wrap", "invert"});
+        const float imageScale = params.getFloat("scale", 1.f);
+        (void)imageScale;
 
         auto path = ctx.resolver(params.getString("filename", ""));
 
@@ -821,6 +972,7 @@ FloatTexture createFloatTexture(BuilderContext& ctx, const TextureSceneEntity& e
         }
         bool sRGB = encoding == "sRGB";
 
+        floatTexture.transform = createPbrtImageTextureTransform(params, entity.loc, ctx.rotateImageTextures90);
         floatTexture.texture = Falcor::Texture::createFromFile(ctx.builder.getDevice(), path, generateMips, sRGB);
     }
     else if (type == "checkerboard")
@@ -875,21 +1027,48 @@ SpectrumTexture createSpectrumTexture(BuilderContext& ctx, const TextureSceneEnt
     SpectrumTexture spectrumTexture;
 
     spectrumTexture.spectrumType = SpectrumType::Albedo;
-    spectrumTexture.transform = entity.transform;
-    if (spectrumTexture.transform != float4x4::identity())
+    const float4x4 textureFromRender = toFalcor(entity.transform);
+    if (textureFromRender != float4x4::identity())
         logWarning(entity.loc, "Texture transforms are currently not supported and ignored.");
 
     if (type == "constant")
     {
         // Parameters:
         // Spectrum value
-        spectrumTexture.texture = params.getSpectrum("value", Spectrum(1.f), ctx.resolver);
+        spectrumTexture.texture = params.getSpectrum("value", makePbrtSpectrum(float3(1.f)), ctx.resolver);
     }
     else if (type == "scale")
     {
         // Parameters:
         // SpectrumTexture tex, FloatTexture scale
-        warnUnsupported();
+        const float scale = params.hasFloat("scale") ? params.getFloat("scale", 1.f) : 1.f;
+        if (params.hasTexture("scale"))
+            (void)params.getTexture("scale");
+
+        bool scaleApplied = false;
+        if (params.hasSpectrum("tex"))
+        {
+            const auto tex = params.getSpectrum("tex", makePbrtSpectrum(float3(1.f)), ctx.resolver);
+            spectrumTexture.texture = makePbrtSpectrum(spectrumToRGB(tex, spectrumTexture.spectrumType) * scale);
+            scaleApplied = true;
+        }
+        else if (params.hasTexture("tex"))
+        {
+            const auto texName = params.getTexture("tex");
+            auto it = ctx.spectrumTextures.find(texName);
+            if (it != ctx.spectrumTextures.end())
+                spectrumTexture = it->second;
+            else
+                spectrumTexture.texture = makePbrtSpectrum(float3(scale));
+        }
+        else
+        {
+            spectrumTexture.texture = makePbrtSpectrum(float3(scale));
+            scaleApplied = true;
+        }
+
+        if (!scaleApplied && spectrumTexture.isConstant())
+            spectrumTexture.texture = makePbrtSpectrum(spectrumToRGB(spectrumTexture.getConstant(), spectrumTexture.spectrumType) * scale);
     }
     else if (type == "mix")
     {
@@ -915,7 +1094,9 @@ SpectrumTexture createSpectrumTexture(BuilderContext& ctx, const TextureSceneEnt
         // Float maxanisotropy, String filter, String wrap
         // Float scale, Bool invert
         // String filename, String encoding
-        warnUnsupportedParameters(params, {"maxanisotropy", "wrap", "scale", "invert"});
+        warnUnsupportedParameters(params, {"maxanisotropy", "wrap", "invert"});
+        const float imageScale = params.getFloat("scale", 1.f);
+        (void)imageScale;
 
         auto path = ctx.resolver(params.getString("filename", ""));
 
@@ -938,6 +1119,7 @@ SpectrumTexture createSpectrumTexture(BuilderContext& ctx, const TextureSceneEnt
         }
         bool sRGB = encoding == "sRGB";
 
+        spectrumTexture.transform = createPbrtImageTextureTransform(params, entity.loc, ctx.rotateImageTextures90);
         spectrumTexture.texture = Falcor::Texture::createFromFile(ctx.builder.getDevice(), path, generateMips, sRGB);
     }
     else if (type == "checkerboard")
@@ -994,7 +1176,7 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
         // Parameters:
         // SpectrumTexture reflectance
         // FloatTexture displacement
-        warnUnsupportedParameters(params, {"displacement"});
+        // Displacement textures are intentionally ignored by this realtime viewer.
 
         auto reflectance = getSpectrumTexture(ctx, params, "reflectance", float3(0.5f), SpectrumType::Albedo);
 
@@ -1004,7 +1186,8 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
             assignSpectrumTexture(
                 reflectance,
                 [&](float3 rgb) { pPBRTMaterial->setBaseColor(float4(rgb, 1.f)); },
-                [&](Falcor::ref<Texture> pTexture) { pPBRTMaterial->setBaseColorTexture(pTexture); }
+                [&](Falcor::ref<Texture> pTexture) { pPBRTMaterial->setBaseColorTexture(pTexture); },
+                [&](const Transform& transform) { pPBRTMaterial->setTextureTransform(transform); }
             );
             pPBRTMaterial->setDoubleSided(true);
             pMaterial = pPBRTMaterial;
@@ -1017,7 +1200,8 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
             assignSpectrumTexture(
                 reflectance,
                 [&](float3 rgb) { pStandardMaterial->setBaseColor(float4(rgb, 1.f)); },
-                [&](Falcor::ref<Texture> pTexture) { pStandardMaterial->setBaseColorTexture(pTexture); }
+                [&](Falcor::ref<Texture> pTexture) { pStandardMaterial->setBaseColorTexture(pTexture); },
+                [&](const Transform& transform) { pStandardMaterial->setTextureTransform(transform); }
             );
             pStandardMaterial->setDoubleSided(true);
             pMaterial = pStandardMaterial;
@@ -1030,7 +1214,7 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
         // FloatTexture roughness, FloatTexture uroughness, FloatTexture vroughness, Bool remaproughness
         // FloatTexture thickness, Float|Spectrum eta, Int maxdepth, Int nsamples, FloatTexture g, SpectrumTexture albedo
         // FloatTexture displacement
-        warnUnsupportedParameters(params, {"thickness", "eta", "maxdepth", "nsamples", "g", "albedo", "displacement"});
+        warnUnsupportedParameters(params, {"thickness", "eta", "maxdepth", "nsamples", "g", "albedo"});
 
         auto reflectance = getSpectrumTexture(ctx, params, "reflectance", float3(0.5f), SpectrumType::Albedo);
 
@@ -1043,7 +1227,8 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
             assignSpectrumTexture(
                 reflectance,
                 [&](float3 rgb) { pPBRTMaterial->setBaseColor(float4(rgb, 1.f)); },
-                [&](Falcor::ref<Texture> pTexture) { pPBRTMaterial->setBaseColorTexture(pTexture); }
+                [&](Falcor::ref<Texture> pTexture) { pPBRTMaterial->setBaseColorTexture(pTexture); },
+                [&](const Transform& transform) { pPBRTMaterial->setTextureTransform(transform); }
             );
             pPBRTMaterial->setDoubleSided(true);
             pMaterial = pPBRTMaterial;
@@ -1058,7 +1243,8 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
             assignSpectrumTexture(
                 reflectance,
                 [&](float3 rgb) { pStandardMaterial->setBaseColor(float4(rgb, 1.f)); },
-                [&](Falcor::ref<Texture> pTexture) { pStandardMaterial->setBaseColorTexture(pTexture); }
+                [&](Falcor::ref<Texture> pTexture) { pStandardMaterial->setBaseColorTexture(pTexture); },
+                [&](const Transform& transform) { pStandardMaterial->setTextureTransform(transform); }
             );
             pStandardMaterial->setDoubleSided(true);
             pMaterial = pStandardMaterial;
@@ -1070,7 +1256,7 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
         // SpectrumTexture eta, SpectrumTexture k, SpectrumTexture reflectance
         // FloatTexture roughness, FloatTexture uroughness, FloatTexture vroughness, Bool remaproughness
         // FloatTexture displacement
-        warnUnsupportedParameters(params, {"displacement"});
+        // Displacement textures are intentionally ignored by this realtime viewer.
 
         if (ctx.usePBRTMaterials && !isAreaLight)
         {
@@ -1110,7 +1296,7 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
 
         if (ctx.usePBRTMaterials && !isAreaLight)
         {
-            warnUnsupportedParameters(params, {"maxdepth", "nsamples", "g", "albedo", "displacement"});
+            warnUnsupportedParameters(params, {"maxdepth", "nsamples", "g", "albedo"});
 
             float2 interfaceRoughness = getRoughness(ctx, entity, "interface.roughness", "interface.uroughness", "interface.vroughness");
             float interfaceEta = getScalarEta(ctx, entity, "interface.eta");
@@ -1136,8 +1322,7 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
                  "maxdepth",
                  "nsamples",
                  "g",
-                 "albedo",
-                 "displacement"}
+                 "albedo"}
             );
 
             float3 specularAlbedo = getConductorSpecularAlbedo(ctx, entity, "conductor.reflectance", "conductor.eta", "conductor.k");
@@ -1157,7 +1342,7 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
         // Float|Spectrum eta
         // FloatTexture roughness, FloatTexture uroughness, FloatTexture vroughness, Bool remaproughness
         // FloatTexture displacement
-        warnUnsupportedParameters(params, {"displacement"});
+        // Displacement textures are intentionally ignored by this realtime viewer.
 
         if (ctx.usePBRTMaterials && !isAreaLight)
         {
@@ -1187,7 +1372,7 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
         // Parameters:
         // Float|Spectrum eta
         // FloatTexture displacement
-        warnUnsupportedParameters(params, {"displacement"});
+        // Displacement textures are intentionally ignored by this realtime viewer.
 
         float eta = getScalarEta(ctx, entity);
 
@@ -1204,7 +1389,7 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
         // Parameters:
         // SpectrumTexture reflectance, SpectrumTexture transmittance, Float scale
         // FloatTexture displacement
-        warnUnsupportedParameters(params, {"displacement", "scale"});
+        warnUnsupportedParameters(params, {"scale"});
 
         auto reflectance = getSpectrumTexture(ctx, params, "reflectance", float3(0.25f), SpectrumType::Albedo);
         auto transmittance = getSpectrumTexture(ctx, params, "transmittance", float3(0.25f), SpectrumType::Albedo);
@@ -1215,12 +1400,14 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
             assignSpectrumTexture(
                 reflectance,
                 [&](float3 rgb) { pPBRTMaterial->setBaseColor(float4(rgb, 1.f)); },
-                [&](Falcor::ref<Texture> pTexture) { pPBRTMaterial->setBaseColorTexture(pTexture); }
+                [&](Falcor::ref<Texture> pTexture) { pPBRTMaterial->setBaseColorTexture(pTexture); },
+                [&](const Transform& transform) { pPBRTMaterial->setTextureTransform(transform); }
             );
             assignSpectrumTexture(
                 transmittance,
                 [&](float3 rgb) { pPBRTMaterial->setTransmissionColor(rgb); },
-                [&](Falcor::ref<Texture> pTexture) { pPBRTMaterial->setTransmissionTexture(pTexture); }
+                [&](Falcor::ref<Texture> pTexture) { pPBRTMaterial->setTransmissionTexture(pTexture); },
+                [&](const Transform& transform) { pPBRTMaterial->setTextureTransform(transform); }
             );
             pMaterial = pPBRTMaterial;
         }
@@ -1233,12 +1420,14 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
             assignSpectrumTexture(
                 reflectance,
                 [&](float3 rgb) { pStandardMaterial->setBaseColor(float4(rgb, 1.f)); },
-                [&](Falcor::ref<Texture> pTexture) { pStandardMaterial->setBaseColorTexture(pTexture); }
+                [&](Falcor::ref<Texture> pTexture) { pStandardMaterial->setBaseColorTexture(pTexture); },
+                [&](const Transform& transform) { pStandardMaterial->setTextureTransform(transform); }
             );
             assignSpectrumTexture(
                 transmittance,
                 [&](float3 rgb) { pStandardMaterial->setTransmissionColor(rgb); },
-                [&](Falcor::ref<Texture> pTexture) { pStandardMaterial->setTransmissionTexture(pTexture); }
+                [&](Falcor::ref<Texture> pTexture) { pStandardMaterial->setTransmissionTexture(pTexture); },
+                [&](const Transform& transform) { pStandardMaterial->setTextureTransform(transform); }
             );
             pStandardMaterial->setDoubleSided(true);
             pMaterial = pStandardMaterial;
@@ -1297,7 +1486,8 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
             assignSpectrumTexture(
                 *reflectance,
                 [&](float3 constant) { pHairMaterial->setBaseColor(float4(constant, 1.f)); },
-                [&](Falcor::ref<Texture> pTexture) { pHairMaterial->setBaseColorTexture(pTexture); }
+                [&](Falcor::ref<Texture> pTexture) { pHairMaterial->setBaseColorTexture(pTexture); },
+                [&](const Transform& transform) { pHairMaterial->setTextureTransform(transform); }
             );
         }
         else if (eumelanin || pheomelanin)
@@ -1398,6 +1588,7 @@ void createAreaLight(BuilderContext& ctx, const SceneEntity& entity, const Falco
 
         auto L = getSpectrumAsRGB(ctx, params, "L", float3(1.f), SpectrumType::Illuminant);
         auto scale = params.getFloat("scale", 1.f);
+        L *= scale;
 
         if (auto pStandardMaterial = dynamic_ref_cast<Falcor::StandardMaterial>(pMaterial))
         {
@@ -1436,7 +1627,7 @@ Shape createShape(BuilderContext& ctx, const ShapeSceneEntity& entity)
 
         shape.pTriangleMesh = Falcor::TriangleMesh::createSphere(radius);
         shape.pTriangleMesh->setName("sphere");
-        shape.transform = entity.transform;
+        shape.transform = toFalcor(entity.transform);
     }
     else if (type == "cylinder")
     {
@@ -1485,16 +1676,16 @@ Shape createShape(BuilderContext& ctx, const ShapeSceneEntity& entity)
         if (curveType != "cylinder")
             logWarning(entity.loc, "Curve type '{}' is not supported. Using 'cylinder' type instead.", curveType);
 
-        auto P = params.getPoint3Array("P");
+        auto P = toFalcor(params.getPoint3Array("P"));
 
         // Create or get existing curve aggregate.
         auto pMaterial = ctx.getMaterial(entity.materialRef);
-        CurveAggregate::Key key{entity.transform, pMaterial.get()};
+        CurveAggregate::Key key{toFalcor(entity.transform), pMaterial.get()};
         auto it = ctx.curveAggregates.find(key);
         if (it == ctx.curveAggregates.end())
         {
             it = ctx.curveAggregates.emplace(key, CurveAggregate{}).first;
-            it->second.transform = entity.transform;
+            it->second.transform = toFalcor(entity.transform);
             it->second.pMaterial = pMaterial;
             it->second.splitDepth = splitdepth;
         }
@@ -1520,9 +1711,9 @@ Shape createShape(BuilderContext& ctx, const ShapeSceneEntity& entity)
         warnUnsupportedParameters(params, {"S", "faceIndices"});
 
         auto indices = params.getIntArray("indices");
-        auto P = params.getPoint3Array("P");
-        auto N = params.getNormalArray("N");
-        auto uv = params.getPoint2Array("uv");
+        auto P = toFalcor(params.getPoint3Array("P"));
+        auto N = toFalcor(params.getNormalArray("N"));
+        auto uv = toFalcor(params.getPoint2Array("uv"));
 
         if (indices.empty())
         {
@@ -1582,7 +1773,7 @@ Shape createShape(BuilderContext& ctx, const ShapeSceneEntity& entity)
             indexList[i] = indices[i];
 
         shape.pTriangleMesh = Falcor::TriangleMesh::create(std::move(vertexList), std::move(indexList));
-        shape.transform = entity.transform;
+        shape.transform = toFalcor(entity.transform);
     }
     else if (type == "plymesh")
     {
@@ -1596,7 +1787,7 @@ Shape createShape(BuilderContext& ctx, const ShapeSceneEntity& entity)
         shape.pTriangleMesh = Falcor::TriangleMesh::createFromFile(path.string());
         if (shape.pTriangleMesh)
             shape.pTriangleMesh->setName(filename);
-        shape.transform = entity.transform;
+        shape.transform = toFalcor(entity.transform);
     }
     else if (type == "loopsubdiv")
     {
@@ -1621,14 +1812,14 @@ Shape createShape(BuilderContext& ctx, const ShapeSceneEntity& entity)
         for (size_t i = 0; i < result.positions.size(); ++i)
         {
             auto& vertex = vertexList[i];
-            vertex.position = result.positions[i];
-            vertex.normal = result.normals[i];
+            vertex.position = toFalcor(result.positions[i]);
+            vertex.normal = toFalcor(result.normals[i]);
             vertex.texCoord = float2(0.f);
         }
 
         shape.pTriangleMesh = Falcor::TriangleMesh::create(vertexList, result.indices);
         shape.pTriangleMesh->setName("loopsubdiv");
-        shape.transform = entity.transform;
+        shape.transform = toFalcor(entity.transform);
     }
     else
     {
@@ -1812,6 +2003,21 @@ void buildScene(BuilderContext& ctx)
     for (const auto& entity : ctx.scene.getMaterials())
         ctx.materials.push_back(createMaterial(ctx, entity));
 
+    if (ctx.nonConstantRoughnessFallbackCount > 0)
+    {
+        logInfo(
+            "PBRTImporter: {} material roughness values are texture/non-constant and are currently approximated as constant roughness 0.5.",
+            ctx.nonConstantRoughnessFallbackCount
+        );
+    }
+    if (ctx.anisotropicRoughnessFallbackCount > 0)
+    {
+        logInfo(
+            "PBRTImporter: {} anisotropic roughness values are currently approximated with the average of u/v roughness.",
+            ctx.anisotropicRoughnessFallbackCount
+        );
+    }
+
     // Create camera.
     auto camera = createCamera(ctx, ctx.scene.getCamera());
     if (camera.pCamera)
@@ -1893,13 +2099,20 @@ void buildScene(BuilderContext& ctx)
     for (const auto& entity : ctx.scene.getInstances())
     {
         const auto& instanceDefinition = getInstanceDefinition(entity);
-        auto instanceTransform = entity.transform;
+        auto instanceTransform = toFalcor(entity.transform);
 
         // Instantiate meshes.
         for (const auto& [meshID, transform] : instanceDefinition.meshes)
         {
             auto nodeID = ctx.builder.addNode({"instance", mul(instanceTransform, transform)});
             ctx.builder.addMeshInstance(nodeID, meshID);
+        }
+
+        // Instantiate curves.
+        for (const auto& [curveID, transform] : instanceDefinition.curves)
+        {
+            auto nodeID = ctx.builder.addNode({"instance_curve", mul(instanceTransform, transform)});
+            ctx.builder.addCurveInstance(nodeID, curveID);
         }
     }
 }
@@ -1930,6 +2143,7 @@ void PBRTImporter::importScene(
 
         pbrt::BuilderContext ctx{pbrtScene, builder};
         ctx.usePBRTMaterials = builder.getSettings().getOption("PBRTImporter:usePBRTMaterials", false);
+        ctx.rotateImageTextures90 = builder.getSettings().getOption("PBRTImporter:rotateImageTextures90", false);
         pbrt::buildScene(ctx);
         timeReport.measure("Building pbrt scene");
         timeReport.printToLog();

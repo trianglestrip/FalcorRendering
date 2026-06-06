@@ -362,7 +362,6 @@ namespace Falcor
             }
             else
             {
-                logInfo("Removing duplicate material '{}' (duplicate of '{}').", pMaterial->getName(), (*it)->getName());
                 idMap[id.get()] = MaterialID{ (size_t)std::distance(uniqueMaterials.begin(), it) };
             }
         }
@@ -370,6 +369,7 @@ namespace Falcor
         size_t removed = mMaterials.size() - uniqueMaterials.size();
         if (removed > 0)
         {
+            logInfo("Optimized materials by removing {} duplicate materials.", removed);
             mMaterials = uniqueMaterials;
             mMaterialsChanged = true;
         }

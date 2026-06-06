@@ -47,6 +47,22 @@
 
 namespace Falcor
 {
+namespace
+{
+bool hasOnlySuppressedWarnings(const std::string& log)
+{
+    bool foundWarning = false;
+    size_t pos = 0;
+    while ((pos = log.find("warning ", pos)) != std::string::npos)
+    {
+        foundWarning = true;
+        pos += 8;
+        if (log.compare(pos, 5, "30081") != 0)
+            return false;
+    }
+    return foundWarning;
+}
+} // namespace
 
 void ProgramDesc::finalize()
 {
@@ -334,7 +350,7 @@ bool Program::link() const
         }
         else
         {
-            if (!log.empty())
+            if (!log.empty() && !hasOnlySuppressedWarnings(log))
             {
                 logWarning("Warnings in program:\n{}\n{}", getProgramDescString(), log);
             }

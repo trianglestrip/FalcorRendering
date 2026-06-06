@@ -432,6 +432,7 @@ endif()
 # -----------------------------------------------------------------------------
 
 add_subdirectory(Source/Falcor)
+add_subdirectory(third_party/pbrtio)
 add_subdirectory(Source/Modules)
 add_subdirectory(Source/Mogwai)
 add_subdirectory(Source/plugins)

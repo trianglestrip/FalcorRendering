@@ -38,6 +38,33 @@
 
 namespace Falcor
 {
+    namespace
+    {
+        constexpr float kMaxImportedPositionMagnitude = 1e4f;
+
+        bool isFinite(const float2& v)
+        {
+            return std::isfinite(v.x) && std::isfinite(v.y);
+        }
+
+        bool isFinite(const float3& v)
+        {
+            return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+        }
+
+        bool isUsablePosition(const float3& p)
+        {
+            return isFinite(p) && all(abs(p) < float3(kMaxImportedPositionMagnitude));
+        }
+
+        float3 safeNormalize(const float3& v, const float3& fallback)
+        {
+            if (!isFinite(v)) return fallback;
+            const float len = length(v);
+            return len > 1e-12f && std::isfinite(len) ? v / len : fallback;
+        }
+    }
+
     ref<TriangleMesh> TriangleMesh::create()
     {
         return ref<TriangleMesh>(new TriangleMesh());
@@ -243,6 +270,8 @@ namespace Falcor
         vertices.reserve(vertexCount);
         indices.reserve(indexCount);
 
+        size_t skippedFaceCount = 0;
+        size_t skippedInvalidFaceCount = 0;
         for (size_t meshIdx = 0; meshIdx < scene->mNumMeshes; ++meshIdx)
         {
             size_t indexBase = vertices.size();
@@ -250,12 +279,15 @@ namespace Falcor
             for (size_t vertexIdx = 0; vertexIdx < mesh->mNumVertices; ++vertexIdx)
             {
                 const auto& vertex = mesh->mVertices[vertexIdx];
-                const auto& normal = mesh->mNormals[vertexIdx];
+                const auto normal = mesh->mNormals ? mesh->mNormals[vertexIdx] : aiVector3D(0.f, 1.f, 0.f);
                 const auto& texCoord = mesh->mTextureCoords[0] ? mesh->mTextureCoords[0][vertexIdx] : aiVector3D(0.f);
+                const float3 position(vertex.x, vertex.y, vertex.z);
+                const float3 sanitizedNormal = safeNormalize(float3(normal.x, normal.y, normal.z), float3(0.f, 1.f, 0.f));
+                const float2 sanitizedTexCoord = isFinite(float2(texCoord.x, texCoord.y)) ? float2(texCoord.x, texCoord.y) : float2(0.f);
                 vertices.emplace_back(Vertex{
-                    float3(vertex.x, vertex.y, vertex.z),
-                    float3(normal.x, normal.y, normal.z),
-                    float2(texCoord.x, texCoord.y)
+                    position,
+                    sanitizedNormal,
+                    sanitizedTexCoord
                 });
             }
             for (size_t faceIdx = 0; faceIdx < mesh->mNumFaces; ++faceIdx)
@@ -263,12 +295,40 @@ namespace Falcor
                 const auto& face = mesh->mFaces[faceIdx];
                 if (face.mNumIndices != 3)
                 {
-                    logWarning("Failed to load triangle mesh from '{}': Broken face data", path);
-                    return nullptr;
+                    skippedFaceCount++;
+                    continue;
+                }
+                bool validFace = true;
+                for (size_t i = 0; i < 3; ++i)
+                {
+                    if (face.mIndices[i] >= mesh->mNumVertices || !isUsablePosition(vertices[indexBase + face.mIndices[i]].position))
+                    {
+                        validFace = false;
+                        break;
+                    }
+                }
+                if (!validFace)
+                {
+                    skippedInvalidFaceCount++;
+                    continue;
                 }
                 for (size_t i = 0; i < 3; ++i) indices.emplace_back((uint32_t)(indexBase + face.mIndices[i]));
             }
         }
+
+        if (indices.empty())
+        {
+            if (skippedFaceCount > 0 || skippedInvalidFaceCount > 0)
+                logDebug("Skipped triangle mesh from '{}': no valid triangle faces after filtering.", path);
+            else
+                logWarning("Failed to load triangle mesh from '{}': No valid triangle faces", path);
+            return nullptr;
+        }
+
+        if (skippedFaceCount > 0)
+            logDebug("Skipped {} non-triangle/broken face(s) while loading triangle mesh from '{}'.", skippedFaceCount, path);
+        if (skippedInvalidFaceCount > 0)
+            logDebug("Skipped {} face(s) with invalid vertex positions while loading triangle mesh from '{}'.", skippedInvalidFaceCount, path);
 
         return create(vertices, indices);
     }
@@ -305,7 +365,7 @@ namespace Falcor
         for (auto& vertex : mVertices)
         {
             vertex.position = transformPoint(transform, vertex.position);
-            vertex.normal = normalize(transformVector(invTranspose, vertex.normal));
+            vertex.normal = safeNormalize(transformVector(invTranspose, vertex.normal), float3(0.f, 1.f, 0.f));
         }
 
         // Check if triangle winding has flipped and adjust winding order accordingly.

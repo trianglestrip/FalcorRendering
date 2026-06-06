@@ -93,7 +93,8 @@ void colorGradingPrep(uint3 dispatchThreadId : SV_DispatchThreadID)
     float ambientWeight = src.a;
 
     if (gAOEnabled > 0.5f) {
-        float ao = gAO.Load(int3(coord, 0)).r;
+        float2 uv = (float2(coord) + 0.5f) / float2(gResolution);
+        float ao = gAO.SampleLevel(gSampler, uv, 0).r;
         ao = saturate(ao);
         color *= (1.0 - ambientWeight + ambientWeight * ao);
     }

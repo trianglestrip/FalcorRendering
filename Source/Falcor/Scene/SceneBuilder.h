@@ -45,6 +45,7 @@
 
 #include <pybind11/pytypes.h>
 
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -758,6 +759,14 @@ namespace Falcor
             std::vector<StaticCurveVertexData> staticData;
         };
 
+        struct MeshAttributeWarningStats
+        {
+            std::atomic<uint32_t> invalidMeshWarnings{ 0 };
+            std::atomic<uint32_t> zeroMeshWarnings{ 0 };
+            std::atomic<uint64_t> invalidVertices{ 0 };
+            std::atomic<uint64_t> zeroVertices{ 0 };
+        };
+
         using SceneGraph = std::vector<InternalNode>;
         using MeshList = std::vector<MeshSpec>;
         using MeshGroup = Scene::MeshGroup;
@@ -786,6 +795,7 @@ namespace Falcor
         CurveList mCurves;
 
         std::unique_ptr<MaterialTextureLoader> mpMaterialTextureLoader;
+        mutable MeshAttributeWarningStats mMeshAttributeWarningStats;
 
         // Helpers
         bool doesNodeHaveAnimation(NodeID nodeID) const;

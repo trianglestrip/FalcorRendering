@@ -935,6 +935,7 @@ void FilamentPostProcess::executeColorGradingPrep(RenderContext* pRenderContext,
     var["gDst"] = pDst;
     var["gAO"] = (settings.enableSSAO && mpAOBlurTarget) ? mpAOBlurTarget : mpWhiteTexture;
     var["gShadow"] = (settings.postProcessShadow && settings.enableShadows && mpShadowVisibility) ? mpShadowVisibility : mpWhiteTexture;
+    var["gSampler"] = mpLinearSampler;
     mpColorGradingPrepPass->execute(pRenderContext, uint3(resolution, 1));
 }
 

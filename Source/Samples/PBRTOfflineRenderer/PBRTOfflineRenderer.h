@@ -4,6 +4,7 @@
 #pragma once
 #include "Falcor.h"
 #include "Core/SampleApp.h"
+#include "Core/Pass/FullScreenPass.h"
 #include "Core/Pass/RasterPass.h"
 #include "Scene/Scene.h"
 #include "Scene/Lights/Light.h"
@@ -30,7 +31,10 @@ public:
     void setScenePath(const std::filesystem::path& p) { mScenePath = p; }
     void setOutputPath(const std::filesystem::path& p) { mOutputPath = p; }
     void setSingleFrame(bool enabled) { mSingleFrame = enabled; }
+    void setDebugView(uint32_t view) { mDebugView = view; }
+    void setInspectInstanceIDs(std::vector<uint32_t> ids) { mInspectInstanceIDs = std::move(ids); }
     void setHeadlessProbeMode(bool enabled);
+    void setPreviewMode(bool enabled);
 
 private:
     void loadScene(RenderContext* pCtx);
@@ -43,19 +47,23 @@ private:
     void syncFilamentCameraSettings();
     void syncFilamentSunLight();
     void initSunFromScene();
-    void updateInteractiveCamera();
 
     std::filesystem::path mScenePath, mOutputPath;
     ref<Scene> mpScene;
-    ref<RasterPass> mpRasterPass;
-    ref<RasterPass> mpDepthPrepassPass;
+    ref<RasterPass> mpGBufferPass;
+    ref<FullScreenPass> mpLightingPass;
     ref<FilamentPostProcess> mpFilamentPostProcess;
     ref<FilamentIBL> mpFilamentIBL;
     ref<Texture> mpIntermediateTexture;
     ref<Texture> mpVelocityTexture;
     ref<Texture> mpIntermediateDepth;
-    ref<Texture> mpDepthPrepass;
     ref<Texture> mpPostProcessOutput;
+    ref<Texture> mpGBufferBaseColor;
+    ref<Texture> mpGBufferNormalW;
+    ref<Texture> mpGBufferMaterial;
+    ref<Texture> mpGBufferEmissive;
+    ref<Texture> mpGBufferViewDirW;
+    ref<Texture> mpGBufferIDs;
     ref<CPUSampleGenerator> mpHaltonJitter;
 
     // Shadow map resources
@@ -77,21 +85,11 @@ private:
     tf::Taskflow mTaskflow;
     bool mSavePending = false;
     bool mSingleFrame = false;
+    uint32_t mDebugView = 0;
+    std::vector<uint32_t> mInspectInstanceIDs;
     std::mutex mSaveMutex;
     std::filesystem::path mSavePath;
     ref<Texture> mSaveTexture;
-
-    bool mMoveForward = false;
-    bool mMoveBackward = false;
-    bool mMoveLeft = false;
-    bool mMoveRight = false;
-    bool mMoveUp = false;
-    bool mMoveDown = false;
-    bool mMoveFast = false;
-    bool mMouseLook = false;
-    float2 mLastMousePos = float2(0.f);
-    float2 mPendingMouseDelta = float2(0.f);
-    double mLastCameraUpdateTime = 0.0;
 
     FilamentPostProcess::FilamentSettings mFilamentSettings;
 };

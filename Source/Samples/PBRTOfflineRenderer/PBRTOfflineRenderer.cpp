@@ -3,8 +3,11 @@
  **************************************************************************/
 #include "PBRTOfflineRenderer.h"
 #include "Utils/Math/FalcorMath.h"
+#include "Utils/Settings/Settings.h"
 #include "Utils/SampleGenerators/HaltonSamplePattern.h"
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
 FALCOR_EXPORT_D3D12_AGILITY_SDK
@@ -111,7 +114,24 @@ namespace
     }
 }
 
-PBRTOfflineRenderer::PBRTOfflineRenderer(const SampleAppConfig& c) : SampleApp(c), mExecutor(std::thread::hardware_concurrency()) { buildTaskGraph(); }
+PBRTOfflineRenderer::PBRTOfflineRenderer(const SampleAppConfig& c) : SampleApp(c), mExecutor(std::thread::hardware_concurrency())
+{
+    mFilamentSettings.postProcessingEnabled = true;
+    mFilamentSettings.antiAliasing = 0;
+    mFilamentSettings.enableSSAO = true;
+    mFilamentSettings.forwardSSAO = true;
+    mFilamentSettings.ssaoRadius = 5.0f;
+    mFilamentSettings.ssaoIntensity = 1.4f;
+    mFilamentSettings.ssaoPower = 1.25f;
+    mFilamentSettings.ssaoResolution = 1.0f;
+    mFilamentSettings.ssaoSampleCount = 11;
+    mFilamentSettings.iblIntensity = 0.85f;
+    mFilamentSettings.sunIntensity = 0.f;
+    mFilamentSettings.enableShadows = false;
+    mFilamentSettings.exposure = -1.0f;
+    mFilamentSettings.toneMapping = 0; // ACES
+    buildTaskGraph();
+}
 PBRTOfflineRenderer::~PBRTOfflineRenderer() { mExecutor.wait_for_all(); }
 
 void PBRTOfflineRenderer::setHeadlessProbeMode(bool enabled)
@@ -119,9 +139,32 @@ void PBRTOfflineRenderer::setHeadlessProbeMode(bool enabled)
     if (!enabled)
         return;
 
+    mFilamentSettings.postProcessingEnabled = true;
     mFilamentSettings.enableShadows = false;
     mFilamentSettings.enableSSAO = true;
-    mFilamentSettings.forwardSSAO = false;
+    mFilamentSettings.forwardSSAO = true;
+    mFilamentSettings.sunIntensity = 0.f;
+}
+
+void PBRTOfflineRenderer::setPreviewMode(bool enabled)
+{
+    if (!enabled)
+        return;
+
+    // Mirror filament pbrt_kitchen setPreviewPreset() defaults.
+    mFilamentSettings.postProcessingEnabled = true;
+    mFilamentSettings.enableSSAO = true;
+    mFilamentSettings.forwardSSAO = true;
+    mFilamentSettings.ssaoRadius = 5.0f;
+    mFilamentSettings.ssaoIntensity = 1.4f;
+    mFilamentSettings.ssaoPower = 1.25f;
+    mFilamentSettings.ssaoResolution = 1.0f;
+    mFilamentSettings.ssaoSampleCount = 11;
+    mFilamentSettings.iblIntensity = 0.85f;
+    mFilamentSettings.sunIntensity = 0.f;
+    mFilamentSettings.enableShadows = false;
+    mFilamentSettings.exposure = -1.0f; // ~ f/8, 1/125s, ISO 100
+    mFilamentSettings.toneMapping = 0; // ACES (Filament ColorGrading::ToneMapping::ACES)
 }
 
 void PBRTOfflineRenderer::onLoad(RenderContext* pCtx)
@@ -130,27 +173,36 @@ void PBRTOfflineRenderer::onLoad(RenderContext* pCtx)
     else logInfo("No scene. Drag .pbrt file or use --scene <path>");
 }
 
-void PBRTOfflineRenderer::onShutdown() { mExecutor.wait_for_all(); mpRasterPass = nullptr; mpScene = nullptr; }
+void PBRTOfflineRenderer::onShutdown()
+{
+    mExecutor.wait_for_all();
+    mpGBufferPass = nullptr;
+    mpLightingPass = nullptr;
+    mpScene = nullptr;
+}
 
 void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
 {
     logInfo("Loading: {}", mScenePath.string());
     try
     {
-        mpScene = Scene::create(getDevice(), mScenePath);
+        Settings settings;
+        settings.addOptions(nlohmann::json{
+            {"PBRTImporter:rotateImageTextures90", false},
+            {"PBRTImporter:usePBRTMaterials", true},
+        });
+        mpScene = Scene::create(getDevice(), mScenePath, settings);
         if (!mpScene) { logError("Failed to load scene."); return; }
 
         auto pCam = mpScene->getCamera();
         float r = mpScene->getSceneBounds().radius();
-        mpScene->setCameraSpeed(r * 0.25f);
+        if (!std::isfinite(r) || r <= 0.f)
+            r = 1000.f;
+        mpScene->setCameraSpeed(r * 0.05f);
         mpScene->setCameraController(Scene::CameraControllerType::FirstPerson);
         mpScene->setCameraControlsEnabled(true);
         pCam->setIsAnimated(false);
         pCam->setDepthRange(std::max(0.1f, r / 750.f), r * 10.f);
-        const auto pTargetFbo = getTargetFbo();
-        const float aspect = pTargetFbo ? (float(pTargetFbo->getWidth()) / float(pTargetFbo->getHeight())) : 16.f / 9.f;
-        pCam->setAspectRatio(aspect);
-
         mSceneLoaded = true; mFrameCount = 0; mStartTime = getGlobalClock().getTime();
 
         // Enable emissive lights and build light collection (needed for PBRT area lights)
@@ -161,14 +213,68 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
             mpScene->getGeometryCount(), mpScene->useAnalyticLights(),
             mpScene->useEmissiveLights(), mpScene->useEnvLight());
 
-        // Create raster pass (like HelloDXR)
-        logInfo("Creating forward raster pass.");
+        if (!mInspectInstanceIDs.empty())
+        {
+            const auto pInspectCam = mpScene->getCamera();
+            if (pInspectCam)
+            {
+                logInfo(
+                    "Inspect camera: pos=({}, {}, {}) target=({}, {}, {}) up=({}, {}, {}) aspect={} focalLength={} near={} far={}",
+                    pInspectCam->getPosition().x, pInspectCam->getPosition().y, pInspectCam->getPosition().z,
+                    pInspectCam->getTarget().x, pInspectCam->getTarget().y, pInspectCam->getTarget().z,
+                    pInspectCam->getUpVector().x, pInspectCam->getUpVector().y, pInspectCam->getUpVector().z,
+                    pInspectCam->getAspectRatio(), pInspectCam->getFocalLength(), pInspectCam->getNearPlane(), pInspectCam->getFarPlane()
+                );
+            }
+        }
+
+        for (uint32_t instanceID : mInspectInstanceIDs)
+        {
+            if (instanceID >= mpScene->getGeometryInstanceCount())
+            {
+                logWarning("Inspect instance {} is out of range ({} instances).", instanceID, mpScene->getGeometryInstanceCount());
+                continue;
+            }
+
+            const auto& instance = mpScene->getGeometryInstance(instanceID);
+            const auto materialID = MaterialID::fromSlang(instance.materialID);
+            const auto& pMaterial = mpScene->getMaterial(materialID);
+            std::string meshName = "<non-mesh>";
+            if (instance.getType() == Scene::GeometryType::TriangleMesh || instance.getType() == Scene::GeometryType::DisplacedTriangleMesh)
+                meshName = mpScene->getMeshName(instance.geometryID);
+            logInfo(
+                "Inspect instance {}: geometryID={} materialID={} material='{}' mesh='{}'",
+                instanceID,
+                instance.geometryID,
+                instance.materialID,
+                pMaterial ? pMaterial->getName() : "<null>",
+                meshName
+            );
+            const auto* pAnim = mpScene->getAnimationController();
+            if (pAnim && instance.globalMatrixID < pAnim->getGlobalMatrices().size())
+            {
+                const auto& m = pAnim->getGlobalMatrices()[instance.globalMatrixID];
+                logInfo(
+                    "Inspect instance {} matrix rows: [{}, {}, {}, {}] [{}, {}, {}, {}] [{}, {}, {}, {}] [{}, {}, {}, {}]",
+                    instanceID,
+                    m[0][0], m[0][1], m[0][2], m[0][3],
+                    m[1][0], m[1][1], m[1][2], m[1][3],
+                    m[2][0], m[2][1], m[2][2], m[2][3],
+                    m[3][0], m[3][1], m[3][2], m[3][3]
+                );
+            }
+        }
+
+        logInfo("Creating PBRT GBuffer raster pass.");
         ProgramDesc d;
         d.addCompilerArguments({"-Wno-30081"});
         d.addShaderModules(mpScene->getShaderModules());
-        d.addShaderLibrary("Samples/PBRTOfflineRenderer/ForwardFlat.3d.slang").vsEntry("vsMain").psEntry("psMain");
+        d.addShaderLibrary("Samples/PBRTOfflineRenderer/PBRTGBuffer.3d.slang").vsEntry("vsMain").psEntry("psMain");
         d.addTypeConformances(mpScene->getTypeConformances());
-        mpRasterPass = RasterPass::create(getDevice(), d, mpScene->getSceneDefines());
+        mpGBufferPass = RasterPass::create(getDevice(), d, mpScene->getSceneDefines());
+
+        logInfo("Creating PBRT IBL lighting pass.");
+        mpLightingPass = FullScreenPass::create(getDevice(), "Samples/PBRTOfflineRenderer/PBRTIBLLighting.ps.slang");
 
         logInfo("Creating shadow resources.");
         ensureShadowMapResources();
@@ -181,14 +287,6 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         sd.addShaderLibrary("Samples/PBRTOfflineRenderer/ShadowDepth.3d.slang").vsEntry("vsMain").psEntry("psMain");
         sd.addTypeConformances(mpScene->getTypeConformances());
         mpShadowRasterPass = RasterPass::create(getDevice(), sd, mpScene->getSceneDefines());
-
-        logInfo("Creating depth prepass.");
-        ProgramDesc depthDesc;
-        depthDesc.addCompilerArguments({"-Wno-30081"});
-        depthDesc.addShaderModules(mpScene->getShaderModules());
-        depthDesc.addShaderLibrary("Samples/PBRTOfflineRenderer/DepthPrepass.3d.slang").vsEntry("vsMain").psEntry("psMain");
-        depthDesc.addTypeConformances(mpScene->getTypeConformances());
-        mpDepthPrepassPass = RasterPass::create(getDevice(), depthDesc, mpScene->getSceneDefines());
 
         Sampler::Desc shadowSamplerDesc;
         shadowSamplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point);
@@ -203,8 +301,7 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         mpFilamentIBL = FilamentIBL::create(getDevice());
         mpFilamentIBL->loadDefault();
 
-        logInfo("Initializing sun.");
-        initSunFromScene();
+        logInfo("Using IBL-only preview lighting by default.");
         logInfo("Scene load complete.");
     }
     catch (const std::exception& e)
@@ -303,58 +400,6 @@ void PBRTOfflineRenderer::syncFilamentCameraSettings()
     mFilamentSettings.cameraJitter = float2(pCam->getJitterX(), pCam->getJitterY());
 }
 
-void PBRTOfflineRenderer::updateInteractiveCamera()
-{
-    if (!mpScene || mSingleFrame) return;
-
-    auto pCam = mpScene->getCamera();
-    if (!pCam) return;
-    pCam->setIsAnimated(false);
-
-    const double now = getGlobalClock().getTime();
-    float dt = 1.f / 60.f;
-    if (mLastCameraUpdateTime > 0.0)
-        dt = std::clamp(float(now - mLastCameraUpdateTime), 0.0f, 0.1f);
-    mLastCameraUpdateTime = now;
-
-    float3 pos = pCam->getPosition();
-    float3 up = normalize(pCam->getUpVector());
-    float3 viewDir = normalize(pCam->getTarget() - pos);
-    float3 right = normalize(cross(viewDir, up));
-
-    if (any(mPendingMouseDelta != float2(0.f)))
-    {
-        const float2 delta = mPendingMouseDelta * 2.5f;
-        mPendingMouseDelta = float2(0.f);
-
-        float3x3 yaw = math::matrixFromQuat(math::quatFromAngleAxis(delta.x, up));
-        viewDir = normalize(mul(viewDir, yaw));
-        right = normalize(cross(viewDir, up));
-
-        float3x3 pitch = math::matrixFromQuat(math::quatFromAngleAxis(delta.y, right));
-        viewDir = normalize(mul(viewDir, pitch));
-        up = normalize(mul(up, pitch));
-    }
-
-    float3 movement(0.f);
-    if (mMoveForward) movement += viewDir;
-    if (mMoveBackward) movement -= viewDir;
-    if (mMoveRight) movement += right;
-    if (mMoveLeft) movement -= right;
-    if (mMoveUp) movement += up;
-    if (mMoveDown) movement -= up;
-
-    if (length(movement) > 0.f)
-    {
-        const float speed = mpScene->getSceneBounds().radius() * (mMoveFast ? 2.5f : 0.35f);
-        pos += normalize(movement) * speed * dt;
-    }
-
-    pCam->setPosition(pos);
-    pCam->setTarget(pos + viewDir);
-    pCam->setUpVector(up);
-}
-
 void PBRTOfflineRenderer::setAOShaderVars(const ShaderVar& var)
 {
     if (!var.isValid() || !mpFilamentPostProcess) return;
@@ -373,7 +418,7 @@ void PBRTOfflineRenderer::setAOShaderVars(const ShaderVar& var)
         var["gSSAOLinearSampler"] = mpFilamentPostProcess->getLinearSampler();
 
     if (var.findMember("AODataCB").isValid())
-        mpFilamentPostProcess->bindAOShaderVars(var, mFilamentSettings, mpDepthPrepass);
+        mpFilamentPostProcess->bindAOShaderVars(var, mFilamentSettings, mpIntermediateDepth);
 }
 
 void PBRTOfflineRenderer::setShadowShaderVars(const ShaderVar& var)
@@ -428,8 +473,6 @@ void PBRTOfflineRenderer::renderShadowMap(RenderContext* pCtx)
     }
 
     auto pCam = mpScene->getCamera();
-    const auto origView = pCam->getViewMatrix();
-    const auto origProj = pCam->getProjMatrix();
 
     const float3 lightDir = normalize(mFilamentSettings.sunDirection);
     const float3 camPos = pCam->getPosition();
@@ -518,8 +561,9 @@ void PBRTOfflineRenderer::renderShadowMap(RenderContext* pCtx)
         mpScene->rasterize(pCtx, mpShadowRasterPass->getState().get(), mpShadowRasterPass->getVars().get());
     }
 
-    pCam->setViewMatrix(origView);
-    pCam->setProjectionMatrix(origProj);
+    // setViewMatrix/setProjectionMatrix enable persistent mode; restore interactive camera control afterward.
+    pCam->togglePersistentViewMatrix(false);
+    pCam->togglePersistentProjectionMatrix(false);
     mpShadowRasterPass->getState()->setViewport(0, GraphicsState::Viewport(0.f, 0.f, float(mShadowMapSize), float(mShadowMapSize), 0.f, 1.f), true);
 
     if (useVsm && mpFilamentPostProcess && mpShadowMapMoments && mpShadowMapMomentsBlur)
@@ -536,11 +580,19 @@ void PBRTOfflineRenderer::renderShadowMap(RenderContext* pCtx)
 
 void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFbo)
 {
+    pCtx->clearFbo(pFbo.get(), kClear, 1.f, 0, FboAttachmentType::All);
+    if (!mSceneLoaded || !mpScene || !mpGBufferPass || !mpLightingPass)
+    {
+        if (mSingleFrame && mFrameCount == 0)
+        {
+            mFrameCount++;
+            shutdown();
+        }
+        return;
+    }
+
     if (mFrameCount == 0)
         logInfo("Rendering first frame.");
-
-    pCtx->clearFbo(pFbo.get(), kClear, 1.f, 0, FboAttachmentType::All);
-    if (!mSceneLoaded || !mpScene || !mpRasterPass) return;
 
     auto pTarget = pFbo->getColorTexture(0);
     const uint2 frameDim = uint2(pTarget->getWidth(), pTarget->getHeight());
@@ -562,7 +614,6 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     // --- Stage 0: Render shadow map ---
     if (mFilamentSettings.enableShadows && mpShadowRasterPass)
     {
-        logInfo("Frame stage: shadow map.");
         renderShadowMap(pCtx);
     }
 
@@ -578,71 +629,84 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
         mpIntermediateDepth = getDevice()->createTexture2D(
             frameDim.x, frameDim.y, ResourceFormat::D32Float, 1, 1, nullptr,
             ResourceBindFlags::DepthStencil | ResourceBindFlags::ShaderResource);
-        mpDepthPrepass = getDevice()->createTexture2D(
-            frameDim.x, frameDim.y, ResourceFormat::D32Float, 1, 1, nullptr,
-            ResourceBindFlags::DepthStencil | ResourceBindFlags::ShaderResource);
         mpPostProcessOutput = getDevice()->createTexture2D(
             frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
             ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+        mpGBufferBaseColor = getDevice()->createTexture2D(
+            frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
+            ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
+        mpGBufferNormalW = getDevice()->createTexture2D(
+            frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
+            ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
+        mpGBufferMaterial = getDevice()->createTexture2D(
+            frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
+            ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
+        mpGBufferEmissive = getDevice()->createTexture2D(
+            frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
+            ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
+        mpGBufferViewDirW = getDevice()->createTexture2D(
+            frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
+            ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
+        mpGBufferIDs = getDevice()->createTexture2D(
+            frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
+            ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
     }
 
-    updateInteractiveCamera();
-    syncFilamentCameraSettings();
     syncFilamentSunLight();
     mpScene->update(pCtx, getGlobalClock().getTime());
+    syncFilamentCameraSettings();
 
-    // Depth prepass -> SSAO (Filament: structure + SSAO before color pass)
-    if (mpDepthPrepassPass && mFilamentSettings.postProcessingEnabled && mFilamentSettings.enableSSAO && mFilamentSettings.forwardSSAO && mpFilamentPostProcess)
+    auto pGBufferFbo = Fbo::create(
+        getDevice(),
+        {mpGBufferBaseColor, mpGBufferNormalW, mpGBufferMaterial, mpGBufferEmissive, mpGBufferViewDirW, mpGBufferIDs},
+        mpIntermediateDepth
+    );
+    pCtx->clearFbo(pGBufferFbo.get(), float4(0.f, 0.f, 0.f, 0.f), 1.f, 1, FboAttachmentType::All);
+    mpGBufferPass->getState()->setFbo(pGBufferFbo);
+    mpGBufferPass->getState()->setViewport(0, fullViewport, true);
+    mpScene->rasterize(pCtx, mpGBufferPass->getState().get(), mpGBufferPass->getVars().get());
+
+    // GBuffer depth -> SSAO.
+    if (mFilamentSettings.postProcessingEnabled && mFilamentSettings.enableSSAO && mFilamentSettings.forwardSSAO && mpFilamentPostProcess)
     {
-        auto pDepthFbo = Fbo::create(getDevice(), {}, mpDepthPrepass);
-        pCtx->clearFbo(pDepthFbo.get(), float4(0.f, 0.f, 0.f, 0.f), 1.f, 1.f, FboAttachmentType::Depth);
-        mpDepthPrepassPass->getState()->setFbo(pDepthFbo);
-        mpDepthPrepassPass->getState()->setViewport(0, fullViewport, true);
-        logInfo("Frame stage: depth prepass.");
-        mpScene->rasterize(pCtx, mpDepthPrepassPass->getState().get(), mpDepthPrepassPass->getVars().get());
-        logInfo("Frame stage: prepass SSAO.");
-        mpFilamentPostProcess->executePrePassSSAO(pCtx, mpDepthPrepass, mFilamentSettings);
+        mpFilamentPostProcess->executePrePassSSAO(pCtx, mpIntermediateDepth, mFilamentSettings);
     }
 
-    auto pInterFbo = Fbo::create(getDevice(), {mpIntermediateTexture}, mpIntermediateDepth);
-    pCtx->clearFbo(pInterFbo.get(), kClear, 1.f, 1.f, FboAttachmentType::All);
+    auto pLightingFbo = Fbo::create(getDevice(), {mpIntermediateTexture});
+    pCtx->clearFbo(pLightingFbo.get(), kClear, 1.f, 1.f, FboAttachmentType::All);
     pCtx->clearTexture(mpVelocityTexture.get(), float4(0.f, 0.f, 0.f, 0.f));
 
     {
-        auto vars = mpRasterPass->getVars();
+        auto vars = mpLightingPass->getVars();
         if (vars)
         {
             auto root = vars->getRootVar();
-            setShadowShaderVars(root);
             setAOShaderVars(root);
             auto perFrameCB = root.findMember("PerFrameCB");
             if (perFrameCB.isValid())
             {
                 if (perFrameCB.findMember("gFrameDim").isValid())
                     perFrameCB["gFrameDim"] = frameDim;
-                if (perFrameCB.findMember("gSunIntensity").isValid())
-                    perFrameCB["gSunIntensity"] = mFilamentSettings.sunIntensity;
-                if (perFrameCB.findMember("gSunColor").isValid())
-                    perFrameCB["gSunColor"] = mFilamentSettings.sunColor;
-                if (perFrameCB.findMember("gSunDirection").isValid())
-                    perFrameCB["gSunDirection"] = normalize(mFilamentSettings.sunDirection);
-                if (perFrameCB.findMember("gAmbientIntensity").isValid())
-                    perFrameCB["gAmbientIntensity"] = 0.35f;
+                if (perFrameCB.findMember("gDebugView").isValid())
+                    perFrameCB["gDebugView"] = mDebugView;
             }
+            root["gBaseColor"] = mpGBufferBaseColor;
+            root["gNormalW"] = mpGBufferNormalW;
+            root["gMaterial"] = mpGBufferMaterial;
+            root["gEmissive"] = mpGBufferEmissive;
+            root["gViewDirW"] = mpGBufferViewDirW;
+            root["gDepth"] = mpIntermediateDepth;
+            root["gIDs"] = mpGBufferIDs;
+            if (mpFilamentIBL && root.findMember("FilamentIBLCB").isValid())
+                mpFilamentIBL->bindShaderVars(root, mFilamentSettings);
         }
     }
 
-    mpRasterPass->getState()->setFbo(pInterFbo);
-    mpRasterPass->getState()->setViewport(0, fullViewport, true);
-    if (mpFilamentIBL && mpRasterPass->getRootVar().findMember("FilamentIBLCB").isValid())
-        mpFilamentIBL->bindShaderVars(mpRasterPass->getRootVar(), mFilamentSettings);
-    logInfo("Frame stage: forward raster.");
-    mpScene->rasterize(pCtx, mpRasterPass->getState().get(), mpRasterPass->getVars().get());
+    mpLightingPass->execute(pCtx, pLightingFbo);
 
     // Sync FilamentSettings to FilamentPostProcess pass
     if (mpFilamentPostProcess && mFilamentSettings.postProcessingEnabled)
     {
-        logInfo("Frame stage: post process.");
         const ref<Texture> pMotionVec = (mFilamentSettings.antiAliasing == 2) ? mpVelocityTexture : nullptr;
         mpFilamentPostProcess->executeCustom(pCtx, mpIntermediateTexture, mpIntermediateDepth, mpPostProcessOutput, mFilamentSettings,
             mFilamentSettings.enableShadows ? mpShadowMapDepth : nullptr, pMotionVec,
@@ -696,6 +760,7 @@ void PBRTOfflineRenderer::buildTaskGraph()
                 mSaveTexture->captureToFile(0, 0, mSavePath, Bitmap::FileFormat::PngFile, Bitmap::ExportFlags::None, false);
             }
             catch (const std::exception&) {}
+            mSaveTexture = nullptr;
             mSavePending = false;
         }
     });
@@ -718,6 +783,15 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
             viewGroup.dropdown("Anti-aliasing", aaList, (uint32_t&)mFilamentSettings.antiAliasing);
             if (mFilamentSettings.antiAliasing == 2)
                 viewGroup.slider("TAA Feedback", mFilamentSettings.taaFeedback, 0.0f, 0.99f);
+            Gui::DropdownList debugViews = {
+                {0, "Shaded"},
+                {1, "Albedo"},
+                {2, "Normal"},
+                {3, "Material ID"},
+                {4, "Instance ID"},
+                {5, "AO"},
+            };
+            viewGroup.dropdown("Debug View", debugViews, mDebugView);
         }
 
         if (auto lightGroup = g.group("Light (Sun)")) {
@@ -775,7 +849,7 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                 if (auto ssaoGroup = ppGroup.group("SSAO (Ambient Occlusion)")) {
                     ssaoGroup.checkbox("Enable", mFilamentSettings.enableSSAO);
                     if (mFilamentSettings.enableSSAO) {
-                        ssaoGroup.slider("Radius", mFilamentSettings.ssaoRadius, 0.01f, 3.0f);
+                        ssaoGroup.slider("Radius", mFilamentSettings.ssaoRadius, 0.01f, 20.0f);
                         ssaoGroup.slider("Bias", mFilamentSettings.ssaoBias, 0.0f, 0.1f);
                         ssaoGroup.slider("Power", mFilamentSettings.ssaoPower, 0.1f, 5.0f);
                         ssaoGroup.slider("Intensity", mFilamentSettings.ssaoIntensity, 0.0f, 3.0f);
@@ -870,44 +944,31 @@ bool PBRTOfflineRenderer::onKeyEvent(const KeyboardEvent& e)
         if (mOutputPath.empty()) { mOutputPath = mScenePath; mOutputPath.replace_extension(".exr"); }
         saveOutput(getRenderContext()); return true;
     }
-    if (e.type == KeyboardEvent::Type::KeyPressed || e.type == KeyboardEvent::Type::KeyReleased)
-    {
-        const bool pressed = e.type == KeyboardEvent::Type::KeyPressed;
-        mMoveFast = e.hasModifier(Input::Modifier::Shift);
-        switch (e.key)
-        {
-        case Input::Key::W: mMoveForward = pressed; return true;
-        case Input::Key::S: mMoveBackward = pressed; return true;
-        case Input::Key::A: mMoveLeft = pressed; return true;
-        case Input::Key::D: mMoveRight = pressed; return true;
-        case Input::Key::Q: mMoveDown = pressed; return true;
-        case Input::Key::E: mMoveUp = pressed; return true;
-        default: break;
-        }
-    }
     return mpScene && mpScene->onKeyEvent(e);
 }
 
 bool PBRTOfflineRenderer::onMouseEvent(const MouseEvent& e)
 {
-    if (e.type == MouseEvent::Type::ButtonDown && e.button == Input::MouseButton::Left)
+    if (mpScene && mpScene->onMouseEvent(e))
+        return true;
+
+    if (mpScene && e.type == MouseEvent::Type::Wheel)
     {
-        mMouseLook = true;
-        mLastMousePos = e.pos;
+        auto pCam = mpScene->getCamera();
+        if (!pCam)
+            return false;
+
+        const float3 pos = pCam->getPosition();
+        const float3 viewDir = normalize(pCam->getTarget() - pos);
+        const float distance = std::max(0.1f, mpScene->getSceneBounds().radius() * 0.15f);
+        const float3 delta = viewDir * (e.wheelDelta.y * distance);
+        pCam->setPosition(pos + delta);
+        pCam->setTarget(pCam->getTarget() + delta);
+        pCam->setIsAnimated(false);
         return true;
     }
-    if (e.type == MouseEvent::Type::ButtonUp && e.button == Input::MouseButton::Left)
-    {
-        mMouseLook = false;
-        return true;
-    }
-    if (e.type == MouseEvent::Type::Move && mMouseLook)
-    {
-        mPendingMouseDelta += e.pos - mLastMousePos;
-        mLastMousePos = e.pos;
-        return true;
-    }
-    return mpScene && mpScene->onMouseEvent(e);
+
+    return false;
 }
 
 void PBRTOfflineRenderer::onDroppedFile(const std::filesystem::path& p)
@@ -922,6 +983,11 @@ struct PBRTOfflineRendererOptions
     std::filesystem::path outputPath;
     bool headless = false;
     bool singleFrame = false;
+    bool preview = false;
+    uint32_t debugView = 0;
+    uint32_t width = 1920;
+    uint32_t height = 840;
+    std::vector<uint32_t> inspectInstanceIDs;
 };
 
 static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
@@ -936,8 +1002,33 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
             options.outputPath = argv[++i];
         else if (a == "--headless")
             options.headless = true;
+        else if (a == "--preview")
+            options.preview = true;
         else if (a == "--single-frame")
             options.singleFrame = true;
+        else if (a == "--width" && i + 1 < argc)
+            options.width = uint32_t(std::max(1, std::atoi(argv[++i])));
+        else if (a == "--height" && i + 1 < argc)
+            options.height = uint32_t(std::max(1, std::atoi(argv[++i])));
+        else if (a == "--debug-view" && i + 1 < argc)
+        {
+            std::string value = argv[++i];
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            if (value == "albedo")
+                options.debugView = 1;
+            else if (value == "normal")
+                options.debugView = 2;
+            else if (value == "material")
+                options.debugView = 3;
+            else if (value == "instance")
+                options.debugView = 4;
+            else if (value == "ao")
+                options.debugView = 5;
+            else
+                options.debugView = uint32_t(std::max(0, std::atoi(value.c_str())));
+        }
+        else if (a == "--inspect-instance" && i + 1 < argc)
+            options.inspectInstanceIDs.push_back(uint32_t(std::max(0, std::atoi(argv[++i]))));
     }
     return options;
 }
@@ -946,7 +1037,7 @@ int runMain(int argc, char** argv)
 {
     const auto options = parseArgs(argc, argv);
     SampleAppConfig c;
-    c.windowDesc.title = "PBRT Renderer - Falcor"; c.windowDesc.resizableWindow = true; c.windowDesc.width = 1280; c.windowDesc.height = 720;
+    c.windowDesc.title = "PBRT Renderer - Falcor"; c.windowDesc.resizableWindow = true; c.windowDesc.width = options.width; c.windowDesc.height = options.height;
     c.headless = options.headless;
     c.showUI = !options.headless;
     PBRTOfflineRenderer app(c);
@@ -956,9 +1047,12 @@ int runMain(int argc, char** argv)
     {
         app.setHeadlessProbeMode(true);
     }
+    app.setPreviewMode(options.preview);
     app.setScenePath(options.scenePath);
     app.setOutputPath(options.outputPath);
     app.setSingleFrame(options.singleFrame || options.headless);
+    app.setDebugView(options.debugView);
+    app.setInspectInstanceIDs(options.inspectInstanceIDs);
     return app.run();
 }
 int main(int argc, char** argv) { return catchAndReportAllExceptions([&]() { return runMain(argc, argv); }); }

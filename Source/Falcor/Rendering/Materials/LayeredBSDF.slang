@@ -119,6 +119,7 @@ struct LayeredBSDF : IBSDF
 
     bool sampleTopOrBottom<S : ISampleGenerator>(bool sampleTop, float3 wi, out BSDFSample bs, inout S sg, BSDFContext bc)
     {
+        bs = BSDFSample();
         if (sampleTop)
         {
             return top.sample(wi, bs.wo, bs.pdf, bs.weight, bs.lobeType, sg, bc);

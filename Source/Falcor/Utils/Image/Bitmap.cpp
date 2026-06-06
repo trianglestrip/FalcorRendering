@@ -373,6 +373,22 @@ Bitmap::UniqueConstPtr Bitmap::createFromFile(const std::filesystem::path& path,
     // Identify resource format based on bit depth.
     ResourceFormat format = ResourceFormat::Unknown;
     uint32_t bpp = FreeImage_GetBPP(pDib);
+    if (bpp > 0 && bpp < 8)
+    {
+        auto pNew = FreeImage_ConvertTo32Bits(pDib);
+        FreeImage_Unload(pDib);
+        pDib = pNew;
+
+        if (pDib == nullptr)
+        {
+            genWarning("Failed to convert low bit-depth image to RGBA format", path);
+            return nullptr;
+        }
+
+        colorType = FreeImage_GetColorType(pDib);
+        bpp = FreeImage_GetBPP(pDib);
+    }
+
     switch (bpp)
     {
     case 128:

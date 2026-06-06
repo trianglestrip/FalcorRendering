@@ -51,7 +51,7 @@ bool FilamentIBL::loadDefault()
     // The generated DDS cubemap currently terminates the process inside Falcor's
     // DDS texture creation path on some devices. Keep the renderer usable and
     // preserve Filament's diffuse SH while the packed cubemap path is fixed.
-    logWarning("FilamentIBL: DDS IBL loading is disabled. Using procedural specular and analytic DFG fallback.");
+    logInfo("FilamentIBL: DDS IBL loading is disabled. Using procedural specular and analytic DFG fallback.");
     createPlaceholderSpecularCubemap();
     createFallbackDfgLut();
     mUsingPlaceholder = true;
@@ -329,9 +329,12 @@ void FilamentIBL::bindShaderVars(const ShaderVar& rootVar, const FilamentPostPro
     for (uint32_t i = 0; i < 9; ++i)
         cb["gIblSH"][i] = mSH[i];
 
-    rootVar["gIblSpecular"] = mpSpecularCubemap;
-    rootVar["gIblDFG"] = mpDfgLut;
-    rootVar["gIblLinearSampler"] = mpLinearSampler;
+    if (rootVar.findMember("gIblSpecular").isValid())
+        rootVar["gIblSpecular"] = mpSpecularCubemap;
+    if (rootVar.findMember("gIblDFG").isValid())
+        rootVar["gIblDFG"] = mpDfgLut;
+    if (rootVar.findMember("gIblLinearSampler").isValid())
+        rootVar["gIblLinearSampler"] = mpLinearSampler;
 }
 
 } // namespace Falcor

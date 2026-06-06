@@ -98,7 +98,10 @@ struct PBRTCoatedDiffuseMaterialInstance : MaterialInstanceBase, IMaterialInstan
 
         p.guideNormal = sf.N;
         p.roughness = interfaceD.getIsotropicRoughness();
+        p.diffuseReflectionAlbedo = diffuseAlbedo;
         p.specularReflectionAlbedo = float3(1.0f);
+        float f0 = (interfaceEta - 1.0f) / (interfaceEta + 1.0f);
+        p.specularReflectance = float3(f0 * f0);
 
         return p;
     }

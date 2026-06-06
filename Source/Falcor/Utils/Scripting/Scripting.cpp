@@ -71,7 +71,7 @@ void Scripting::start()
         catch (const std::exception& e)
         {
             // Non-fatal: Python scripting is optional for rendering
-            logWarning("Python scripting unavailable: {}", e.what());
+            logDebug("Python scripting unavailable: {}", e.what());
             sRunning = false;
         }
     }
