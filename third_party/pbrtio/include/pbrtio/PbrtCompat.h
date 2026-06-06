@@ -28,8 +28,6 @@ namespace pbrtio::pbrt {
 
 using Float = float;
 
-inline float4x4 identity4x4() { return float4x4(1.0f); }
-
 #define PBRTIO_ASSERT(x) assert(x)
 #define PBRTIO_UNREACHABLE() assert(false)
 #define PBRTIO_UNIMPLEMENTED() assert(false)

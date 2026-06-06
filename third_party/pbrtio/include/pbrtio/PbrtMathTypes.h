@@ -20,16 +20,4 @@ using glm::inverse;
 using glm::length;
 using glm::normalize;
 
-inline float3 min(float3 a, float3 b) {
-    return glm::min(a, b);
-}
-
-inline float3 max(float3 a, float3 b) {
-    return glm::max(a, b);
-}
-
-inline float3 xyz(const float4& v) {
-    return float3(v);
-}
-
 } // namespace pbrtio::pbrt

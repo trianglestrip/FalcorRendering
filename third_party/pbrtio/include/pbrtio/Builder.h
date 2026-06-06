@@ -33,11 +33,11 @@
 
 #pragma once
 #include <pbrtio/PbrtTypes.h>
-#include <pbrtio/PbrtFormat.h>
 #include <pbrtio/PbrtMath.h>
 #include <pbrtio/Parser.h>
 
 #include <filesystem>
+#include <format>
 #include <map>
 #include <set>
 #include <string>
@@ -90,7 +90,7 @@ struct TransformedSceneEntity : public SceneEntity
         return std::format("TransformedSceneEntity(name='{}', params={}, transform={})", name, params.toString(), to_string(transform));
     }
 
-    float4x4 transform = identity4x4();
+    float4x4 transform = float4x4(1.f);
 };
 
 struct CameraSceneEntity : public TransformedSceneEntity
@@ -224,7 +224,7 @@ struct InstanceSceneEntity
 
     std::string name;
     FileLoc loc;
-    float4x4 transform = identity4x4();
+    float4x4 transform = float4x4(1.f);
 };
 
 class BasicScene
@@ -330,7 +330,7 @@ struct TransformSet
     }
 
 private:
-    Transform t[kMaxTransforms] = {identity4x4(), identity4x4()};
+    Transform t[kMaxTransforms] = {float4x4(1.f), float4x4(1.f)};
 };
 
 class BasicSceneBuilder : public ParserTarget

@@ -90,8 +90,10 @@ struct DeferredBinding
 
 static std::vector<DeferredBinding>& getDeferredBindings()
 {
-    static std::vector<DeferredBinding> deferredBindings;
-    return deferredBindings;
+    // Deferred bindings may hold callables from plugin DLLs. Avoid running their
+    // destructors during process shutdown, when DLL unload order is undefined.
+    static auto* deferredBindings = new std::vector<DeferredBinding>();
+    return *deferredBindings;
 }
 
 static std::string getUniqueDeferredBindingName()

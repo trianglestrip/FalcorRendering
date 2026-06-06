@@ -33,8 +33,9 @@
 
 #include <pbrtio/Parameters.h>
 #include <pbrtio/Helpers.h>
-#include <pbrtio/PbrtFormat.h>
 #include <pbrtio/PbrtSpectrum.h>
+
+#include <format>
 
 namespace pbrtio::pbrt
 {

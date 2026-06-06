@@ -36,7 +36,6 @@
 #include <pbrtio/PbrtCompat.h>
 #include <pbrtio/PbrtTypes.h>
 #include <pbrtio/PbrtSpectrum.h>
-#include <pbrtio/PbrtFormat.h>
 #include <string>
 #include <string_view>
 #include <vector>

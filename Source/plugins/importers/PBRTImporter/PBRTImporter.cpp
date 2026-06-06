@@ -65,6 +65,7 @@
 #include <pbrtio/Builder.h>
 #include <pbrtio/Helpers.h>
 #include <pbrtio/LoopSubdivide.h>
+#include <pbrtio/Scene.h>
 
 #include "Core/Error.h"
 #include "Core/API/Device.h"
@@ -87,6 +88,8 @@
 #include "Scene/Curves/CurveTessellation.h"
 
 #include <pybind11/pybind11.h>
+
+#include <taskflow.hpp>
 
 #include <cmath>
 #include <limits>
@@ -245,13 +248,13 @@ struct Shape
 
 struct PlyMeshKey
 {
-    std::string path;
+    ::pbrtio::PbrtResourceIndex resourceIndex = ::pbrtio::kInvalidResourceIndex;
     const Falcor::Material* pMaterial = nullptr;
     bool reverseOrientation = false;
 
     bool operator==(const PlyMeshKey& other) const
     {
-        return path == other.path && pMaterial == other.pMaterial && reverseOrientation == other.reverseOrientation;
+        return resourceIndex == other.resourceIndex && pMaterial == other.pMaterial && reverseOrientation == other.reverseOrientation;
     }
 };
 
@@ -259,7 +262,7 @@ struct PlyMeshKeyHash
 {
     size_t operator()(const PlyMeshKey& key) const
     {
-        size_t h = std::hash<std::string>{}(key.path);
+        size_t h = std::hash<size_t>{}(key.resourceIndex);
         h ^= std::hash<const void*>{}(key.pMaterial) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<bool>{}(key.reverseOrientation) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
@@ -269,10 +272,27 @@ struct PlyMeshKeyHash
 struct PlyMeshJob
 {
     std::string filename;
-    std::filesystem::path path;
+    ::pbrtio::PbrtResourceIndex resourceIndex = ::pbrtio::kInvalidResourceIndex;
     Falcor::ref<Falcor::Material> pMaterial;
     bool reverseOrientation = false;
+    bool valid = false;
+    Falcor::SceneBuilder::ProcessedMesh mesh;
     Falcor::MeshID meshID;
+};
+
+struct PlyGeometryJob
+{
+    std::filesystem::path path;
+    Falcor::ref<Falcor::TriangleMesh> pTriangleMesh;
+    bool used = false;
+};
+
+struct TopLevelPlyMeshPlan
+{
+    std::vector<bool> usePlyResource;
+    std::vector<size_t> shapeToPlyJob;
+    std::vector<PlyGeometryJob> geometryJobs;
+    std::vector<PlyMeshJob> plyJobs;
 };
 
 /**
@@ -308,6 +328,7 @@ struct BuilderContext
 {
     BasicScene& scene;
     SceneBuilder& builder;
+    const ::pbrtio::PbrtLoadedScene& resources;
 
     std::map<std::string, FloatTexture> floatTextures;
     std::map<std::string, SpectrumTexture> spectrumTextures;
@@ -1946,6 +1967,166 @@ Falcor::SceneBuilder::ProcessedMesh processTriangleMesh(
     return builder.processMesh(mesh);
 }
 
+std::string normalizedResourceKey(const std::filesystem::path& path)
+{
+    return path.lexically_normal().string();
+}
+
+TopLevelPlyMeshPlan collectTopLevelPlyMeshes(BuilderContext& ctx)
+{
+    const auto& shapes = ctx.scene.getShapes();
+    TopLevelPlyMeshPlan plan;
+    plan.usePlyResource.resize(shapes.size(), false);
+    plan.shapeToPlyJob.resize(shapes.size(), std::numeric_limits<size_t>::max());
+
+    std::unordered_map<std::string, ::pbrtio::PbrtResourceIndex> meshResourceMap;
+    const auto meshResources = ctx.resources.getMeshResources();
+    plan.geometryJobs.resize(meshResources.size());
+    for (::pbrtio::PbrtResourceIndex i = 0; i < meshResources.size(); ++i)
+    {
+        plan.geometryJobs[i].path = meshResources[i].plyPath;
+        meshResourceMap.emplace(normalizedResourceKey(meshResources[i].plyPath), i);
+    }
+
+    std::unordered_map<PlyMeshKey, size_t, PlyMeshKeyHash> plyJobMap;
+
+    for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
+    {
+        const auto& entity = shapes[shapeIndex];
+        if (entity.name != "plymesh" || entity.lightIndex != -1)
+            continue;
+
+        warnUnsupportedParameters(entity.params, {"displacement", "displacement.edgelength"});
+        plan.usePlyResource[shapeIndex] = true;
+
+        auto filename = entity.params.getString("filename", "");
+        if (filename.empty())
+        {
+            logWarning(entity.loc, "Missing plymesh filename. Skipping.");
+            continue;
+        }
+
+        const auto path = ctx.resolver(filename);
+        const auto geometryIt = meshResourceMap.find(normalizedResourceKey(path));
+        if (geometryIt == meshResourceMap.end())
+        {
+            logWarning(entity.loc, "PLY resource '{}' was not collected by pbrtio. Skipping.", filename);
+            continue;
+        }
+
+        const ::pbrtio::PbrtResourceIndex resourceIndex = geometryIt->second;
+        plan.geometryJobs[resourceIndex].used = true;
+        auto pMaterial = ctx.getMaterial(entity.materialRef);
+        const bool reverseOrientation = entity.reverseOrientation;
+        PlyMeshKey key{resourceIndex, pMaterial.get(), reverseOrientation};
+        auto [it, inserted] = plyJobMap.emplace(key, plan.plyJobs.size());
+        const size_t jobIndex = it->second;
+        plan.shapeToPlyJob[shapeIndex] = jobIndex;
+
+        if (!inserted)
+            continue;
+
+        PlyMeshJob job;
+        job.filename = filename;
+        job.resourceIndex = resourceIndex;
+        job.pMaterial = pMaterial;
+        job.reverseOrientation = reverseOrientation;
+        plan.plyJobs.push_back(std::move(job));
+    }
+
+    return plan;
+}
+
+void executePlyMeshGraph(BuilderContext& ctx, TopLevelPlyMeshPlan& plan)
+{
+    if (plan.geometryJobs.empty())
+        return;
+
+    tf::Taskflow taskflow;
+    std::vector<tf::Task> geometryTasks(plan.geometryJobs.size());
+    for (size_t i = 0; i < plan.geometryJobs.size(); ++i)
+    {
+        if (!plan.geometryJobs[i].used)
+            continue;
+
+        geometryTasks[i] = taskflow.emplace([&, i]() {
+            auto& geometry = plan.geometryJobs[i];
+            auto pTriangleMesh = Falcor::TriangleMesh::createFromFile(geometry.path.string());
+            if (pTriangleMesh)
+                pTriangleMesh->setName(geometry.path.filename().string());
+            geometry.pTriangleMesh = pTriangleMesh;
+        });
+    }
+
+    for (size_t i = 0; i < plan.plyJobs.size(); ++i)
+    {
+        auto meshTask = taskflow.emplace([&, i]() {
+            auto& job = plan.plyJobs[i];
+            if (job.resourceIndex >= plan.geometryJobs.size())
+                return;
+
+            auto pTriangleMesh = plan.geometryJobs[job.resourceIndex].pTriangleMesh;
+            if (!pTriangleMesh)
+                return;
+
+            const bool frontFaceCW = job.reverseOrientation ? !pTriangleMesh->getFrontFaceCW() : pTriangleMesh->getFrontFaceCW();
+            job.mesh = processTriangleMesh(ctx.builder, pTriangleMesh, job.pMaterial, frontFaceCW);
+            job.valid = true;
+        });
+        geometryTasks[plan.plyJobs[i].resourceIndex].precede(meshTask);
+    }
+
+    tf::Executor executor;
+    executor.run(taskflow).wait();
+
+    for (auto& job : plan.plyJobs)
+    {
+        if (job.valid)
+            job.meshID = ctx.builder.addProcessedMesh(job.mesh);
+    }
+}
+
+bool instantiatePlannedPlyMesh(BuilderContext& ctx, const TopLevelPlyMeshPlan& plan, size_t shapeIndex)
+{
+    if (!plan.usePlyResource[shapeIndex])
+        return false;
+
+    const size_t jobIndex = plan.shapeToPlyJob[shapeIndex];
+    if (jobIndex == std::numeric_limits<size_t>::max())
+        return true;
+
+    const auto& job = plan.plyJobs[jobIndex];
+    if (job.meshID.isValid())
+    {
+        const auto& entity = ctx.scene.getShapes()[shapeIndex];
+        auto nodeID = ctx.builder.addNode({job.filename, toFalcor(entity.transform)});
+        ctx.builder.addMeshInstance(nodeID, job.meshID);
+    }
+    return true;
+}
+
+void createTopLevelShapes(BuilderContext& ctx)
+{
+    auto plan = collectTopLevelPlyMeshes(ctx);
+    executePlyMeshGraph(ctx, plan);
+
+    const auto& shapes = ctx.scene.getShapes();
+    for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
+    {
+        if (instantiatePlannedPlyMesh(ctx, plan, shapeIndex))
+            continue;
+
+        const auto& entity = shapes[shapeIndex];
+        auto shape = createShape(ctx, entity);
+        if (shape.pTriangleMesh)
+        {
+            auto nodeID = ctx.builder.addNode({entity.name, shape.transform});
+            auto meshID = ctx.builder.addTriangleMesh(shape.pTriangleMesh, shape.pMaterial);
+            ctx.builder.addMeshInstance(nodeID, meshID);
+        }
+    }
+}
+
 /**
  * Create curve geometry from a curve aggregate.
  * This can either result in mesh or curve geometry depending on the tesselation mode.
@@ -2136,101 +2317,7 @@ void buildScene(BuilderContext& ctx)
         }
     }
 
-    const auto& shapes = ctx.scene.getShapes();
-    std::vector<bool> usePlyResource(shapes.size(), false);
-    std::vector<size_t> shapeToPlyJob(shapes.size(), std::numeric_limits<size_t>::max());
-    std::vector<PlyMeshJob> plyJobs;
-    std::unordered_map<PlyMeshKey, size_t, PlyMeshKeyHash> plyJobMap;
-    std::unordered_map<std::string, Falcor::ref<Falcor::TriangleMesh>> plyGeometryCache;
-
-    for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
-    {
-        const auto& entity = shapes[shapeIndex];
-        if (entity.name != "plymesh" || entity.lightIndex != -1)
-            continue;
-
-        warnUnsupportedParameters(entity.params, {"displacement", "displacement.edgelength"});
-
-        auto filename = entity.params.getString("filename", "");
-        if (filename.empty())
-        {
-            logWarning(entity.loc, "Missing plymesh filename. Skipping.");
-            usePlyResource[shapeIndex] = true;
-            continue;
-        }
-
-        const auto path = ctx.resolver(filename);
-        auto pMaterial = ctx.getMaterial(entity.materialRef);
-        const bool reverseOrientation = entity.reverseOrientation;
-        usePlyResource[shapeIndex] = true;
-
-        PlyMeshKey key{path.lexically_normal().string(), pMaterial.get(), reverseOrientation};
-        auto [it, inserted] = plyJobMap.emplace(key, plyJobs.size());
-        const size_t jobIndex = it->second;
-        shapeToPlyJob[shapeIndex] = jobIndex;
-
-        if (!inserted)
-            continue;
-
-        PlyMeshJob job;
-        job.filename = filename;
-        job.path = path;
-        job.pMaterial = pMaterial;
-        job.reverseOrientation = reverseOrientation;
-        plyJobs.push_back(std::move(job));
-    }
-
-    if (!plyJobs.empty())
-    {
-        for (auto& job : plyJobs)
-        {
-            const std::string pathKey = job.path.lexically_normal().string();
-            auto geometryIt = plyGeometryCache.find(pathKey);
-            if (geometryIt == plyGeometryCache.end())
-            {
-                auto pTriangleMesh = Falcor::TriangleMesh::createFromFile(job.path.string());
-                if (pTriangleMesh)
-                    pTriangleMesh->setName(job.filename);
-                geometryIt = plyGeometryCache.emplace(pathKey, pTriangleMesh).first;
-            }
-
-            auto pTriangleMesh = geometryIt->second;
-            if (!pTriangleMesh)
-                continue;
-
-            const bool frontFaceCW = job.reverseOrientation ? !pTriangleMesh->getFrontFaceCW() : pTriangleMesh->getFrontFaceCW();
-            auto processedMesh = processTriangleMesh(ctx.builder, pTriangleMesh, job.pMaterial, frontFaceCW);
-            job.meshID = ctx.builder.addProcessedMesh(processedMesh);
-        }
-    }
-
-    // Process shapes and create meshes.
-    for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
-    {
-        const auto& entity = shapes[shapeIndex];
-        if (usePlyResource[shapeIndex])
-        {
-            const size_t jobIndex = shapeToPlyJob[shapeIndex];
-            if (jobIndex != std::numeric_limits<size_t>::max())
-            {
-                const auto& job = plyJobs[jobIndex];
-                if (job.meshID.isValid())
-                {
-                    auto nodeID = ctx.builder.addNode({job.filename, toFalcor(entity.transform)});
-                    ctx.builder.addMeshInstance(nodeID, job.meshID);
-                }
-            }
-            continue;
-        }
-
-        auto shape = createShape(ctx, entity);
-        if (shape.pTriangleMesh)
-        {
-            auto nodeID = ctx.builder.addNode({entity.name, shape.transform});
-            auto meshID = ctx.builder.addTriangleMesh(shape.pTriangleMesh, shape.pMaterial);
-            ctx.builder.addMeshInstance(nodeID, meshID);
-        }
-    }
+    createTopLevelShapes(ctx);
 
     // Create curves from curve aggregates assembled during the processing step above.
     for (const auto& [_, curveAggregate] : ctx.curveAggregates)
@@ -2313,7 +2400,10 @@ void PBRTImporter::importScene(
         pbrt::parseFile(pbrtBuilder, path);
         timeReport.measure("Parsing pbrt scene");
 
-        pbrt::BuilderContext ctx{pbrtScene, builder};
+        ::pbrtio::PbrtLoadedScene pbrtResources;
+        ::pbrtio::collectPbrtScene(pbrtScene, pbrtResources);
+
+        pbrt::BuilderContext ctx{pbrtScene, builder, pbrtResources};
         ctx.usePBRTMaterials = builder.getSettings().getOption("PBRTImporter:usePBRTMaterials", false);
         ctx.rotateImageTextures90 = builder.getSettings().getOption("PBRTImporter:rotateImageTextures90", false);
         ctx.flipTextureV = builder.getSettings().getOption("PBRTImporter:flipTextureV", true);

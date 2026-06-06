@@ -33,8 +33,9 @@
 
 #include <pbrtio/Builder.h>
 #include <pbrtio/Helpers.h>
-#include <pbrtio/PbrtFormat.h>
 #include <pbrtio/PbrtMath.h>
+
+#include <format>
 
 namespace pbrtio::pbrt
 {
@@ -236,7 +237,7 @@ void BasicSceneBuilder::onColorSpace(const std::string& name, FileLoc loc)
 
 void BasicSceneBuilder::onIdentity(FileLoc loc)
 {
-    mGraphicsState.forActiveTransforms([](auto t) { return identity4x4(); });
+    mGraphicsState.forActiveTransforms([](auto t) { return float4x4(1.f); });
 }
 
 void BasicSceneBuilder::onTranslate(Float dx, Float dy, Float dz, FileLoc loc)
@@ -344,7 +345,7 @@ void BasicSceneBuilder::onWorldBegin(FileLoc loc)
     // Reset graphics state.
     for (uint32_t i = 0; i < kMaxTransforms; ++i)
     {
-        mGraphicsState.ctm[i] = identity4x4();
+        mGraphicsState.ctm[i] = float4x4(1.f);
     }
     mGraphicsState.activeTransformBits = kAllTransformsBits;
     mNamedCoordinateSystems["world"] = mGraphicsState.ctm;

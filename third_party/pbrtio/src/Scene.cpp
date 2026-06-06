@@ -1,8 +1,8 @@
 /*
- * PBRT scene collector.
+ * PBRT scene data extraction and resource indexing.
  */
 
-#include <pbrtio/PbrtSceneLoader.h>
+#include <pbrtio/Scene.h>
 
 #include <pbrtio/Builder.h>
 #include <pbrtio/Parser.h>
@@ -25,11 +25,11 @@ static mat4f pbrtWorldTransform(const mat4f& pbrtTransform) {
 }
 
 static float3 transformPoint(const mat4f& m, const float3& p) {
-    return xyz(m * float4(p, 1.f));
+    return float3(m * float4(p, 1.f));
 }
 
 static float3 transformVector(const mat4f& m, const float3& v) {
-    return xyz(m * float4(v, 0.f));
+    return float3(m * float4(v, 0.f));
 }
 
 static void extractCamera(const BasicScene& scene, float sceneRadius, PbrtCameraSettings& camera) {
@@ -281,31 +281,60 @@ static void addShape(const BasicScene& scene, const ShapeSceneEntity& shape,
     meshes.push_back(std::move(inst));
 }
 
-static void buildMeshResources(PbrtLoadedScene& scene) {
+static std::string resourceKey(const std::filesystem::path& path) {
+    return path.lexically_normal().string();
+}
+
+static std::string imageResourceKey(const std::filesystem::path& path, bool sRGB) {
+    return resourceKey(path) + (sRGB ? "|srgb" : "|linear");
+}
+
+static size_t addImageResource(PbrtLoadedScene& scene,
+        std::unordered_map<std::string, size_t>& imageMap,
+        const std::filesystem::path& path, bool sRGB) {
+    if (path.empty()) {
+        return kInvalidResourceIndex;
+    }
+
+    const std::string key = imageResourceKey(path, sRGB);
+    auto [it, inserted] = imageMap.emplace(key, scene.imageResources.size());
+    if (inserted) {
+        PbrtImageResource resource;
+        resource.path = path;
+        resource.sRGB = sRGB;
+        scene.imageResources.push_back(std::move(resource));
+    }
+    return it->second;
+}
+
+static void buildResourceReferences(PbrtLoadedScene& scene) {
     scene.meshResources.clear();
-    std::unordered_map<std::string, size_t> resourceMap;
+    scene.imageResources.clear();
+
+    std::unordered_map<std::string, size_t> meshMap;
+    std::unordered_map<std::string, size_t> imageMap;
 
     for (auto& mesh : scene.meshes) {
-        const std::string key = mesh.plyPath.lexically_normal().string();
-        auto [it, inserted] = resourceMap.emplace(key, scene.meshResources.size());
+        const std::string meshKey = resourceKey(mesh.plyPath);
+        auto [it, inserted] = meshMap.emplace(meshKey, scene.meshResources.size());
         if (inserted) {
             PbrtMeshResource resource;
             resource.plyPath = mesh.plyPath;
             scene.meshResources.push_back(std::move(resource));
         }
         mesh.meshResourceIndex = it->second;
+
+        mesh.baseColorTextureResourceIndex = addImageResource(scene, imageMap,
+                mesh.baseColorTexturePath, mesh.baseColorTextureSRGB);
+    }
+
+    if (scene.environment.valid) {
+        scene.environment.imageResourceIndex = addImageResource(scene, imageMap,
+                scene.environment.mapPath, false);
     }
 }
 
-bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out) {
-    if (!std::filesystem::exists(pbrtPath)) {
-        return false;
-    }
-
-    BasicScene scene(pbrtPath.parent_path());
-    BasicSceneBuilder builder(scene);
-    parseFile(builder, pbrtPath);
-
+void collectPbrtScene(const BasicScene& scene, PbrtLoadedScene& out) {
     out.searchPath = scene.resolvePath(".");
     out.meshes.clear();
 
@@ -325,18 +354,17 @@ bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out) 
         }
     }
 
-    buildMeshResources(out);
-
     std::vector<ShapeSceneEntity> allShapes;
     collectAllShapes(scene, allShapes);
     collectLights(scene, allShapes, out);
+    buildResourceReferences(out);
 
     float3 bmin(1e30f), bmax(-1e30f);
     for (const auto& mesh : out.meshes) {
         const float4 t = mesh.transform[3];
         const float3 p(t.x, t.y, t.z);
-        bmin = min(bmin, p);
-        bmax = max(bmax, p);
+        bmin = glm::min(bmin, p);
+        bmax = glm::max(bmax, p);
     }
     if (out.meshes.empty()) {
         out.sceneCenter = float3(0.f);
@@ -356,7 +384,18 @@ bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out) 
         out.camera.target = out.sceneCenter;
         out.camera.up = float3(0.f, 1.f, 0.f);
     }
+}
 
+bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out) {
+    if (!std::filesystem::exists(pbrtPath)) {
+        return false;
+    }
+
+    BasicScene scene(pbrtPath.parent_path());
+    BasicSceneBuilder builder(scene);
+    parseFile(builder, pbrtPath);
+
+    collectPbrtScene(scene, out);
     return !out.meshes.empty();
 }
 

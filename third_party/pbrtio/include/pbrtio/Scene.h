@@ -1,6 +1,5 @@
 /*
- * Load a parsed PBRT scene into renderer-neutral scene resources.
- * PBRT v4 parser and renderer-neutral scene resource loader.
+ * Parse PBRT v4 into renderer-neutral scene data and resource reference tables.
  */
 #pragma once
 
@@ -9,15 +8,23 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
+#include <span>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace pbrtio {
 
+namespace pbrt {
+class BasicScene;
+}
+
+using PbrtResourceIndex = size_t;
+inline constexpr PbrtResourceIndex kInvalidResourceIndex = std::numeric_limits<PbrtResourceIndex>::max();
+
 struct PbrtMeshInstance {
     std::filesystem::path plyPath;
-    size_t meshResourceIndex = SIZE_MAX;
+    PbrtResourceIndex meshResourceIndex = kInvalidResourceIndex;
     pbrt::mat4f transform;
     pbrt::float3 baseColor{ 0.75f, 0.75f, 0.75f };
     float roughness = 0.45f;
@@ -25,17 +32,19 @@ struct PbrtMeshInstance {
     std::string materialName;
     /** Resolved imagemap path for spectrum reflectance textures (empty = solid color only). */
     std::filesystem::path baseColorTexturePath;
+    PbrtResourceIndex baseColorTextureResourceIndex = kInvalidResourceIndex;
     bool baseColorTextureSRGB = true;
     /** PBRT UVMapping as (uscale, vscale, udelta, vdelta). Image textures flip v at sample time. */
     pbrt::float4 baseColorUvTransform{ 1.f, 1.f, 0.f, 0.f };
-    /** Set by parallel mesh verification during loadPbrtSceneResources. */
-    bool plyFileExists = true;
 };
 
 struct PbrtMeshResource {
     std::filesystem::path plyPath;
-    /** Set by parallel mesh verification during loadPbrtSceneResources. */
-    bool plyFileExists = true;
+};
+
+struct PbrtImageResource {
+    std::filesystem::path path;
+    bool sRGB = true;
 };
 
 enum class PbrtLightType {
@@ -72,6 +81,7 @@ using PbrtAreaLightMesh = PbrtRectAreaLight;
 /** PBRT Light "infinite" environment map (equirectangular HDR/EXR/etc.). */
 struct PbrtEnvironmentLight {
     std::filesystem::path mapPath;
+    PbrtResourceIndex imageResourceIndex = kInvalidResourceIndex;
     float scale = 1.f;
     bool valid = false;
 };
@@ -89,6 +99,7 @@ struct PbrtCameraSettings {
 struct PbrtLoadedScene {
     std::filesystem::path searchPath;
     std::vector<PbrtMeshResource> meshResources;
+    std::vector<PbrtImageResource> imageResources;
     std::vector<PbrtMeshInstance> meshes;
     std::vector<PbrtLightInstance> lights;
     std::vector<PbrtRectAreaLight> areaLights;
@@ -96,54 +107,24 @@ struct PbrtLoadedScene {
     PbrtCameraSettings camera;
     pbrt::float3 sceneCenter{ 0.f };
     float sceneRadius = 1.f;
+
+    const PbrtMeshResource* getMeshResource(PbrtResourceIndex index) const {
+        return index < meshResources.size() ? &meshResources[index] : nullptr;
+    }
+
+    const PbrtImageResource* getImageResource(PbrtResourceIndex index) const {
+        return index < imageResources.size() ? &imageResources[index] : nullptr;
+    }
+
+    std::span<const PbrtMeshResource> getMeshResources() const { return meshResources; }
+    std::span<const PbrtImageResource> getImageResources() const { return imageResources; }
+    std::span<const PbrtMeshInstance> getMeshes() const { return meshes; }
 };
 
-/** Decoded RGBA pixels; buffer owned by PbrtDecodedImage. */
-struct PbrtDecodedImage {
-    uint8_t* pixels = nullptr;
-    size_t byteSize = 0;
-    int width = 0;
-    int height = 0;
-    bool sRGB = true;
-    bool valid = false;
-
-    PbrtDecodedImage() = default;
-    PbrtDecodedImage(PbrtDecodedImage&& other) noexcept;
-    PbrtDecodedImage& operator=(PbrtDecodedImage&& other) noexcept;
-    ~PbrtDecodedImage();
-
-    PbrtDecodedImage(const PbrtDecodedImage&) = delete;
-    PbrtDecodedImage& operator=(const PbrtDecodedImage&) = delete;
-};
-
-struct PbrtDecodedTextures {
-    std::unordered_map<std::string, PbrtDecodedImage> decoded;
-};
-
-struct PbrtLoadTimings {
-    double parseMs = 0;
-    double collectMs = 0;
-    double decodeTexturesMs = 0;
-    double verifyMeshesMs = 0;
-    double uploadTexturesMs = 0;
-    double totalMs = 0;
-};
-
-struct PbrtSceneResources {
-    PbrtLoadedScene scene;
-    PbrtDecodedTextures textures;
-    PbrtLoadTimings timings;
-};
+/** Collect renderer-neutral scene/resource references from an already parsed PBRT scene. */
+void collectPbrtScene(const pbrt::BasicScene& scene, PbrtLoadedScene& out);
 
 /** Parse PBRT file into scene description (meshes, lights, camera). */
 bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out);
-
-/**
- * Full CPU load pipeline: parse, taskflow-parallel texture decode, and mesh verification.
- */
-bool loadPbrtSceneResources(const std::filesystem::path& pbrtPath,
-        PbrtSceneResources& out, bool loadEnvironmentTexture = true);
-
-void printPbrtLoadTimings(const PbrtLoadTimings& timings);
 
 } // namespace pbrtio
