@@ -73,6 +73,7 @@
 #include "Utils/Timing/TimeReport.h"
 #include "Utils/Math/FalcorMath.h"
 #include "Utils/Math/FNVHash.h"
+#include "Utils/Math/MathHelpers.h"
 #include "Scene/Importer.h"
 #include "Scene/Material/Material.h"
 #include "Scene/Material/StandardMaterial.h"
@@ -91,6 +92,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <cmath>
 #include <limits>
 #include <thread>
@@ -250,13 +252,12 @@ struct Shape
 
 struct PlyMeshKey
 {
-    ::pbrtio::PbrtResourceIndex resourceIndex = ::pbrtio::kInvalidResourceIndex;
+    size_t processJobIndex = 0;
     const Falcor::Material* pMaterial = nullptr;
-    bool reverseOrientation = false;
 
     bool operator==(const PlyMeshKey& other) const
     {
-        return resourceIndex == other.resourceIndex && pMaterial == other.pMaterial && reverseOrientation == other.reverseOrientation;
+        return processJobIndex == other.processJobIndex && pMaterial == other.pMaterial;
     }
 };
 
@@ -264,21 +265,51 @@ struct PlyMeshKeyHash
 {
     size_t operator()(const PlyMeshKey& key) const
     {
-        size_t h = std::hash<size_t>{}(key.resourceIndex);
+        size_t h = std::hash<size_t>{}(key.processJobIndex);
         h ^= std::hash<const void*>{}(key.pMaterial) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<bool>{}(key.reverseOrientation) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
 
-struct PlyMeshJob
+struct PlyProcessKey
 {
-    std::string filename;
+    ::pbrtio::PbrtResourceIndex resourceIndex = ::pbrtio::kInvalidResourceIndex;
+    bool reverseOrientation = false;
+    float4x4 textureTransform = float4x4::identity();
+
+    bool operator==(const PlyProcessKey& other) const
+    {
+        return resourceIndex == other.resourceIndex &&
+               reverseOrientation == other.reverseOrientation &&
+               std::memcmp(&textureTransform, &other.textureTransform, sizeof(textureTransform)) == 0;
+    }
+};
+
+struct PlyProcessKeyHash
+{
+    size_t operator()(const PlyProcessKey& key) const
+    {
+        size_t h = std::hash<size_t>{}(key.resourceIndex);
+        h ^= std::hash<bool>{}(key.reverseOrientation) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= fnvHashArray64(&key.textureTransform, sizeof(key.textureTransform)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct PlyProcessJob
+{
     ::pbrtio::PbrtResourceIndex resourceIndex = ::pbrtio::kInvalidResourceIndex;
     Falcor::ref<Falcor::Material> pMaterial;
     bool reverseOrientation = false;
     bool valid = false;
     Falcor::SceneBuilder::ProcessedMesh mesh;
+};
+
+struct PlyMeshJob
+{
+    std::string filename;
+    size_t processJobIndex = 0;
+    Falcor::ref<Falcor::Material> pMaterial;
     Falcor::MeshID meshID;
 };
 
@@ -294,6 +325,7 @@ struct PlyMeshPlan
 {
     std::unordered_map<const ShapeSceneEntity*, size_t> shapeToPlyJob;
     std::vector<PlyGeometryJob> geometryJobs;
+    std::vector<PlyProcessJob> processJobs;
     std::vector<PlyMeshJob> plyJobs;
 };
 
@@ -353,6 +385,7 @@ struct BuilderContext
     bool flipTextureV = true;
     uint32_t plyIOConcurrency = 0;
     bool logPlyTiming = true;
+    bool fastPlyTangents = true;
     uint32_t nonConstantRoughnessFallbackCount = 0;
     uint32_t anisotropicRoughnessFallbackCount = 0;
 
@@ -1787,6 +1820,7 @@ Falcor::SceneBuilder::ProcessedMesh processPbrtMeshView(
     const SceneBuilder& builder,
     const std::string& name,
     ::pbrtio::PbrtMeshView view,
+    std::span<const float4> tangents,
     const Falcor::ref<Falcor::Material>& pMaterial,
     bool frontFaceCW
 )
@@ -1814,6 +1848,11 @@ Falcor::SceneBuilder::ProcessedMesh processPbrtMeshView(
         mesh.normals = {reinterpret_cast<const float3*>(view.normals.data()), SceneBuilder::Mesh::AttributeFrequency::Vertex};
     if (view.texcoords.size() == view.positions.size())
         mesh.texCrds = {reinterpret_cast<const float2*>(view.texcoords.data()), SceneBuilder::Mesh::AttributeFrequency::Vertex};
+    if (tangents.size() == view.positions.size())
+    {
+        mesh.tangents = {tangents.data(), SceneBuilder::Mesh::AttributeFrequency::Vertex};
+        mesh.useOriginalTangentSpace = true;
+    }
 
     return builder.processMesh(mesh);
 }
@@ -1837,6 +1876,7 @@ PlyMeshPlan collectPlyMeshes(BuilderContext& ctx)
         meshResourceMap.emplace(normalizedResourceKey(meshResources[i].plyPath), i);
     }
 
+    std::unordered_map<PlyProcessKey, size_t, PlyProcessKeyHash> processJobMap;
     std::unordered_map<PlyMeshKey, size_t, PlyMeshKeyHash> plyJobMap;
 
     auto addShape = [&](const ShapeSceneEntity& entity)
@@ -1865,19 +1905,31 @@ PlyMeshPlan collectPlyMeshes(BuilderContext& ctx)
         plan.geometryJobs[resourceIndex].used = true;
         auto pMaterial = ctx.getMaterial(entity.materialRef);
         const bool reverseOrientation = entity.reverseOrientation;
-        PlyMeshKey key{resourceIndex, pMaterial.get(), reverseOrientation};
+        PlyProcessKey processKey{resourceIndex, reverseOrientation, pMaterial->getTextureTransform().getMatrix()};
+        auto [processIt, processInserted] = processJobMap.emplace(processKey, plan.processJobs.size());
+        const size_t processJobIndex = processIt->second;
+
+        if (processInserted)
+        {
+            PlyProcessJob processJob;
+            processJob.resourceIndex = resourceIndex;
+            processJob.pMaterial = pMaterial;
+            processJob.reverseOrientation = reverseOrientation;
+            plan.processJobs.push_back(std::move(processJob));
+        }
+
+        PlyMeshKey key{processJobIndex, pMaterial.get()};
         auto [it, inserted] = plyJobMap.emplace(key, plan.plyJobs.size());
-        const size_t jobIndex = it->second;
-        plan.shapeToPlyJob.emplace(&entity, jobIndex);
+        const size_t meshJobIndex = it->second;
+        plan.shapeToPlyJob.emplace(&entity, meshJobIndex);
 
         if (!inserted)
             return;
 
         PlyMeshJob job;
         job.filename = filename;
-        job.resourceIndex = resourceIndex;
+        job.processJobIndex = processJobIndex;
         job.pMaterial = pMaterial;
-        job.reverseOrientation = reverseOrientation;
         plan.plyJobs.push_back(std::move(job));
     };
 
@@ -1946,21 +1998,34 @@ void executePlyMeshPlan(BuilderContext& ctx, PlyMeshPlan& plan)
         geometryTasks[i].acquire(ioSemaphore).release(ioSemaphore);
     }
 
-    for (size_t i = 0; i < plan.plyJobs.size(); ++i)
+    std::vector<tf::Task> processTasks(plan.processJobs.size());
+    for (size_t i = 0; i < plan.processJobs.size(); ++i)
     {
         auto meshTask = taskflow.emplace([&, i]() {
             const auto start = std::chrono::steady_clock::now();
-            auto& job = plan.plyJobs[i];
+            auto& job = plan.processJobs[i];
             if (job.resourceIndex >= plan.geometryJobs.size()) return;
             const auto& geometry = plan.geometryJobs[job.resourceIndex];
             if (!geometry.valid || !geometry.pResource || !geometry.pResource->mesh.loaded) return;
             const bool frontFaceCW = job.reverseOrientation;
-            job.mesh = processPbrtMeshView(ctx.builder, geometry.pResource->mesh.name, geometry.pResource->mesh.view(), job.pMaterial, frontFaceCW);
+            std::vector<float4> fastTangents;
+            const auto meshView = geometry.pResource->mesh.view();
+            if (ctx.fastPlyTangents && meshView.normals.size() == meshView.positions.size())
+            {
+                fastTangents.resize(meshView.normals.size());
+                for (size_t normalIndex = 0; normalIndex < meshView.normals.size(); ++normalIndex)
+                {
+                    const auto& normal = meshView.normals[normalIndex];
+                    fastTangents[normalIndex] = float4(perp_stark(float3(normal.x, normal.y, normal.z)), 1.f);
+                }
+            }
+            job.mesh = processPbrtMeshView(ctx.builder, geometry.pResource->mesh.name, meshView, fastTangents, job.pMaterial, frontFaceCW);
             job.valid = true;
             processMicros.fetch_add(elapsedMicros(start), std::memory_order_relaxed);
             processedMeshes.fetch_add(1, std::memory_order_relaxed);
         });
-        geometryTasks[plan.plyJobs[i].resourceIndex].precede(meshTask);
+        processTasks[i] = meshTask;
+        geometryTasks[plan.processJobs[i].resourceIndex].precede(meshTask);
     }
 
     tf::Executor executor(hardwareThreads);
@@ -1970,9 +2035,11 @@ void executePlyMeshPlan(BuilderContext& ctx, PlyMeshPlan& plan)
     uint32_t addedMeshes = 0;
     for (auto& job : plan.plyJobs)
     {
-        if (job.valid)
+        if (job.processJobIndex < plan.processJobs.size() && plan.processJobs[job.processJobIndex].valid)
         {
-            job.meshID = ctx.builder.addProcessedMesh(job.mesh);
+            auto mesh = plan.processJobs[job.processJobIndex].mesh;
+            mesh.pMaterial = job.pMaterial;
+            job.meshID = ctx.builder.addProcessedMesh(mesh);
             addedMeshes++;
         }
     }
@@ -1981,8 +2048,9 @@ void executePlyMeshPlan(BuilderContext& ctx, PlyMeshPlan& plan)
     if (ctx.logPlyTiming)
     {
         logInfo(
-            "PBRTImporter: PLY DAG resources={} jobs={} ioConcurrency={} loaded={} failed={} processed={} added={} loadSum={:.3f}ms processSum={:.3f}ms add={:.3f}ms",
+            "PBRTImporter: PLY DAG resources={} processJobs={} meshJobs={} ioConcurrency={} loaded={} failed={} processed={} added={} loadSum={:.3f}ms processSum={:.3f}ms add={:.3f}ms",
             usedResources,
+            plan.processJobs.size(),
             plan.plyJobs.size(),
             ioConcurrency,
             loadedResources.load(std::memory_order_relaxed),
@@ -2325,6 +2393,7 @@ void PBRTImporter::importScene(
         ctx.flipTextureV = builder.getSettings().getOption("PBRTImporter:flipTextureV", true);
         ctx.plyIOConcurrency = builder.getSettings().getOption("PBRTImporter:plyIOConcurrency", 0);
         ctx.logPlyTiming = builder.getSettings().getOption("PBRTImporter:logPlyTiming", true);
+        ctx.fastPlyTangents = builder.getSettings().getOption("PBRTImporter:fastPlyTangents", true);
         pbrt::buildScene(ctx);
         timeReport.measure("Building pbrt scene");
         timeReport.printToLog();
