@@ -32,6 +32,16 @@ public:
     void setOutputPath(const std::filesystem::path& p) { mOutputPath = p; }
     void setSingleFrame(bool enabled) { mSingleFrame = enabled; }
     void setDebugView(uint32_t view) { mDebugView = view; }
+    void setEnableShadows(bool enabled)
+    {
+        mFilamentSettings.enableShadows = enabled;
+        if (enabled)
+        {
+            mFilamentSettings.enableSunlight = true;
+            if (mFilamentSettings.sunIntensity <= 0.f) mFilamentSettings.sunIntensity = 30000.f;
+        }
+    }
+    void setEnableSSAO(bool enabled) { mFilamentSettings.enableSSAO = enabled; }
     void setInspectInstanceIDs(std::vector<uint32_t> ids) { mInspectInstanceIDs = std::move(ids); }
     void setHeadlessProbeMode(bool enabled);
     void setPreviewMode(bool enabled);
@@ -48,7 +58,7 @@ private:
     void syncFilamentSunLight();
     void initSunFromScene();
 
-    std::filesystem::path mScenePath, mOutputPath;
+    std::filesystem::path mScenePath, mLoadedScenePath, mOutputPath;
     ref<Scene> mpScene;
     ref<RasterPass> mpGBufferPass;
     ref<FullScreenPass> mpLightingPass;

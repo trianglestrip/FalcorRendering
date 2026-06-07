@@ -51,7 +51,11 @@ namespace
     AOQualityParams getAOQualityParams(const FilamentPostProcess::FilamentSettings& settings)
     {
         AOQualityParams params;
-        const int sampleCount = std::clamp(settings.ssaoSampleCount, 4, 64);
+        const int quality = std::clamp(settings.ssaoQuality, 0, 3);
+        const int sampleCount = (quality == 0) ? 7 :
+            (quality == 1) ? 11 :
+            (quality == 2) ? 16 :
+            std::clamp(settings.ssaoSampleCount, 32, 64);
 
         if (sampleCount <= 7)
         {
@@ -78,9 +82,10 @@ namespace
             params.standardDeviation = 4.0f;
         }
 
-        params.kernelSize = 11;
-        params.standardDeviation *= 0.5f;
-        params.blurScale = 2.0f;
+        const int lowPass = std::clamp(settings.ssaoLowPassFilter, 0, 2);
+        params.kernelSize = (lowPass == 0) ? 5u : (lowPass == 1) ? 9u : 11u;
+        params.standardDeviation *= (lowPass == 0) ? 0.35f : (lowPass == 1) ? 0.65f : 1.0f;
+        params.blurScale = (lowPass == 0) ? 1.0f : (lowPass == 1) ? 2.0f : 3.0f;
         return params;
     }
 
@@ -483,6 +488,8 @@ void FilamentPostProcess::bindAOShaderVars(const ShaderVar& var, const FilamentS
         cb["gInvFarPlane"] = 1.0f / std::max(settings.farPlane, 1.0f);
         cb["gInvProj"] = settings.invProj;
         cb["gPositionParams"] = settings.positionParams;
+        if (cb.findMember("gSSAOHighQualityUpsampling").isValid())
+            cb["gSSAOHighQualityUpsampling"] = settings.ssaoHighQualityUpsampling ? 1u : 0u;
     }
 
     if (var["gAODepth"].isValid())
@@ -1010,7 +1017,10 @@ void FilamentPostProcess::executeDeferredSSAO(RenderContext* pRenderContext, con
 {
     if (!settings.enableSSAO || !pDepth || !pNormalW) return;
     executeStructure(pRenderContext, pDepth);
-    executeDeferredSSAOInternal(pRenderContext, pDepth, pNormalW, settings);
+    if (settings.ssaoMode == 1 && mpGTAOPass)
+        executeGTAO(pRenderContext, pDepth, settings);
+    else
+        executeDeferredSSAOInternal(pRenderContext, pDepth, pNormalW, settings);
 }
 
 ref<Texture> FilamentPostProcess::getAOTexture(const FilamentSettings& settings) const

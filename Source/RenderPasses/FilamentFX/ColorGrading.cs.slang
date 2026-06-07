@@ -1,7 +1,7 @@
 cbuffer PerFrameCB
 {
     uint2 gResolution;
-    float gToneMapping; // 0: ACES, 1: Filmic, 2: Linear, 3: Display
+    float gToneMapping; // Filament enum: 0 LINEAR, 1 ACES_LEGACY, 2 ACES, 3 FILMIC, 4 AGX, 5 GENERIC, 6 PBR_NEUTRAL, 7 GT7, 8 DISPLAY_RANGE
     float gExposure;
     float gContrast;
     float gVibrance;
@@ -49,6 +49,37 @@ float3 Tonemap_Filmic(const float3 x) {
     float3 X = max(float3(0.0f), x - 0.004f);
     float3 result = (X * (6.2f * X + 0.5f)) / (X * (6.2f * X + 1.7f) + 0.06f);
     return pow(result, 2.2f);
+}
+
+float3 Tonemap_Generic(const float3 x)
+{
+    return x / (1.0f + x);
+}
+
+float3 Tonemap_AgXApprox(const float3 x)
+{
+    float3 v = log2(max(x, 1e-6f));
+    v = saturate((v + 12.47393f) / (12.47393f + 4.026069f));
+    float3 v2 = v * v;
+    float3 v3 = v2 * v;
+    return saturate(15.5f * v3 * v2 - 40.14f * v2 * v2 + 31.96f * v3 - 6.868f * v2 + 0.4298f * v);
+}
+
+float3 Tonemap_PbrNeutralApprox(const float3 x)
+{
+    float startCompression = 0.8f - 0.04f;
+    float desaturation = 0.15f;
+    float xMax = max(x.r, max(x.g, x.b));
+    float offset = xMax < 0.08f ? xMax - 6.25f * xMax * xMax : 0.04f;
+    float3 color = x - offset;
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression)
+        return max(color, 0.0f);
+    float d = 1.0f - startCompression;
+    float newPeak = 1.0f - d * d / (peak + d - startCompression);
+    color *= newPeak / peak;
+    float g = 1.0f - 1.0f / (desaturation * (peak - newPeak) + 1.0f);
+    return lerp(color, newPeak.xxx, g);
 }
 
 // Color Grading
@@ -148,13 +179,24 @@ void colorGradingMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     // Apply Tone Mapping
     if (gToneMapping == 0.0f) {
-        color = Tonemap_ACES(color);
+        color = max(color, 0.0f);
     } else if (gToneMapping == 1.0f) {
-        color = Tonemap_Filmic(color);
+        color = Tonemap_ACES(color * 0.6f);
+    } else if (gToneMapping == 2.0f) {
+        color = Tonemap_ACES(color);
     } else if (gToneMapping == 3.0f) {
-        // Display - assume already in display color space (simple sRGB gamma applied later)
+        color = Tonemap_Filmic(color);
+    } else if (gToneMapping == 4.0f) {
+        color = Tonemap_AgXApprox(color);
+    } else if (gToneMapping == 5.0f) {
+        color = Tonemap_Generic(color);
+    } else if (gToneMapping == 6.0f) {
+        color = Tonemap_PbrNeutralApprox(color);
+    } else if (gToneMapping == 7.0f) {
+        color = pow(Tonemap_Generic(color * 1.15f), 0.92f);
+    } else if (gToneMapping == 8.0f) {
         color = saturate(color);
-    } // Linear is just pass-through
+    }
 
     // Filament dithering (reduce banding after tone map)
     if (gDithering > 0.5f) {

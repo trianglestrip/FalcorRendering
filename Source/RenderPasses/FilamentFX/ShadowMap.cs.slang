@@ -50,8 +50,8 @@ void shadowMapMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
 
-    float4 clip = float4(uv * 2.0 - 1.0, depth, 1.0);
-    float4 world = mul(clip, gInvViewProj);
+    float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    float4 world = mul(gInvViewProj, clip);
     world.xyz /= world.w;
 
     float visibility = evaluateShadowVisibility(

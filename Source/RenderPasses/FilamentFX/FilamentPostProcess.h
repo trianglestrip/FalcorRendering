@@ -23,13 +23,20 @@ public:
         bool postProcessingEnabled = true;
         int antiAliasing = 1; // 0: None, 1: FXAA, 2: TAA
         bool dithering = true;
+        bool enableMSAA = false;
+        bool msaaCustomResolve = false;
+        bool screenSpaceGuardBand = false;
 
         // Light & IBL
         float iblIntensity = 1.0f;
         float iblRotation = 0.0f;
+        bool enableSunlight = false;
         float sunIntensity = 0.0f;
         float3 sunColor = float3(1.0f, 1.0f, 1.0f);
         float3 sunDirection = float3(0.0f, -1.0f, 0.0f);
+        float sunAngularRadiusDeg = 0.545f;
+        float sunHaloSize = 10.0f;
+        float sunHaloFalloff = 80.0f;
         float ambientIntensity = 0.0f;
 
         // Bloom
@@ -38,35 +45,61 @@ public:
         int bloomLevels = 6;
         int bloomBlendMode = 0; // 0: Add, 1: Screen
         float bloomThreshold = 0.0f;
+        bool bloomThresholdEnabled = false;
+        int bloomQuality = 2;
+        bool bloomLensFlare = false;
 
         // SSAO (Filament SAO parameters)
         bool enableSSAO = true;
         bool forwardSSAO = true; // When true, SSAO is applied in forward pass (not colorGradingPrep)
-        float ssaoResolution = 0.5f;      // Filament AmbientOcclusionOptions.resolution (0.5 = half-res)
+        float ssaoResolution = 0.5f;      // Filament AmbientOcclusionOptions.resolution (0.5 = half-res, 1.0 = full-res)
         float ssaoBilateralEdgeDistance = 0.1f; // Forward upscale edge distance (Filament aoSamplingQualityAndEdgeDistance)
-        float ssaoRadius = 0.3f;          // Filament default radius
+        float ssaoRadius = 1.0f;          // PBRT viewer default; Filament engine default is 0.3m.
         float ssaoBias = 0.001f;          // Filament default bias
         float ssaoPower = 1.0f;           // power curve (doubled internally)
-        float ssaoIntensity = 1.0f;       // Filament default intensity
-        int   ssaoSampleCount = 11;       // Filament MEDIUM quality: 11
-        int   ssaoSpiralTurns = 6;        // Filament MEDIUM: 6
+        float ssaoIntensity = 1.0f;       // Filament default intensity.
+        int   ssaoSampleCount = 11;       // Filament MEDIUM quality.
+        int   ssaoSpiralTurns = 6;        // Filament MEDIUM quality.
         float ssaoMinHorizonAngleSineSquared = 0.0f;
+        float ssaoMinHorizonAngleRad = 0.0f;
         float ssaoPeak2 = 0.0001f;
         float ssaoProjectionScale = 1.0f;
-        int ssaoMode = 0; // 0: SAO (Filament default), 1: GTAO horizon-based
+        int ssaoMode = 0; // 0: SAO, 1: GTAO horizon-based
+        int ssaoQuality = 1;
+        int ssaoLowPassFilter = 1;
+        bool ssaoBentNormals = false;
+        bool ssaoHighQualityUpsampling = true;
         int gtaoSlices = 4;
         int gtaoSteps = 3;
-        float gtaoRadius = 0.3f;
+        float gtaoRadius = 1.0f;
         float gtaoThicknessHeuristic = 0.004f;
+        bool gtaoUseVisibilityBitmasks = false;
+        float gtaoConstThickness = 0.5f;
+        bool gtaoLinearThickness = false;
+        bool ssctEnabled = false;
+        float ssctLightConeRad = 0.0f;
+        float ssctShadowDistance = 0.3f;
+        float ssctContactDistanceMax = 1.0f;
+        float ssctIntensity = 0.8f;
+        float ssctDepthBias = 0.01f;
+        float ssctDepthSlopeBias = 0.01f;
+        int ssctSampleCount = 4;
+        float3 ssctLightDirection = float3(0.0f, -1.0f, 0.0f);
 
         // FSR / sharpening (RCAS post-pass; full EASU upsample when DSR < 1 is future work)
         bool enableFSR = false;
         float fsrSharpness = 0.5f;
+        bool dynamicResolutionEnabled = false;
+        bool dynamicResolutionHomogeneous = true;
+        float dynamicResolutionMinScale = 1.0f;
+        float dynamicResolutionMaxScale = 1.0f;
+        int dynamicResolutionQuality = 2;
         float dynamicResolutionScale = 1.0f; // placeholder for DSR integration
 
         // Shadow (CSM atlas rendered in forward pass; post-process shadow is optional debug)
         bool enableShadows = true;
         bool postProcessShadow = false;
+        int shadowTypeFilament = 0; // 0: PCF, 1: VSM, 2: DPCF, 3: PCSS, 4: PCFd
         int shadowType = 1; // 0: PCF Hard, 1: PCF Low (3x3), 2: VSM
         int shadowCascades = 4;
         float shadowBias = 0.001f;
@@ -76,6 +109,19 @@ public:
         float vsmMaxMoment = 65504.f;
         float vsmLightBleedReduction = 0.15f;
         float vsmBlurWidth = 3.0f;
+        float shadowFar = 100.0f;
+        bool shadowStable = false;
+        bool shadowLiSPSM = true;
+        bool debugCascades = false;
+        bool enableContactShadows = false;
+        float3 cascadeSplitPositions = float3(0.125f, 0.25f, 0.5f);
+        bool vsmHighPrecision = false;
+        bool vsmElvsm = false;
+        int vsmMsaaSamplesLog2 = 0;
+        int vsmAnisotropy = 0;
+        bool vsmMipmapping = false;
+        float softShadowPenumbraScale = 1.0f;
+        float softShadowPenumbraRatioScale = 1.0f;
         float4x4 shadowLightViewProj[4] = {};
         float4 cascadeAtlasRect[4] = {};
 
@@ -84,15 +130,30 @@ public:
         float dofFocalDistance = 10.0f;
         float dofAperture = 2.8f;
         float dofMaxCoC = 5.0f;
+        float dofCocScale = 1.0f;
+        float dofCocAspectRatio = 1.0f;
+        int dofRingCount = 5;
+        bool dofNativeResolution = false;
+        bool dofMedianFilter = false;
 
         // Fog (exponential distance + height, HDR pre-tone-map)
         bool enableFog = false;
         float fogDensity = 0.02f;
         float fogStart = 0.0f;
         float3 fogColor = float3(0.7f, 0.75f, 0.8f);
+        float fogHeight = 0.0f;
+        float fogHeightFalloff = 1.0f;
+        float fogInScatteringStart = 0.0f;
+        float fogInScatteringSize = 1.0f;
+        bool fogExcludeSkybox = false;
+        int fogColorSource = 0; // 0: Constant, 1: IBL, 2: Skybox
 
         // SSR (stub: structure depth only until reflection pass is implemented)
         bool enableSSR = false;
+        float ssrThickness = 0.1f;
+        float ssrBias = 0.01f;
+        float ssrMaxDistance = 3.0f;
+        float ssrStride = 2.0f;
 
         // Vignette
         bool enableVignette = false;
@@ -102,8 +163,19 @@ public:
         float3 vignetteColor = float3(0.0f, 0.0f, 0.0f);
 
         // Color Grading
-        int toneMapping = 2; // 0: ACES approximation, 1: Filmic, 2: Linear, 3: Display
+        int toneMappingFilament = 0; // 0: LINEAR, 1: ACES_LEGACY, 2: ACES, 3: FILMIC, 4: AGX, 5: GENERIC, 6: PBR_NEUTRAL, 7: GT7, 8: DISPLAY_RANGE
+        int toneMapping = 2; // Filament enum: 0 LINEAR, 1 ACES_LEGACY, 2 ACES, 3 FILMIC, 4 AGX, 5 GENERIC, 6 PBR_NEUTRAL, 7 GT7, 8 DISPLAY_RANGE
+        bool colorGradingEnabled = true;
+        bool colorGradingLinkedCurves = false;
+        bool colorGradingLuminanceScaling = false;
+        bool colorGradingGamutMapping = false;
+        int colorGradingQuality = 1;
+        int colorGradingCustomLut = 0;
+        int colorGradingColorSpace = 0;
         float exposure = 0.0f; // EV
+        float nightAdaptation = 0.0f;
+        float temperature = 0.0f;
+        float tint = 0.0f;
         float contrast = 1.0f;
         float vibrance = 1.0f;
         float saturation = 1.0f;
@@ -112,7 +184,33 @@ public:
 
         // TAA
         float taaFeedback = 0.9f;
+        float taaUpscaling = 1.0f;
+        bool taaHistoryReprojection = true;
+        bool taaFilterHistory = true;
+        bool taaFilterInput = true;
+        float taaLodBias = -1.0f;
+        bool taaHDR = true;
+        bool taaUseYCoCg = false;
+        bool taaPreventFlickering = true;
+        int taaJitterPattern = 4;
+        int taaBoxClipping = 0;
+        int taaBoxType = 0;
+        float taaVarianceGamma = 1.0f;
+        float taaSharpness = 0.0f;
         float2 cameraJitter = float2(0.f, 0.f); // Subpixel jitter (normalized), set when antiAliasing==2
+
+        // Scene / Camera UI mirrors Filament viewer. Most fields are UI presets/placeholders.
+        bool sceneAutoScaleEnabled = false;
+        bool sceneAutoInstancingEnabled = false;
+        bool sceneSkyboxEnabled = true;
+        float3 sceneBackgroundColor = float3(0.0f, 0.0f, 0.0f);
+        bool sceneGroundPlaneEnabled = false;
+        float sceneGroundShadowStrength = 0.75f;
+        float cameraFocalLength = 28.0f;
+        float cameraAperture = 16.0f;
+        float cameraShutterSpeed = 125.0f;
+        float cameraSensitivity = 100.0f;
+        float cameraFocusDistance = 10.0f;
 
         // Camera (set each frame by PBRTOfflineRenderer)
         float4x4 invViewProj = float4x4();

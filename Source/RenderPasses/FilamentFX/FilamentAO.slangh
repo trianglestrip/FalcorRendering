@@ -9,6 +9,7 @@ cbuffer AODataCB
     float gInvFarPlane;
     float4x4 gInvProj;
     float2 gPositionParams;
+    uint gSSAOHighQualityUpsampling;
 };
 
 Texture2D<float2> gSSAO;
@@ -60,7 +61,30 @@ float evaluateSSAOHalfResUpsample(float2 uv)
     float4 diff = (pixelPacked - depthSamples) * gAOBilateralEdgeDist;
     float4 w = max(float4(1e-6), 1.0 - diff * diff) * b;
     float weightSum = w.x + w.y + w.z + w.w;
-    return dot(aoSamples, w) / weightSum;
+    float ao = dot(aoSamples, w) / weightSum;
+
+    if (gSSAOHighQualityUpsampling != 0u)
+    {
+        float hqSum = ao * weightSum;
+        float hqWeight = weightSum;
+        for (int y = -1; y <= 1; ++y)
+        {
+            for (int x = -1; x <= 1; ++x)
+            {
+                if (x == 0 && y == 0) continue;
+                float2 sampleUv = uv + float2(x, y) / size;
+                float2 data = gSSAO.SampleLevel(gSSAOLinearSampler, sampleUv, 0).rg;
+                float dd = (pixelPacked - data.g) * gAOBilateralEdgeDist;
+                float bw = max(0.0, 1.0 - dd * dd);
+                float sw = bw * ((abs(x) + abs(y)) == 1 ? 0.5 : 0.25);
+                hqSum += data.r * sw;
+                hqWeight += sw;
+            }
+        }
+        ao = hqSum / max(hqWeight, 1e-5);
+    }
+
+    return ao;
 }
 
 float evaluateSSAO(float2 uv)

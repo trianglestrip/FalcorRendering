@@ -46,9 +46,9 @@ if errorlevel 1 (
 )
 
 :done
-if not exist "%BUILD_DIR%\bin\Release\PBRTOfflineRenderer.exe" (
+if not exist "%BUILD_DIR%\bin\Release\pbrt_viewer.exe" (
     echo [ERROR] Output missing.
     exit /b 1
 )
-echo [OK] %BUILD_DIR%\bin\Release\PBRTOfflineRenderer.exe
+echo [OK] %BUILD_DIR%\bin\Release\pbrt_viewer.exe
 exit /b 0

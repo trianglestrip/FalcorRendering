@@ -3,6 +3,8 @@
  **************************************************************************/
 
 #include "RenderPasses/FilamentFX/FilamentAO.slangh"
+#include "RenderPasses/FilamentFX/FilamentPBR.slangh"
+#include "RenderPasses/FilamentFX/FilamentShadow.slangh"
 
 #define MIN_PERCEPTUAL_ROUGHNESS 0.045f
 
@@ -26,6 +28,24 @@ cbuffer FilamentIBLCB
     float3 gIblSH[9];
 };
 
+cbuffer ShadowCB
+{
+    uint gShadowEnabled;
+    uint gShadowType;
+    uint gCascadeCount;
+    float gShadowBias;
+    float4 gCascadeSplits;
+    float4x4 gLightViewProj[4];
+    float4 gCascadeAtlasRect[4];
+    float2 gShadowAtlasSize;
+    float3 gShadowSunDir;
+    float gVsmExponent;
+    float gVsmLightBleedReduction;
+    float4x4 gInvViewProj;
+    float3 gCameraPos;
+    float gDebugShadowPad;
+};
+
 Texture2D<float4> gBaseColor;
 Texture2D<float4> gNormalW;
 Texture2D<float4> gMaterial;
@@ -33,6 +53,9 @@ Texture2D<float4> gEmissive;
 Texture2D<float4> gViewDirW;
 Texture2D<float> gDepth;
 Texture2D<float4> gIDs;
+Texture2D<float> gShadowMap;
+Texture2D<float2> gShadowMoments;
+SamplerState gShadowPointSampler;
 
 float3 rotateY(float3 v, float angle)
 {
@@ -53,19 +76,47 @@ float3 filamentSHIrradiance(float3 n)
 
 float3 evaluateStableFilamentIBL(float3 diffuseColor, float3 f0, float perceptualRoughness, float3 N, float3 V, float ao)
 {
+    f0 = saturate(f0);
     float3 Nibl = rotateY(N, gIblRotation);
     float NoV = saturate(abs(dot(N, V)) + 1e-4f);
 
     float3 irradiance = filamentSHIrradiance(Nibl);
-    float3 diffuse = diffuseColor * irradiance * singleBounceAO(ao);
+    float fresnelVisibility = pow(1.0f - NoV, 5.0f);
+    float dfg0 = fresnelVisibility * (1.0f - perceptualRoughness);
+    float dfg1 = lerp(0.45f, 1.0f, 1.0f - perceptualRoughness) * (1.0f - 0.35f * fresnelVisibility);
+    float3 dfg = float3(dfg0, dfg1, dfg0);
+    float3 E = lerp(dfg.xxx, dfg.yyy, f0);
+    float3 diffuse = diffuseColor * irradiance * (1.0f - E) * singleBounceAO(ao);
 
     float3 R = rotateY(reflect(-V, N), gIblRotation);
-    float3 specIrradiance = filamentSHIrradiance(normalize(lerp(R, Nibl, perceptualRoughness * perceptualRoughness)));
-    float3 fresnel = f0 + (1.0f - f0) * pow(1.0f - NoV, 5.0f);
-    float clearCoatWeight = lerp(0.12f, 0.65f, 1.0f - perceptualRoughness);
-    float3 specular = specIrradiance * fresnel * clearCoatWeight * specularAO(NoV, ao, perceptualRoughness);
+    float3 dominantR = lerp(R, Nibl, perceptualRoughness * perceptualRoughness);
+    dominantR = (dot(dominantR, dominantR) > 1e-6f) ? normalize(dominantR) : Nibl;
+    // Keep the deferred path GPU-stable with the current procedural IBL fallback.
+    // Real DDS cubemap sampling remains bound for the forward Filament IBL path.
+    float3 prefiltered = filamentSHIrradiance(dominantR);
+    float3 specular = prefiltered * E * specularAO(NoV, ao, perceptualRoughness);
 
     return (diffuse + specular) * gIblLuminance;
+}
+
+float3 reconstructWorldPosition(float2 uv, float depth)
+{
+    float4 clip = float4(float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0), depth, 1.0);
+    float4 world = mul(gInvViewProj, clip);
+    return world.xyz / world.w;
+}
+
+void getShadowDebugData(float3 worldPos, out int cascade, out float3 lightNdc, out float2 shadowUV, out float2 atlasUV, out float sampledDepth)
+{
+    float viewSpaceDepth = length(worldPos - gCameraPos);
+    cascade = selectShadowCascade(viewSpaceDepth, gCascadeCount, gCascadeSplits);
+
+    float4 lightSpacePos = mul(float4(worldPos, 1.0), gLightViewProj[cascade]);
+    lightNdc = lightSpacePos.xyz / lightSpacePos.w;
+    shadowUV = lightNdc.xy * 0.5 + 0.5;
+    float4 atlasRect = gCascadeAtlasRect[cascade];
+    atlasUV = shadowUV * atlasRect.zw + atlasRect.xy;
+    sampledDepth = gShadowMap.SampleLevel(gShadowPointSampler, atlasUV, 0).r;
 }
 
 float4 main(float2 texC : TEXCOORD) : SV_TARGET
@@ -84,6 +135,23 @@ float4 main(float2 texC : TEXCOORD) : SV_TARGET
     float3 f0 = material.yzw;
     float perceptualRoughness = max(saturate(roughness), MIN_PERCEPTUAL_ROUGHNESS);
     float ao = (gSSAOEnabled != 0u) ? evaluateSSAO(texC) : 1.0f;
+    float3 worldPos = reconstructWorldPosition(texC, depth);
+    float shadowVis = evaluateShadowVisibility(
+        worldPos,
+        gCameraPos,
+        gShadowEnabled,
+        gShadowType,
+        gCascadeCount,
+        gShadowBias,
+        gCascadeSplits,
+        gLightViewProj,
+        gCascadeAtlasRect,
+        gShadowAtlasSize,
+        gShadowMap,
+        gShadowMoments,
+        gShadowPointSampler,
+        gVsmExponent,
+        gVsmLightBleedReduction);
 
     if (gDebugView == 1u) return float4(base.rgb, 1.0f);
     if (gDebugView == 2u) return float4(N * 0.5f + 0.5f, 1.0f);
@@ -98,6 +166,33 @@ float4 main(float2 texC : TEXCOORD) : SV_TARGET
         return float4(float(id & 255u), float((id >> 8u) & 255u), float((id >> 16u) & 255u), 255.0f) / 255.0f;
     }
     if (gDebugView == 5u) return float4(ao.xxx, 1.0f);
+    if (gDebugView == 6u) return float4(shadowVis.xxx, 1.0f);
+    if (gDebugView == 7u) {
+        float atlasDepth = gShadowMap.SampleLevel(gShadowPointSampler, texC, 0).r;
+        return float4(atlasDepth.xxx, 1.0f);
+    }
+    if (gDebugView >= 8u && gDebugView <= 11u) {
+        int cascade = 0;
+        float3 lightNdc = float3(0.0f);
+        float2 shadowUV = float2(0.0f);
+        float2 atlasUV = float2(0.0f);
+        float sampledDepth = 1.0f;
+        getShadowDebugData(worldPos, cascade, lightNdc, shadowUV, atlasUV, sampledDepth);
+        if (gDebugView == 8u) {
+            float band = (gCascadeCount > 1u) ? float(cascade) / float(gCascadeCount - 1u) : 0.0f;
+            return float4(band, 1.0f - band, frac(float(cascade) * 0.37f), 1.0f);
+        }
+        if (gDebugView == 9u) {
+            float valid = (shadowUV.x >= 0.0f && shadowUV.x <= 1.0f && shadowUV.y >= 0.0f && shadowUV.y <= 1.0f) ? 1.0f : 0.0f;
+            return float4(saturate(shadowUV), valid, 1.0f);
+        }
+        if (gDebugView == 10u) {
+            float valid = (lightNdc.z >= 0.0f && lightNdc.z <= 1.0f) ? 1.0f : 0.0f;
+            return float4(saturate(lightNdc.z).xxx * valid, 1.0f);
+        }
+        float delta = lightNdc.z - sampledDepth;
+        return float4(saturate(delta * 20.0f + 0.5f), saturate(sampledDepth), saturate(lightNdc.z), 1.0f);
+    }
 
     float3 color = emissive + evaluateStableFilamentIBL(base.rgb, f0, perceptualRoughness, N, V, ao);
     color += base.rgb * gAmbientIntensity;
@@ -106,22 +201,16 @@ float4 main(float2 texC : TEXCOORD) : SV_TARGET
     float NoL = saturate(dot(N, sunL));
     if (gSunIntensity > 0.0f && NoL > 0.0f)
     {
-        float glossy = saturate(1.0f - roughness * 0.8f);
-        float specLum = dot(f0, float3(0.2126f, 0.7152f, 0.0722f));
         float sunScale = min(gSunIntensity * 0.00001f, 3.0f);
         float3 sunRadiance = gSunColor * sunScale;
-        color += base.rgb * sunRadiance * NoL;
-
-        if (specLum > 0.0f)
-        {
-            float3 H = normalize(sunL + V);
-            float NoH = saturate(dot(N, H));
-            float VoH = saturate(dot(V, H));
-            float specPower = lerp(8.0f, 160.0f, glossy);
-            float3 fresnel = f0 + (1.0f - f0) * pow(1.0f - VoH, 5.0f);
-            float spec = pow(NoH, specPower) * glossy * NoL;
-            color += fresnel * sunRadiance * spec * 0.5f;
-        }
+        PixelParams pixel;
+        pixel.diffuseColor = base.rgb;
+        pixel.perceptualRoughness = perceptualRoughness;
+        pixel.roughness = perceptualRoughness * perceptualRoughness;
+        pixel.f0 = f0;
+        pixel.dfg = float3(0.0f);
+        pixel.energyCompensation = float3(1.0f);
+        color += surfaceShading(pixel, sunL, V, N, 1.0f) * sunRadiance * shadowVis;
     }
 
     return float4(color, 1.0f);

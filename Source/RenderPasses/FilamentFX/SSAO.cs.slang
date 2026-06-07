@@ -66,7 +66,7 @@ float sampleDepthLinear(float2 uv, float lod)
 float3 computeViewPosition(float2 uv, float depth)
 {
     float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    float4 view = mul(clip, gInvProj);
+    float4 view = mul(gInvProj, clip);
     return view.xyz / view.w;
 }
 

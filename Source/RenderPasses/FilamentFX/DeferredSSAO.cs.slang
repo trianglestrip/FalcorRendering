@@ -44,14 +44,14 @@ bool isSkyDepth(float depth)
 float3 computeViewPosition(float2 uv, float depth)
 {
     float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    float4 view = mul(clip, gInvProj);
+    float4 view = mul(gInvProj, clip);
     return view.xyz / view.w;
 }
 
 float3 computeWorldPosition(float2 uv, float depth)
 {
     float3 viewPosition = computeViewPosition(uv, depth);
-    float4 world = mul(float4(viewPosition, 1.0), gInvView);
+    float4 world = mul(gInvView, float4(viewPosition, 1.0));
     return world.xyz / world.w;
 }
 

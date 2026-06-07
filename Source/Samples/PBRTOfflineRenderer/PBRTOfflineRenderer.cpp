@@ -11,15 +11,22 @@
 #include <limits>
 
 FALCOR_EXPORT_D3D12_AGILITY_SDK
-static const float4 kClear = float4(0.1f, 0.1f, 0.12f, 1.f);
+static const float4 kClear = float4(0.2f, 0.2f, 0.24f, 1.f);
 
 namespace
 {
     constexpr float kDefaultIblIntensityScale = 0.35f;
     constexpr float kPreviewIblIntensityScale = 0.35f;
     constexpr float kPreviewAmbientIntensity = 0.0f;
-    constexpr float kDefaultSSAORadius = 0.3f;
+    constexpr float kDefaultSSAORadius = 1.0f;
     constexpr float kDefaultSSAOIntensity = 1.0f;
+    constexpr float kDefaultSSAOPower = 1.0f;
+    constexpr float kDefaultSSAOResolution = 0.5f;
+    constexpr float kDefaultSSAOBilateralThreshold = 0.05f;
+    constexpr int kDefaultSSAOMode = 0;
+    constexpr int kDefaultSSAOQuality = 1;
+    constexpr int kDefaultSSAOSampleCount = 11;
+    constexpr int kDefaultSSAOLowPass = 1;
 
     struct CascadeAtlasLayout { uint32_t cols; uint32_t rows; };
 
@@ -45,7 +52,7 @@ namespace
 
     float4x4 buildLightViewMatrix(float3 lightPos, float3 lightDir, float3 cameraFwd)
     {
-        float3 f = normalize(-lightDir);
+        float3 f = normalize(lightDir);
         float3 s = normalize(cross(f, cameraFwd));
         if (length(s) < 1e-4f)
             s = normalize(cross(f, float3(0, 1, 0)));
@@ -125,19 +132,26 @@ PBRTOfflineRenderer::PBRTOfflineRenderer(const SampleAppConfig& c) : SampleApp(c
     mFilamentSettings.postProcessingEnabled = true;
     mFilamentSettings.antiAliasing = 0;
     mFilamentSettings.enableSSAO = true;
-    mFilamentSettings.forwardSSAO = true;
+    mFilamentSettings.forwardSSAO = false;
     mFilamentSettings.ssaoRadius = kDefaultSSAORadius;
     mFilamentSettings.ssaoIntensity = kDefaultSSAOIntensity;
-    mFilamentSettings.ssaoPower = 1.0f;
-    mFilamentSettings.ssaoResolution = 0.5f;
-    mFilamentSettings.ssaoSampleCount = 11;
+    mFilamentSettings.ssaoPower = kDefaultSSAOPower;
+    mFilamentSettings.ssaoResolution = kDefaultSSAOResolution;
+    mFilamentSettings.ssaoBilateralThreshold = kDefaultSSAOBilateralThreshold;
+    mFilamentSettings.ssaoMode = kDefaultSSAOMode;
+    mFilamentSettings.gtaoRadius = kDefaultSSAORadius;
+    mFilamentSettings.ssaoQuality = kDefaultSSAOQuality;
+    mFilamentSettings.ssaoSampleCount = kDefaultSSAOSampleCount;
+    mFilamentSettings.ssaoLowPassFilter = kDefaultSSAOLowPass;
     mFilamentSettings.iblIntensity = kDefaultIblIntensityScale;
+    mFilamentSettings.enableSunlight = false;
     mFilamentSettings.sunIntensity = 0.f;
     mFilamentSettings.sunColor = float3(1.f, 0.95f, 0.85f);
-    mFilamentSettings.sunDirection = normalize(float3(0.3f, 1.f, 0.5f));
+    mFilamentSettings.sunDirection = normalize(float3(0.3f, -1.f, 0.5f));
     mFilamentSettings.enableShadows = false;
     mFilamentSettings.exposure = 0.0f;
-    mFilamentSettings.toneMapping = 2; // Linear: preserve PBRT material colors by default.
+    mFilamentSettings.toneMapping = 2; // ACES
+    mFilamentSettings.toneMappingFilament = 2; // ACES
     buildTaskGraph();
 }
 PBRTOfflineRenderer::~PBRTOfflineRenderer() { mExecutor.wait_for_all(); }
@@ -150,8 +164,9 @@ void PBRTOfflineRenderer::setHeadlessProbeMode(bool enabled)
     mFilamentSettings.postProcessingEnabled = true;
     mFilamentSettings.enableShadows = false;
     mFilamentSettings.enableSSAO = true;
-    mFilamentSettings.forwardSSAO = true;
+    mFilamentSettings.forwardSSAO = false;
     mFilamentSettings.sunIntensity = 0.f;
+    mFilamentSettings.enableSunlight = false;
 }
 
 void PBRTOfflineRenderer::setPreviewMode(bool enabled)
@@ -159,27 +174,35 @@ void PBRTOfflineRenderer::setPreviewMode(bool enabled)
     if (!enabled)
         return;
 
-    // Mirror filament pbrt_kitchen setPreviewPreset() defaults.
+    // Mirror the interactive PBRT viewer preview preset defaults.
     mFilamentSettings.postProcessingEnabled = true;
     mFilamentSettings.enableSSAO = true;
-    mFilamentSettings.forwardSSAO = true;
+    mFilamentSettings.forwardSSAO = false;
     mFilamentSettings.ssaoRadius = kDefaultSSAORadius;
     mFilamentSettings.ssaoIntensity = kDefaultSSAOIntensity;
-    mFilamentSettings.ssaoPower = 1.0f;
-    mFilamentSettings.ssaoResolution = 0.5f;
-    mFilamentSettings.ssaoSampleCount = 11;
+    mFilamentSettings.ssaoPower = kDefaultSSAOPower;
+    mFilamentSettings.ssaoResolution = kDefaultSSAOResolution;
+    mFilamentSettings.ssaoBilateralThreshold = kDefaultSSAOBilateralThreshold;
+    mFilamentSettings.ssaoMode = kDefaultSSAOMode;
+    mFilamentSettings.gtaoRadius = kDefaultSSAORadius;
+    mFilamentSettings.ssaoQuality = kDefaultSSAOQuality;
+    mFilamentSettings.ssaoSampleCount = kDefaultSSAOSampleCount;
+    mFilamentSettings.ssaoLowPassFilter = kDefaultSSAOLowPass;
     mFilamentSettings.iblIntensity = kPreviewIblIntensityScale;
+    mFilamentSettings.enableSunlight = false;
     mFilamentSettings.sunIntensity = 0.f;
+    mFilamentSettings.sunDirection = normalize(float3(0.3f, -1.f, 0.5f));
     mFilamentSettings.enableShadows = false;
     mFilamentSettings.exposure = 0.0f;
-    mFilamentSettings.toneMapping = 2; // Linear: preserve PBRT material colors by default.
+    mFilamentSettings.toneMapping = 2; // ACES
+    mFilamentSettings.toneMappingFilament = 2; // ACES
     mFilamentSettings.ambientIntensity = kPreviewAmbientIntensity;
 }
 
 void PBRTOfflineRenderer::onLoad(RenderContext* pCtx)
 {
     if (!mScenePath.empty()) loadScene(pCtx);
-    else logInfo("No scene. Drag .pbrt file or use --scene <path>");
+    else logInfo("No scene. Drag .pbrt file, use path <file>, or choose a file in the UI.");
 }
 
 void PBRTOfflineRenderer::onShutdown()
@@ -193,6 +216,7 @@ void PBRTOfflineRenderer::onShutdown()
 void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
 {
     logInfo("Loading: {}", mScenePath.string());
+    mSceneLoaded = false;
     try
     {
         Settings settings;
@@ -214,7 +238,7 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         mpScene->setCameraControlsEnabled(true);
         pCam->setIsAnimated(false);
         pCam->setDepthRange(std::max(0.1f, r / 750.f), r * 10.f);
-        mSceneLoaded = true; mFrameCount = 0; mStartTime = getGlobalClock().getTime();
+        mSceneLoaded = true; mLoadedScenePath = mScenePath; mFrameCount = 0; mStartTime = getGlobalClock().getTime();
 
         // Enable emissive lights and build light collection (needed for PBRT area lights)
         mpScene->getRenderSettings().useEmissiveLights = true;
@@ -367,7 +391,7 @@ void PBRTOfflineRenderer::syncFilamentSunLight()
     if (!mpScene) return;
 
     const float3 sunDir = normalize(mFilamentSettings.sunDirection);
-    const float3 intensity = mFilamentSettings.sunColor * mFilamentSettings.sunIntensity;
+    const float3 intensity = mFilamentSettings.enableSunlight ? mFilamentSettings.sunColor * mFilamentSettings.sunIntensity : float3(0.f);
 
     ref<Light> pSun;
     for (const auto& pLight : mpScene->getLights())
@@ -419,7 +443,7 @@ void PBRTOfflineRenderer::setAOShaderVars(const ShaderVar& var)
 
     const bool useForwardSSAO = mFilamentSettings.postProcessingEnabled
         && mFilamentSettings.enableSSAO
-        && mFilamentSettings.forwardSSAO;
+        && (mFilamentSettings.forwardSSAO || mDebugView == 5);
 
     auto perFrameCB = var.findMember("PerFrameCB");
     if (perFrameCB.isValid() && perFrameCB.findMember("gSSAOEnabled").isValid())
@@ -450,6 +474,10 @@ void PBRTOfflineRenderer::setShadowShaderVars(const ShaderVar& var)
         cb["gShadowSunDir"] = normalize(mFilamentSettings.sunDirection);
         cb["gVsmExponent"] = mFilamentSettings.vsmExponent;
         cb["gVsmLightBleedReduction"] = mFilamentSettings.vsmLightBleedReduction;
+        if (cb.findMember("gInvViewProj").isValid())
+            cb["gInvViewProj"] = mFilamentSettings.invViewProj;
+        if (cb.findMember("gCameraPos").isValid())
+            cb["gCameraPos"] = mFilamentSettings.cameraPos;
         for (int i = 0; i < 4; ++i)
         {
             cb["gLightViewProj"][i] = mFilamentSettings.shadowLightViewProj[i];
@@ -553,17 +581,31 @@ void PBRTOfflineRenderer::renderShadowMap(RenderContext* pCtx)
         }
 
         const float margin = 0.05f * std::max(maxX - minX, maxY - minY);
-        const float left = minX - margin, right = maxX + margin;
-        const float bottom = minY - margin, top = maxY + margin;
+        float left = minX - margin, right = maxX + margin;
+        float bottom = minY - margin, top = maxY + margin;
         const float nearP = minZ - margin;
         const float farP = maxZ + margin + sceneRadius * 0.5f;
 
-        const float4x4 lightProj = buildOrthoProjMatrix(left, right, bottom, top, nearP, farP);
-        mFilamentSettings.shadowLightViewProj[c] = mul(lightProj, lightView);
-        mFilamentSettings.cascadeAtlasRect[c] = getAtlasTileRect(c, atlasLayout);
-
         const uint32_t tileW = mShadowMapSize / atlasLayout.cols;
         const uint32_t tileH = mShadowMapSize / atlasLayout.rows;
+        if (mFilamentSettings.shadowStable)
+        {
+            const float extentX = right - left;
+            const float extentY = top - bottom;
+            const float texelX = extentX / std::max(1u, tileW);
+            const float texelY = extentY / std::max(1u, tileH);
+            const float centerX = std::floor(((left + right) * 0.5f) / texelX) * texelX;
+            const float centerY = std::floor(((bottom + top) * 0.5f) / texelY) * texelY;
+            left = centerX - extentX * 0.5f;
+            right = centerX + extentX * 0.5f;
+            bottom = centerY - extentY * 0.5f;
+            top = centerY + extentY * 0.5f;
+        }
+
+        const float4x4 lightProj = buildOrthoProjMatrix(left, right, bottom, top, nearP, farP);
+        mFilamentSettings.shadowLightViewProj[c] = mul(lightView, lightProj);
+        mFilamentSettings.cascadeAtlasRect[c] = getAtlasTileRect(c, atlasLayout);
+
         const uint32_t col = c % atlasLayout.cols;
         const uint32_t row = c / atlasLayout.cols;
         GraphicsState::Viewport vp(float(col * tileW), float(row * tileH), float(tileW), float(tileH), 0.f, 1.f);
@@ -679,11 +721,12 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     mpGBufferPass->getState()->setViewport(0, fullViewport, true);
     mpScene->rasterize(pCtx, mpGBufferPass->getState().get(), mpGBufferPass->getVars().get());
 
-    // GBuffer depth -> SSAO. Keep the stable depth-derived path for the main preview
-    // while the world-space/GBuffer-normal AO path is validated separately.
-    if (mFilamentSettings.postProcessingEnabled && mFilamentSettings.enableSSAO && mFilamentSettings.forwardSSAO && mpFilamentPostProcess)
+    if (mFilamentSettings.postProcessingEnabled && mFilamentSettings.enableSSAO && mpFilamentPostProcess && (mFilamentSettings.forwardSSAO || mDebugView == 5))
     {
-        mpFilamentPostProcess->executePrePassSSAO(pCtx, mpIntermediateDepth, mFilamentSettings);
+        if (mFilamentSettings.ssaoMode == 0)
+            mpFilamentPostProcess->executePrePassSSAO(pCtx, mpIntermediateDepth, mFilamentSettings);
+        else
+            mpFilamentPostProcess->executeDeferredSSAO(pCtx, mpIntermediateDepth, mpGBufferNormalW, mFilamentSettings);
     }
 
     auto pLightingFbo = Fbo::create(getDevice(), {mpIntermediateTexture});
@@ -696,6 +739,7 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
         {
             auto root = vars->getRootVar();
             setAOShaderVars(root);
+            setShadowShaderVars(root);
             auto perFrameCB = root.findMember("PerFrameCB");
             if (perFrameCB.isValid())
             {
@@ -704,7 +748,7 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
                 if (perFrameCB.findMember("gDebugView").isValid())
                     perFrameCB["gDebugView"] = mDebugView;
                 if (perFrameCB.findMember("gSunIntensity").isValid())
-                    perFrameCB["gSunIntensity"] = mFilamentSettings.sunIntensity;
+                    perFrameCB["gSunIntensity"] = mFilamentSettings.enableSunlight ? mFilamentSettings.sunIntensity : 0.0f;
                 if (perFrameCB.findMember("gSunColor").isValid())
                     perFrameCB["gSunColor"] = mFilamentSettings.sunColor;
                 if (perFrameCB.findMember("gSunDirection").isValid())
@@ -791,20 +835,55 @@ void PBRTOfflineRenderer::buildTaskGraph()
 void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
 {
     Gui::Window w(pGui, "PBRT Renderer", {380, 700});
-    if (mpScene) { w.text(fmt::format("Scene: {}", mScenePath.filename().string())); w.text(fmt::format("Geometry: {}", mpScene->getGeometryCount())); }
-    else w.text("No scene. Drag .pbrt file or use --scene <path>");
+    if (mpScene)
+    {
+        w.text(fmt::format("Loaded: {}", mLoadedScenePath.filename().string()));
+        w.text(fmt::format("Geometry: {}", mpScene->getGeometryCount()));
+    }
+    else
+    {
+        w.text("No scene loaded.");
+    }
+    w.text(mScenePath.empty() ? "Selected: <none>" : fmt::format("Selected: {}", mScenePath.string()));
     w.text(fmt::format("Frame: {}", mFrameCount));
+    if (w.button("Choose PBRT File"))
+    {
+        std::filesystem::path path = mScenePath;
+        const FileDialogFilterVec filters = {{"pbrt", "PBRT Scene"}, {"pyscene", "Falcor Python Scene"}};
+        if (openFileDialog(filters, path))
+        {
+            mScenePath = path;
+        }
+    }
+    if (w.button("Load Selected PBRT") && !mScenePath.empty())
+        loadScene(getRenderContext());
     if (w.button("Save Screenshot")) { if (mOutputPath.empty()) { mOutputPath = mScenePath; mOutputPath.replace_extension(".exr"); } saveOutput(getRenderContext()); }
     
-    if (auto g = w.group("Filament Settings", true))
+    if (auto g = w.group("Filament", true))
     {
+        auto& s = mFilamentSettings;
+
         if (auto viewGroup = g.group("View")) {
-            viewGroup.checkbox("Post-processing", mFilamentSettings.postProcessingEnabled);
-            viewGroup.checkbox("Dithering", mFilamentSettings.dithering);
-            Gui::DropdownList aaList = {{0, "None"}, {1, "FXAA"}, {2, "TAA"}};
-            viewGroup.dropdown("Anti-aliasing", aaList, (uint32_t&)mFilamentSettings.antiAliasing);
-            if (mFilamentSettings.antiAliasing == 2)
-                viewGroup.slider("TAA Feedback", mFilamentSettings.taaFeedback, 0.0f, 0.99f);
+            viewGroup.checkbox("Post-processing", s.postProcessingEnabled);
+            if (auto ppViewGroup = viewGroup.group("Post-processing")) {
+                ppViewGroup.checkbox("Dithering", s.dithering);
+                ppViewGroup.checkbox("Bloom", s.enableBloom);
+
+                bool taa = s.antiAliasing == 2;
+                if (ppViewGroup.checkbox("TAA", taa))
+                    s.antiAliasing = taa ? 2 : 1;
+
+                bool fxaa = s.antiAliasing == 1;
+                if (ppViewGroup.checkbox("FXAA", fxaa))
+                    s.antiAliasing = fxaa ? 1 : 0;
+            }
+            viewGroup.checkbox("MSAA 4x", s.enableMSAA);
+            if (auto msaaGroup = viewGroup.group("MSAA 4x"))
+                msaaGroup.checkbox("Custom resolve", s.msaaCustomResolve);
+            viewGroup.checkbox("SSAO", s.enableSSAO);
+            viewGroup.checkbox("Screen-space reflections", s.enableSSR);
+            viewGroup.checkbox("Screen-space Guard Band", s.screenSpaceGuardBand);
+
             Gui::DropdownList debugViews = {
                 {0, "Shaded"},
                 {1, "Albedo"},
@@ -812,147 +891,249 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                 {3, "Material ID"},
                 {4, "Instance ID"},
                 {5, "AO"},
+                {6, "Shadow"},
+                {7, "Shadow Map"},
             };
             viewGroup.dropdown("Debug View", debugViews, mDebugView);
         }
 
-        if (auto lightGroup = g.group("Light (Sun)")) {
-            lightGroup.slider("Intensity", mFilamentSettings.sunIntensity, 0.0f, 200000.0f);
-            lightGroup.rgbColor("Color", mFilamentSettings.sunColor);
-            lightGroup.slider("Dir X", mFilamentSettings.sunDirection.x, -1.0f, 1.0f);
-            lightGroup.slider("Dir Y", mFilamentSettings.sunDirection.y, -1.0f, 1.0f);
-            lightGroup.slider("Dir Z", mFilamentSettings.sunDirection.z, -1.0f, 1.0f);
-            if (lightGroup.button("Normalize Direction"))
-                mFilamentSettings.sunDirection = normalize(mFilamentSettings.sunDirection);
+        if (auto bloomGroup = g.group("Bloom Options")) {
+            bloomGroup.slider("Strength", s.bloomStrength, 0.0f, 1.0f);
+            if (bloomGroup.checkbox("Threshold", s.bloomThresholdEnabled))
+                s.bloomThreshold = s.bloomThresholdEnabled ? 1.0f : 0.0f;
+            bloomGroup.slider("Levels", s.bloomLevels, 3, 11);
+            bloomGroup.slider("Bloom Quality", s.bloomQuality, 0, 3);
+            bloomGroup.checkbox("Lens Flare", s.bloomLensFlare);
         }
 
-        if (auto iblGroup = g.group("Filament IBL"))
-        {
-            iblGroup.slider("IBL Intensity Scale", mFilamentSettings.iblIntensity, 0.0f, 1.0f);
-            iblGroup.slider("IBL Rotation", mFilamentSettings.iblRotation, -3.14159f, 3.14159f);
-            if (mpFilamentIBL)
-            {
-                iblGroup.text(mpFilamentIBL->usingPlaceholder()
-                    ? "Source: procedural placeholder (awaiting data/ibl assets)"
-                    : "Source: data/ibl/lightroom_14b");
+        if (auto taaGroup = g.group("TAA Options")) {
+            taaGroup.slider("Upscaling", s.taaUpscaling, 1.0f, 3.0f);
+            taaGroup.checkbox("History Reprojection", s.taaHistoryReprojection);
+            taaGroup.slider("Feedback", s.taaFeedback, 0.0f, 1.0f);
+            taaGroup.checkbox("Filter History", s.taaFilterHistory);
+            taaGroup.checkbox("Filter Input", s.taaFilterInput);
+            taaGroup.slider("LOD bias", s.taaLodBias, -8.0f, 0.0f);
+            taaGroup.checkbox("HDR", s.taaHDR);
+            taaGroup.checkbox("Use YCoCg", s.taaUseYCoCg);
+            taaGroup.checkbox("Prevent Flickering", s.taaPreventFlickering);
+            Gui::DropdownList jitterPatterns = {{0, "RGSS x4"}, {1, "Uniform Helix x4"}, {2, "Halton x8"}, {3, "Halton x16"}, {4, "Halton x32"}};
+            Gui::DropdownList boxClipping = {{0, "Accurate"}, {1, "Clamp"}, {2, "None"}};
+            Gui::DropdownList boxTypes = {{0, "AABB"}, {1, "Variance"}};
+            taaGroup.dropdown("Jitter Pattern", jitterPatterns, (uint32_t&)s.taaJitterPattern);
+            taaGroup.dropdown("Box Clipping", boxClipping, (uint32_t&)s.taaBoxClipping);
+            taaGroup.dropdown("Box Type", boxTypes, (uint32_t&)s.taaBoxType);
+            taaGroup.slider("Variance Gamma", s.taaVarianceGamma, 0.75f, 1.25f);
+            taaGroup.slider("RCAS", s.taaSharpness, 0.0f, 1.0f);
+        }
+
+        if (auto ssaoGroup = g.group("SSAO Options")) {
+            ssaoGroup.checkbox("Enabled", s.enableSSAO);
+            Gui::DropdownList aoTypes = {{0, "SAO"}, {1, "GTAO"}};
+            ssaoGroup.dropdown("AO Type", aoTypes, (uint32_t&)s.ssaoMode);
+            ssaoGroup.slider("Quality", s.ssaoQuality, 0, 3);
+            ssaoGroup.slider("Low Pass", s.ssaoLowPassFilter, 0, 2);
+            ssaoGroup.checkbox("Bent Normals", s.ssaoBentNormals);
+            ssaoGroup.checkbox("High quality upsampling", s.ssaoHighQualityUpsampling);
+            ssaoGroup.slider("Radius", s.ssaoRadius, 0.1f, 10.0f);
+            ssaoGroup.slider("Power", s.ssaoPower, 1.0f, 8.0f);
+
+            if (s.ssaoMode == 0) {
+                if (ssaoGroup.slider("Min Horizon angle", s.ssaoMinHorizonAngleRad, 0.0f, 0.785398f)) {
+                    const float v = std::sin(s.ssaoMinHorizonAngleRad);
+                    s.ssaoMinHorizonAngleSineSquared = v * v;
+                }
+            } else {
+                ssaoGroup.slider("Slice Count", s.gtaoSlices, 1, 10);
+                ssaoGroup.slider("Steps Per Slice", s.gtaoSteps, 1, 4);
+                ssaoGroup.checkbox("Use Visibility Bitmasks", s.gtaoUseVisibilityBitmasks);
+                if (s.gtaoUseVisibilityBitmasks) {
+                    ssaoGroup.slider("Constant Thickness", s.gtaoConstThickness, 0.01f, 10.0f);
+                    ssaoGroup.checkbox("Linear Thickness", s.gtaoLinearThickness);
+                }
+            }
+
+            ssaoGroup.slider("Bilateral Threshold", s.ssaoBilateralThreshold, 0.0f, 0.1f);
+            bool halfRes = s.ssaoResolution != 1.0f;
+            if (ssaoGroup.checkbox("Half resolution", halfRes))
+                s.ssaoResolution = halfRes ? 0.5f : 1.0f;
+
+            if (auto dlsGroup = ssaoGroup.group("Dominant Light Shadows (experimental)")) {
+                dlsGroup.checkbox("Enabled##dls", s.ssctEnabled);
+                dlsGroup.slider("Cone angle", s.ssctLightConeRad, 0.0f, 1.570796f);
+                dlsGroup.slider("Shadow Distance", s.ssctShadowDistance, 0.0f, 10.0f);
+                dlsGroup.slider("Contact dist max", s.ssctContactDistanceMax, 0.0f, 100.0f);
+                dlsGroup.slider("Intensity##dls", s.ssctIntensity, 0.0f, 10.0f);
+                dlsGroup.slider("Depth bias", s.ssctDepthBias, 0.0f, 1.0f);
+                dlsGroup.slider("Depth slope bias", s.ssctDepthSlopeBias, 0.0f, 1.0f);
+                dlsGroup.slider("Sample Count", s.ssctSampleCount, 1, 32);
+                dlsGroup.slider("Direction X##dls", s.ssctLightDirection.x, -1.0f, 1.0f);
+                dlsGroup.slider("Direction Y##dls", s.ssctLightDirection.y, -1.0f, 1.0f);
+                dlsGroup.slider("Direction Z##dls", s.ssctLightDirection.z, -1.0f, 1.0f);
             }
         }
 
-        if (mpScene && mpScene->getEnvMap())
-        {
-            if (auto envGroup = g.group("Environment Map (Scene)"))
-            {
-                mpScene->getEnvMap()->renderUI(envGroup);
+        if (auto ssrGroup = g.group("Screen-space reflections Options")) {
+            ssrGroup.slider("Ray thickness", s.ssrThickness, 0.001f, 0.2f);
+            ssrGroup.slider("Bias", s.ssrBias, 0.001f, 0.5f);
+            ssrGroup.slider("Max distance", s.ssrMaxDistance, 0.1f, 10.0f);
+            ssrGroup.slider("Stride", s.ssrStride, 1.0f, 10.0f);
+        }
+
+        if (auto dsrGroup = g.group("Dynamic Resolution")) {
+            dsrGroup.checkbox("enabled", s.dynamicResolutionEnabled);
+            dsrGroup.checkbox("homogeneous", s.dynamicResolutionHomogeneous);
+            dsrGroup.slider("min. scale", s.dynamicResolutionMinScale, 0.25f, 1.0f);
+            dsrGroup.slider("max. scale", s.dynamicResolutionMaxScale, 0.25f, 1.0f);
+            s.dynamicResolutionMinScale = std::min(s.dynamicResolutionMinScale, s.dynamicResolutionMaxScale);
+            s.dynamicResolutionScale = s.dynamicResolutionMinScale;
+            dsrGroup.slider("quality", s.dynamicResolutionQuality, 0, 3);
+            dsrGroup.slider("sharpness", s.fsrSharpness, 0.0f, 1.0f);
+        }
+
+        if (auto lightGroup = g.group("Light")) {
+            if (auto indirectGroup = lightGroup.group("Indirect light")) {
+                indirectGroup.slider("IBL intensity", s.iblIntensity, 0.0f, 10.0f);
+                s.iblIntensity = std::clamp(s.iblIntensity, 0.0f, 10.0f);
+                indirectGroup.slider("IBL rotation", s.iblRotation, -3.14159f, 3.14159f);
+                if (mpFilamentIBL) {
+                    indirectGroup.text(mpFilamentIBL->usingPlaceholder()
+                        ? "Source: procedural placeholder (awaiting data/ibl assets)"
+                        : "Source: data/ibl/lightroom_14b");
+                }
+            }
+            if (auto sunlightGroup = lightGroup.group("Sunlight")) {
+                sunlightGroup.checkbox("Enable sunlight", s.enableSunlight);
+                sunlightGroup.slider("Sun intensity", s.sunIntensity, 0.0f, 150000.0f);
+                sunlightGroup.slider("Sun radius [deg]", s.sunAngularRadiusDeg, 0.25f, 20.0f);
+                sunlightGroup.slider("Halo size", s.sunHaloSize, 1.0f, 100.0f);
+                sunlightGroup.slider("Halo falloff", s.sunHaloFalloff, 1.0f, 1000.0f);
+                sunlightGroup.slider("Sun direction X", s.sunDirection.x, -1.0f, 1.0f);
+                sunlightGroup.slider("Sun direction Y", s.sunDirection.y, -1.0f, 1.0f);
+                sunlightGroup.slider("Sun direction Z", s.sunDirection.z, -1.0f, 1.0f);
+                if (sunlightGroup.button("Normalize Sun direction"))
+                    s.sunDirection = normalize(s.sunDirection);
+                sunlightGroup.slider("Shadow Far", s.shadowFar, 0.0f, s.farPlane);
+                if (auto shadowDirGroup = sunlightGroup.group("Shadow direction")) {
+                    shadowDirGroup.slider("Shadow direction X", s.sunDirection.x, -1.0f, 1.0f);
+                    shadowDirGroup.slider("Shadow direction Y", s.sunDirection.y, -1.0f, 1.0f);
+                    shadowDirGroup.slider("Shadow direction Z", s.sunDirection.z, -1.0f, 1.0f);
+                }
+            }
+            if (auto shadowsGroup = lightGroup.group("Shadows")) {
+                shadowsGroup.checkbox("Enable shadows", s.enableShadows);
+                shadowsGroup.slider("Shadow map size", s.shadowMapSize, 32u, 2048u);
+                shadowsGroup.checkbox("Stable Shadows", s.shadowStable);
+                shadowsGroup.checkbox("Enable LiSPSM", s.shadowLiSPSM);
+                Gui::DropdownList shadowTypes = {{0, "PCF"}, {1, "VSM"}, {2, "DPCF"}, {3, "PCSS"}, {4, "PCFd"}};
+                if (shadowsGroup.dropdown("Shadow type", shadowTypes, (uint32_t&)s.shadowTypeFilament))
+                    s.shadowType = (s.shadowTypeFilament == 1) ? 2 : 1;
+                if (s.shadowTypeFilament == 1) {
+                    shadowsGroup.checkbox("High precision", s.vsmHighPrecision);
+                    shadowsGroup.checkbox("ELVSM", s.vsmElvsm);
+                    shadowsGroup.slider("VSM MSAA samples", s.vsmMsaaSamplesLog2, 0, 3);
+                    shadowsGroup.slider("VSM anisotropy", s.vsmAnisotropy, 0, 3);
+                    shadowsGroup.checkbox("VSM mipmapping", s.vsmMipmapping);
+                    shadowsGroup.slider("VSM blur", s.vsmBlurWidth, 0.0f, 125.0f);
+                } else if (s.shadowTypeFilament == 2 || s.shadowTypeFilament == 3) {
+                    shadowsGroup.slider("Penumbra scale", s.softShadowPenumbraScale, 0.0f, 100.0f);
+                    shadowsGroup.slider("Penumbra Ratio scale", s.softShadowPenumbraRatioScale, 1.0f, 100.0f);
+                }
+                shadowsGroup.slider("Cascades", s.shadowCascades, 1, 4);
+                shadowsGroup.checkbox("Debug cascades", s.debugCascades);
+                shadowsGroup.checkbox("Enable contact shadows", s.enableContactShadows);
+                shadowsGroup.slider("Split pos 0", s.cascadeSplitPositions.x, 0.0f, 1.0f);
+                shadowsGroup.slider("Split pos 1", s.cascadeSplitPositions.y, 0.0f, 1.0f);
+                shadowsGroup.slider("Split pos 2", s.cascadeSplitPositions.z, 0.0f, 1.0f);
+                shadowsGroup.slider("Bias", s.shadowBias, 0.0f, 0.01f);
+                shadowsGroup.checkbox("Post-Process Shadow (debug)", s.postProcessShadow);
             }
         }
 
-        if (auto shadowGroup = g.group("Shadows")) {
-            shadowGroup.checkbox("Enable Shadows", mFilamentSettings.enableShadows);
-            if (mFilamentSettings.enableShadows) {
-                Gui::DropdownList shadowTypes = {{0, "PCF Hard"}, {1, "PCF Low (3x3)"}, {2, "VSM"}};
-                shadowGroup.dropdown("Shadow Type", shadowTypes, (uint32_t&)mFilamentSettings.shadowType);
-                shadowGroup.slider("Cascades", mFilamentSettings.shadowCascades, 1, 4);
-                shadowGroup.slider("Split 1", mFilamentSettings.cascadeSplits.x, 1.0f, 500.0f);
-                if (mFilamentSettings.shadowCascades >= 2)
-                    shadowGroup.slider("Split 2", mFilamentSettings.cascadeSplits.y, 1.0f, 500.0f);
-                if (mFilamentSettings.shadowCascades >= 3)
-                    shadowGroup.slider("Split 3", mFilamentSettings.cascadeSplits.z, 1.0f, 500.0f);
-                if (mFilamentSettings.shadowCascades >= 4)
-                    shadowGroup.slider("Split 4", mFilamentSettings.cascadeSplits.w, 1.0f, 500.0f);
-                shadowGroup.slider("Bias", mFilamentSettings.shadowBias, 0.0f, 0.01f);
-                shadowGroup.slider("Map Size", mFilamentSettings.shadowMapSize, 512u, 4096u);
-                shadowGroup.checkbox("Post-Process Shadow (debug)", mFilamentSettings.postProcessShadow);
+        if (auto fogGroup = g.group("Fog")) {
+            fogGroup.checkbox("Enable large-scale fog", s.enableFog);
+            fogGroup.slider("Start [m]", s.fogStart, 0.0f, 100.0f);
+            fogGroup.slider("Extinction [1/m]", s.fogDensity, 0.0f, 1.0f);
+            fogGroup.slider("Floor [m]", s.fogHeight, 0.0f, 100.0f);
+            fogGroup.slider("Height falloff [1/m]", s.fogHeightFalloff, 0.0f, 4.0f);
+            fogGroup.slider("Sun Scattering start [m]", s.fogInScatteringStart, 0.0f, 100.0f);
+            fogGroup.slider("Sun Scattering size", s.fogInScatteringSize, 0.1f, 100.0f);
+            fogGroup.checkbox("Exclude Skybox", s.fogExcludeSkybox);
+            Gui::DropdownList fogColorSources = {{0, "Constant"}, {1, "IBL"}, {2, "Skybox"}};
+            fogGroup.dropdown("Color##fogColor", fogColorSources, (uint32_t&)s.fogColorSource);
+            fogGroup.rgbColor("Color", s.fogColor);
+        }
+
+        if (auto sceneGroup = g.group("Scene")) {
+            sceneGroup.checkbox("Scale to unit cube", s.sceneAutoScaleEnabled);
+            sceneGroup.checkbox("Automatic instancing", s.sceneAutoInstancingEnabled);
+            sceneGroup.checkbox("Show skybox", s.sceneSkyboxEnabled);
+            sceneGroup.rgbColor("Background color", s.sceneBackgroundColor);
+            sceneGroup.checkbox("Ground shadow", s.sceneGroundPlaneEnabled);
+            if (s.sceneGroundPlaneEnabled)
+                sceneGroup.slider("Strength", s.sceneGroundShadowStrength, 0.0f, 1.0f);
+            if (mpScene && mpScene->getEnvMap()) {
+                if (auto envGroup = sceneGroup.group("Environment Map (Scene)"))
+                    mpScene->getEnvMap()->renderUI(envGroup);
             }
         }
 
-        if (mFilamentSettings.postProcessingEnabled) {
-            if (auto ppGroup = g.group("Post-processing")) {
-                
-                if (auto ssaoGroup = ppGroup.group("SSAO (Ambient Occlusion)")) {
-                    ssaoGroup.checkbox("Enable", mFilamentSettings.enableSSAO);
-                    if (mFilamentSettings.enableSSAO) {
-                        ssaoGroup.slider("Radius", mFilamentSettings.ssaoRadius, 0.01f, 2.0f);
-                        ssaoGroup.slider("Bias", mFilamentSettings.ssaoBias, 0.0f, 0.1f);
-                        ssaoGroup.slider("Power", mFilamentSettings.ssaoPower, 0.1f, 5.0f);
-                        ssaoGroup.slider("Intensity", mFilamentSettings.ssaoIntensity, 0.0f, 3.0f);
-                        ssaoGroup.slider("Samples", mFilamentSettings.ssaoSampleCount, 4, 64);
-                        ssaoGroup.slider("Spiral Turns", mFilamentSettings.ssaoSpiralTurns, 1, 15);
-                        ssaoGroup.slider("Resolution", mFilamentSettings.ssaoResolution, 0.25f, 1.0f);
-                        ssaoGroup.slider("Upsample Edge", mFilamentSettings.ssaoBilateralEdgeDistance, 0.01f, 1.0f);
-                        Gui::DropdownList aoModes = {{0, "SAO"}, {1, "GTAO"}};
-                        ssaoGroup.dropdown("AO Mode", aoModes, (uint32_t&)mFilamentSettings.ssaoMode);
-                        if (mFilamentSettings.ssaoMode == 1) {
-                            ssaoGroup.slider("GTAO Radius", mFilamentSettings.gtaoRadius, 0.05f, 2.0f);
-                            ssaoGroup.slider("GTAO Slices", mFilamentSettings.gtaoSlices, 1, 8);
-                            ssaoGroup.slider("GTAO Steps", mFilamentSettings.gtaoSteps, 1, 8);
-                            ssaoGroup.slider("GTAO Thickness", mFilamentSettings.gtaoThicknessHeuristic, 0.0f, 0.05f);
-                        }
-                    }
-                }
-                
-                if (auto bloomGroup = ppGroup.group("Bloom")) {
-                    bloomGroup.checkbox("Enable", mFilamentSettings.enableBloom);
-                    if (mFilamentSettings.enableBloom) {
-                        bloomGroup.slider("Strength", mFilamentSettings.bloomStrength, 0.0f, 1.0f);
-                        bloomGroup.slider("Threshold", mFilamentSettings.bloomThreshold, 0.0f, 10.0f);
-                        bloomGroup.slider("Levels", mFilamentSettings.bloomLevels, 1, 7);
-                        Gui::DropdownList blendModes = {{0, "Add"}, {1, "Screen"}};
-                        bloomGroup.dropdown("Blend Mode", blendModes, (uint32_t&)mFilamentSettings.bloomBlendMode);
-                    }
-                }
-                
-                if (auto dofGroup = ppGroup.group("Depth of Field")) {
-                    dofGroup.checkbox("Enable", mFilamentSettings.enableDoF);
-                    if (mFilamentSettings.enableDoF) {
-                        dofGroup.slider("Focal Distance", mFilamentSettings.dofFocalDistance, 0.1f, 100.0f);
-                        dofGroup.slider("Aperture", mFilamentSettings.dofAperture, 1.0f, 32.0f);
-                        dofGroup.slider("Max CoC", mFilamentSettings.dofMaxCoC, 1.0f, 32.0f);
-                    }
-                }
+        if (auto cameraGroup = g.group("Camera")) {
+            cameraGroup.slider("Focal length (mm)", s.cameraFocalLength, 16.0f, 90.0f);
+            cameraGroup.slider("Aperture", s.cameraAperture, 1.0f, 32.0f);
+            cameraGroup.slider("Speed (1/s)", s.cameraShutterSpeed, 1.0f, 1000.0f);
+            cameraGroup.slider("ISO", s.cameraSensitivity, 25.0f, 6400.0f);
+            cameraGroup.slider("Near", s.nearPlane, 0.001f, 1.0f);
+            cameraGroup.slider("Far", s.farPlane, 1.0f, 10000.0f);
 
-                if (auto fogGroup = ppGroup.group("Fog")) {
-                    fogGroup.checkbox("Enable", mFilamentSettings.enableFog);
-                    if (mFilamentSettings.enableFog) {
-                        fogGroup.slider("Density", mFilamentSettings.fogDensity, 0.0f, 0.2f);
-                        fogGroup.slider("Start", mFilamentSettings.fogStart, 0.0f, 100.0f);
-                        fogGroup.rgbColor("Color", mFilamentSettings.fogColor);
-                    }
-                }
-
-                if (auto ssrGroup = ppGroup.group("SSR (stub)")) {
-                    ssrGroup.checkbox("Enable", mFilamentSettings.enableSSR);
-                }
-
-                if (auto fsrGroup = ppGroup.group("FSR (RCAS)")) {
-                    fsrGroup.checkbox("Enable", mFilamentSettings.enableFSR);
-                    if (mFilamentSettings.enableFSR)
-                        fsrGroup.slider("Sharpness", mFilamentSettings.fsrSharpness, 0.0f, 2.0f);
-                }
-                
-                if (auto vigGroup = ppGroup.group("Vignette")) {
-                    vigGroup.checkbox("Enable", mFilamentSettings.enableVignette);
-                    if (mFilamentSettings.enableVignette) {
-                        vigGroup.slider("Midpoint", mFilamentSettings.vignetteMidpoint, 0.0f, 1.0f);
-                        vigGroup.slider("Roundness", mFilamentSettings.vignetteRoundness, 0.0f, 1.0f);
-                        vigGroup.slider("Feather", mFilamentSettings.vignetteFeather, 0.0f, 1.0f);
-                        vigGroup.rgbColor("Color", mFilamentSettings.vignetteColor);
-                    }
-                }
-
-                if (auto cgGroup = ppGroup.group("Color Grading")) {
-                    Gui::DropdownList tmModes = {{2, "Linear"}, {0, "ACES"}, {1, "Filmic"}, {3, "Display"}};
-                    cgGroup.dropdown("Tone Mapping", tmModes, (uint32_t&)mFilamentSettings.toneMapping);
-                    cgGroup.checkbox("3D LUT", mFilamentSettings.enableColorGradingLUT);
-                    if (mFilamentSettings.enableColorGradingLUT) {
-                        Gui::DropdownList lutSizes = {{16, "16"}, {32, "32"}};
-                        cgGroup.dropdown("LUT Size", lutSizes, (uint32_t&)mFilamentSettings.lutSize);
-                    }
-                    cgGroup.slider("Exposure (EV)", mFilamentSettings.exposure, -10.0f, 10.0f);
-                    cgGroup.slider("Contrast", mFilamentSettings.contrast, 0.0f, 2.0f);
-                    cgGroup.slider("Vibrance", mFilamentSettings.vibrance, 0.0f, 2.0f);
-                    cgGroup.slider("Saturation", mFilamentSettings.saturation, 0.0f, 2.0f);
-                }
+            if (auto dofGroup = cameraGroup.group("DoF")) {
+                dofGroup.checkbox("Enabled##dofEnabled", s.enableDoF);
+                dofGroup.slider("Focus distance", s.cameraFocusDistance, 0.0f, 30.0f);
+                s.dofFocalDistance = s.cameraFocusDistance;
+                dofGroup.slider("Blur scale", s.dofCocScale, 0.1f, 10.0f);
+                dofGroup.slider("CoC aspect-ratio", s.dofCocAspectRatio, 0.25f, 4.0f);
+                dofGroup.slider("Ring count", s.dofRingCount, 1, 17);
+                dofGroup.slider("Max CoC", s.dofMaxCoC, 1.0f, 32.0f);
+                dofGroup.checkbox("Native Resolution", s.dofNativeResolution);
+                dofGroup.checkbox("Median Filter", s.dofMedianFilter);
             }
+
+            if (auto vignetteGroup = cameraGroup.group("Vignette")) {
+                vignetteGroup.checkbox("Enabled##vignetteEnabled", s.enableVignette);
+                vignetteGroup.slider("Mid point", s.vignetteMidpoint, 0.0f, 1.0f);
+                vignetteGroup.slider("Roundness", s.vignetteRoundness, 0.0f, 1.0f);
+                vignetteGroup.slider("Feather", s.vignetteFeather, 0.0f, 1.0f);
+                vignetteGroup.rgbColor("Color##vignetteColor", s.vignetteColor);
+            }
+        }
+
+        if (auto debugGroup = g.group("Debug Options")) {
+            if (debugGroup.button("Skip 10 frames"))
+                mFrameCount += 10;
+        }
+
+        if (auto cgGroup = g.group("Color Grading")) {
+            cgGroup.checkbox("Enabled", s.colorGradingEnabled);
+            cgGroup.checkbox("Linked curves", s.colorGradingLinkedCurves);
+            cgGroup.checkbox("Luminance scaling", s.colorGradingLuminanceScaling);
+            cgGroup.checkbox("Gamut mapping", s.colorGradingGamutMapping);
+            cgGroup.slider("Quality", s.colorGradingQuality, 0, 3);
+            Gui::DropdownList tmModes = {{0, "LINEAR"}, {1, "ACES_LEGACY"}, {2, "ACES"}, {3, "FILMIC"}, {4, "AGX"}, {5, "GENERIC"}, {6, "PBR_NEUTRAL"}, {7, "GT7"}, {8, "DISPLAY_RANGE"}};
+            if (cgGroup.dropdown("Tone-mapping", tmModes, (uint32_t&)s.toneMappingFilament))
+                s.toneMapping = s.toneMappingFilament;
+            Gui::DropdownList customLuts = {{0, "None"}, {1, "Negative"}, {2, "Grayscale"}, {3, "Sepia"}, {4, "Teal and Orange"}};
+            cgGroup.dropdown("Custom LUT", customLuts, (uint32_t&)s.colorGradingCustomLut);
+            cgGroup.checkbox("3D LUT", s.enableColorGradingLUT);
+            if (s.enableColorGradingLUT) {
+                Gui::DropdownList lutSizes = {{16, "16"}, {32, "32"}};
+                cgGroup.dropdown("LUT Size", lutSizes, (uint32_t&)s.lutSize);
+            }
+            cgGroup.slider("Exposure", s.exposure, -10.0f, 10.0f);
+            cgGroup.slider("Night adaptation", s.nightAdaptation, 0.0f, 1.0f);
+            cgGroup.slider("Temperature", s.temperature, -1.0f, 1.0f);
+            cgGroup.slider("Tint", s.tint, -1.0f, 1.0f);
+            cgGroup.slider("Contrast", s.contrast, 0.0f, 2.0f);
+            cgGroup.slider("Vibrance", s.vibrance, 0.0f, 2.0f);
+            cgGroup.slider("Saturation", s.saturation, 0.0f, 2.0f);
         }
     }
 
@@ -1005,6 +1186,8 @@ struct PBRTOfflineRendererOptions
     bool headless = false;
     bool singleFrame = false;
     bool preview = false;
+    bool enableShadows = false;
+    bool disableSSAO = false;
     uint32_t debugView = 0;
     uint32_t width = 1920;
     uint32_t height = 1080;
@@ -1017,7 +1200,7 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
     for (int i = 1; i < argc; i++)
     {
         std::string a = argv[i];
-        if (a == "--scene" && i + 1 < argc)
+        if ((a == "--scene" || a == "path" || a == "--path") && i + 1 < argc)
             options.scenePath = argv[++i];
         else if (a == "--output" && i + 1 < argc)
             options.outputPath = argv[++i];
@@ -1025,6 +1208,10 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
             options.headless = true;
         else if (a == "--preview")
             options.preview = true;
+        else if (a == "--enable-shadows")
+            options.enableShadows = true;
+        else if (a == "--disable-ssao")
+            options.disableSSAO = true;
         else if (a == "--single-frame")
             options.singleFrame = true;
         else if (a == "--width" && i + 1 < argc)
@@ -1045,11 +1232,31 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
                 options.debugView = 4;
             else if (value == "ao")
                 options.debugView = 5;
+            else if (value == "shadow")
+                options.debugView = 6;
+            else if (value == "shadowmap" || value == "shadow-map")
+                options.debugView = 7;
+            else if (value == "shadow-cascade")
+                options.debugView = 8;
+            else if (value == "shadow-uv")
+                options.debugView = 9;
+            else if (value == "shadow-z")
+                options.debugView = 10;
+            else if (value == "shadow-delta")
+                options.debugView = 11;
             else
                 options.debugView = uint32_t(std::max(0, std::atoi(value.c_str())));
         }
         else if (a == "--inspect-instance" && i + 1 < argc)
             options.inspectInstanceIDs.push_back(uint32_t(std::max(0, std::atoi(argv[++i]))));
+        else if (options.scenePath.empty())
+        {
+            std::filesystem::path pathArg(a);
+            std::string ext = pathArg.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            if (ext == ".pbrt" || ext == ".pyscene")
+                options.scenePath = pathArg;
+        }
     }
     return options;
 }
@@ -1058,7 +1265,7 @@ int runMain(int argc, char** argv)
 {
     const auto options = parseArgs(argc, argv);
     SampleAppConfig c;
-    c.windowDesc.title = "PBRT Renderer - Falcor"; c.windowDesc.resizableWindow = true; c.windowDesc.width = options.width; c.windowDesc.height = options.height;
+    c.windowDesc.title = "PBRT Viewer - Falcor"; c.windowDesc.resizableWindow = true; c.windowDesc.width = options.width; c.windowDesc.height = options.height;
     c.headless = options.headless;
     c.showUI = !options.headless;
     PBRTOfflineRenderer app(c);
@@ -1069,6 +1276,10 @@ int runMain(int argc, char** argv)
         app.setHeadlessProbeMode(true);
     }
     app.setPreviewMode(options.preview);
+    if (options.enableShadows)
+        app.setEnableShadows(true);
+    if (options.disableSSAO)
+        app.setEnableSSAO(false);
     app.setScenePath(options.scenePath);
     app.setOutputPath(options.outputPath);
     app.setSingleFrame(options.singleFrame || options.headless);

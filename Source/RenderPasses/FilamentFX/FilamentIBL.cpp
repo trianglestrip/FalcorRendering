@@ -7,6 +7,7 @@
 using namespace math;
 
 #include <cmath>
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -321,7 +322,7 @@ void FilamentIBL::bindShaderVars(const ShaderVar& rootVar, const FilamentPostPro
     FALCOR_ASSERT(mpSpecularCubemap && mpDfgLut);
 
     auto cb = rootVar["FilamentIBLCB"];
-    cb["gIblLuminance"] = settings.iblIntensity;
+    cb["gIblLuminance"] = std::clamp(settings.iblIntensity, 0.0f, 10.0f);
     cb["gIblRoughnessOneLevel"] = mRoughnessOneLevel;
     cb["gIblRotation"] = settings.iblRotation;
     cb["gUseSH"] = mUseSH ? 1u : 0u;

@@ -31,10 +31,17 @@ GBufferOut psMain(VSOut vsOut, uint triangleIndex : SV_PrimitiveID)
 
     float nLen = length(sd.frame.N);
     float3 N = (nLen > 1e-5f) ? (sd.frame.N / nLen) : float3(0.0f, 1.0f, 0.0f);
-    float3 baseColor = saturate(props.diffuseReflectionAlbedo);
+    float3 diffuseAlbedo = saturate(props.diffuseReflectionAlbedo);
     float3 specularAlbedo = max(props.specularReflectionAlbedo, props.specularReflectance);
-    float roughness = saturate(props.roughness);
-    float3 f0 = max(props.specularReflectance, specularAlbedo * 0.04f);
+    float roughness = max(saturate(props.roughness), 0.045f);
+    float diffuseLum = dot(diffuseAlbedo, float3(0.2126f, 0.7152f, 0.0722f));
+    float specLum = dot(saturate(specularAlbedo), float3(0.2126f, 0.7152f, 0.0722f));
+    float metallic = saturate((specLum - 0.08f) / 0.72f) * (1.0f - saturate(diffuseLum * 4.0f));
+    float3 dielectricF0 = max(props.specularReflectance, float3(0.04f, 0.04f, 0.04f));
+    float3 baseColor = lerp(diffuseAlbedo, saturate(specularAlbedo), metallic);
+    if (dot(baseColor, float3(1.0f)) <= 1e-4f)
+        baseColor = float3(0.5f, 0.5f, 0.5f);
+    float3 f0 = saturate(lerp(dielectricF0, baseColor, metallic));
 
     GBufferOut out;
     out.baseColor = float4(baseColor, 1.0f);

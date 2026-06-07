@@ -22,11 +22,10 @@ int selectShadowCascade(float viewSpaceDepth, uint cascadeCount, float4 cascadeS
     return int(cascadeCount) - 1;
 }
 
-// D3D depth [0,1]: referenceDepth <= storedDepth means lit
 float shadowSample_PCF_Hard(Texture2D<float> shadowMap, SamplerState sampler, float2 shadowUV, float referenceDepth)
 {
     float depth = shadowMap.SampleLevel(sampler, shadowUV, 0).r;
-    return (referenceDepth <= depth + 1e-5) ? 1.0 : 0.0;
+    return (referenceDepth >= depth - 1e-5) ? 1.0 : 0.0;
 }
 
 // Castano 2013 - 3x3 gaussian PCF (manual taps, matches ShadowMap.cs.slang)
@@ -134,10 +133,10 @@ float evaluateShadowVisibility(
     float4 atlasRect = cascadeAtlasRect[cascade];
     float2 atlasUV = shadowUV * atlasRect.zw + atlasRect.xy;
 
-    if (atlasUV.x < 0.0 || atlasUV.x > 1.0 || atlasUV.y < 0.0 || atlasUV.y > 1.0)
+    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0 || lightSpacePos.z < 0.0 || lightSpacePos.z > 1.0)
         return 1.0;
 
-    float referenceDepth = lightSpacePos.z - shadowBias;
+    float referenceDepth = lightSpacePos.z + shadowBias;
 
     // Per-cascade tile resolution
     float2 tileSize = shadowAtlasSize * atlasRect.zw;

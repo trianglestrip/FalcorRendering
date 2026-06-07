@@ -1,4 +1,5 @@
 add_falcor_executable(PBRTOfflineRenderer)
+set_target_properties(PBRTOfflineRenderer PROPERTIES OUTPUT_NAME pbrt_viewer)
 
 target_include_directories(PBRTOfflineRenderer PRIVATE ${CMAKE_SOURCE_DIR}/third_party/taskflow)
 target_include_directories(PBRTOfflineRenderer PRIVATE ${CMAKE_SOURCE_DIR}/Source/RenderPasses/FilamentFX)
