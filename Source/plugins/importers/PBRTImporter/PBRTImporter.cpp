@@ -382,6 +382,7 @@ struct BuilderContext
 
     bool usePBRTMaterials = false;
     bool rotateImageTextures90 = false;
+    bool rotateImageTextures180 = false;
     bool flipTextureV = true;
     uint32_t plyIOConcurrency = 0;
     bool logPlyTiming = true;
@@ -460,7 +461,7 @@ float3 spectrumToRGB(const Spectrum& spectrum, SpectrumType spectrumType)
     }
 }
 
-Transform createPbrtImageTextureTransform(const ParameterDictionary& params, const FileLoc& loc, bool rotate90, bool flipTextureV)
+Transform createPbrtImageTextureTransform(const ParameterDictionary& params, const FileLoc& loc, bool rotate90, bool rotate180, bool flipTextureV)
 {
     Transform transform;
 
@@ -503,6 +504,11 @@ Transform createPbrtImageTextureTransform(const ParameterDictionary& params, con
         // The values below are the inverse of that complete sampling transform.
         transform.setScaling(float3(-1.f / vscale, 1.f / uscale, 1.f));
         transform.setRotation(math::quatFromAngleAxis(math::radians(90.f), float3(0.f, 0.f, 1.f)));
+        transform.setTranslation(float3((1.f - udelta) / uscale, (1.f - vdelta) / vscale, 0.f));
+    }
+    else if (rotate180)
+    {
+        transform.setScaling(float3(-1.f / uscale, -1.f / vscale, 1.f));
         transform.setTranslation(float3((1.f - udelta) / uscale, (1.f - vdelta) / vscale, 0.f));
     }
     else
@@ -962,7 +968,7 @@ inline Falcor::ref<Texture> loadImageMapTexture(
     }
     bool sRGB = (encoding == "sRGB");
 
-    outTransform = createPbrtImageTextureTransform(params, entity.loc, ctx.rotateImageTextures90, ctx.flipTextureV);
+    outTransform = createPbrtImageTextureTransform(params, entity.loc, ctx.rotateImageTextures90, ctx.rotateImageTextures180, ctx.flipTextureV);
     return Falcor::Texture::createFromFile(ctx.builder.getDevice(), path, generateMips, sRGB);
 }
 
@@ -2390,6 +2396,7 @@ void PBRTImporter::importScene(
         pbrt::BuilderContext ctx{pbrtScene, builder, pbrtResources};
         ctx.usePBRTMaterials = builder.getSettings().getOption("PBRTImporter:usePBRTMaterials", false);
         ctx.rotateImageTextures90 = builder.getSettings().getOption("PBRTImporter:rotateImageTextures90", false);
+        ctx.rotateImageTextures180 = builder.getSettings().getOption("PBRTImporter:rotateImageTextures180", false);
         ctx.flipTextureV = builder.getSettings().getOption("PBRTImporter:flipTextureV", true);
         ctx.plyIOConcurrency = builder.getSettings().getOption("PBRTImporter:plyIOConcurrency", 0);
         ctx.logPlyTiming = builder.getSettings().getOption("PBRTImporter:logPlyTiming", true);

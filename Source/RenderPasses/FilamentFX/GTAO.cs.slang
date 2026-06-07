@@ -47,22 +47,20 @@ float linearizeDepth(float depth)
 
 bool isSkyDepth(float depth)
 {
-    return depth > 0.9999;
+    return depth >= 1.0;
 }
 
-float sampleDepthLinear(float2 uv, float lod)
+float3 computeViewPosition(float2 uv, float depth)
 {
-    return linearizeDepth(gStructureDepth.SampleLevel(gPointSampler, uv, lod).r);
-}
-
-float3 computeViewSpacePositionFromDepth(float2 uv, float linearDepth)
-{
-    return float3((0.5 - uv) * gPositionParams * linearDepth, linearDepth);
+    float4 clip = float4(uv * 2.0 - 1.0, depth, 1.0);
+    float4 view = mul(clip, gInvProj);
+    return view.xyz / view.w;
 }
 
 float3 getViewSpacePosition(float2 uv, float level)
 {
-    return computeViewSpacePositionFromDepth(uv, sampleDepthLinear(uv, level));
+    float depth = gStructureDepth.SampleLevel(gPointSampler, uv, level).r;
+    return computeViewPosition(uv, depth);
 }
 
 float3 computeViewSpaceNormal(float2 uv, float depth, float3 position)
@@ -70,8 +68,8 @@ float3 computeViewSpaceNormal(float2 uv, float depth, float3 position)
     float2 texel = gResolution.zw;
     float2 uvx = uv + float2(texel.x, 0.0);
     float2 uvy = uv + float2(0.0, texel.y);
-    float3 px = computeViewSpacePositionFromDepth(uvx, sampleDepthLinear(uvx, 0.0));
-    float3 py = computeViewSpacePositionFromDepth(uvy, sampleDepthLinear(uvy, 0.0));
+    float3 px = getViewSpacePosition(uvx, 0.0);
+    float3 py = getViewSpacePosition(uvy, 0.0);
     return normalize(cross(px - position, py - position));
 }
 
@@ -181,14 +179,13 @@ void gtaoMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
 
-    float z = linearizeDepth(depth);
-    float3 origin = computeViewSpacePositionFromDepth(uv, z);
+    float3 origin = computeViewPosition(uv, depth);
     float3 normal = computeViewSpaceNormal(uv, depth, origin);
 
     float occlusion = gIntensity > 0.0 ? groundTruthAmbientOcclusion(uv, origin, normal) : 0.0;
     float aoVisibility = pow(saturate(1.0 - occlusion), gPower);
     aoVisibility = lerp(1.0, aoVisibility, gIntensity);
 
-    float packedZ = saturate(origin.z * gInvFarPlane);
+    float packedZ = saturate(abs(origin.z) * gInvFarPlane);
     gDst[dispatchThreadId.xy] = float2(saturate(aoVisibility), packedZ);
 }

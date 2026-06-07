@@ -15,11 +15,11 @@ static const float4 kClear = float4(0.1f, 0.1f, 0.12f, 1.f);
 
 namespace
 {
-    constexpr float kDefaultIblIntensityScale = 1.0f;
-    constexpr float kPreviewIblIntensityScale = 1.0f;
+    constexpr float kDefaultIblIntensityScale = 0.35f;
+    constexpr float kPreviewIblIntensityScale = 0.35f;
     constexpr float kPreviewAmbientIntensity = 0.0f;
-    constexpr float kDefaultSSAORadius = 0.3f;
-    constexpr float kDefaultSSAOIntensity = 1.0f;
+    constexpr float kDefaultSSAORadius = 0.65f;
+    constexpr float kDefaultSSAOIntensity = 2.0f;
 
     struct CascadeAtlasLayout { uint32_t cols; uint32_t rows; };
 
@@ -128,9 +128,9 @@ PBRTOfflineRenderer::PBRTOfflineRenderer(const SampleAppConfig& c) : SampleApp(c
     mFilamentSettings.forwardSSAO = true;
     mFilamentSettings.ssaoRadius = kDefaultSSAORadius;
     mFilamentSettings.ssaoIntensity = kDefaultSSAOIntensity;
-    mFilamentSettings.ssaoPower = 1.0f;
-    mFilamentSettings.ssaoResolution = 0.5f;
-    mFilamentSettings.ssaoSampleCount = 11;
+    mFilamentSettings.ssaoPower = 1.5f;
+    mFilamentSettings.ssaoResolution = 1.0f;
+    mFilamentSettings.ssaoSampleCount = 16;
     mFilamentSettings.iblIntensity = kDefaultIblIntensityScale;
     mFilamentSettings.sunIntensity = 0.f;
     mFilamentSettings.sunColor = float3(1.f, 0.95f, 0.85f);
@@ -165,9 +165,9 @@ void PBRTOfflineRenderer::setPreviewMode(bool enabled)
     mFilamentSettings.forwardSSAO = true;
     mFilamentSettings.ssaoRadius = kDefaultSSAORadius;
     mFilamentSettings.ssaoIntensity = kDefaultSSAOIntensity;
-    mFilamentSettings.ssaoPower = 1.0f;
-    mFilamentSettings.ssaoResolution = 0.5f;
-    mFilamentSettings.ssaoSampleCount = 11;
+    mFilamentSettings.ssaoPower = 1.5f;
+    mFilamentSettings.ssaoResolution = 1.0f;
+    mFilamentSettings.ssaoSampleCount = 16;
     mFilamentSettings.iblIntensity = kPreviewIblIntensityScale;
     mFilamentSettings.sunIntensity = 0.f;
     mFilamentSettings.enableShadows = false;
@@ -198,6 +198,7 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         Settings settings;
         settings.addOptions(nlohmann::json{
             {"PBRTImporter:rotateImageTextures90", false},
+            {"PBRTImporter:rotateImageTextures180", true},
             {"PBRTImporter:flipTextureV", true},
             {"PBRTImporter:usePBRTMaterials", true},
         });

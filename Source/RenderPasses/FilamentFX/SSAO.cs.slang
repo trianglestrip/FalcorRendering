@@ -55,7 +55,7 @@ float linearizeDepth(float depth)
 // D3D [0,1]: cleared background = 1 (far/sky)
 bool isSkyDepth(float depth)
 {
-    return depth > 0.9999;
+    return depth >= 1.0;
 }
 
 float sampleDepthLinear(float2 uv, float lod)
@@ -63,17 +63,17 @@ float sampleDepthLinear(float2 uv, float lod)
     return linearizeDepth(gStructureDepth.SampleLevel(gPointSampler, uv, lod).r);
 }
 
-// geometry.fs
-float3 computeViewSpacePositionFromDepth(float2 uv, float linearDepth)
-{
-    return float3((0.5 - uv) * gPositionParams * linearDepth, linearDepth);
-}
-
 float3 computeViewPosition(float2 uv, float depth)
 {
     float4 clip = float4(uv * 2.0 - 1.0, depth, 1.0);
     float4 view = mul(clip, gInvProj);
     return view.xyz / view.w;
+}
+
+float3 sampleViewPosition(float2 uv, float lod)
+{
+    float depth = gStructureDepth.SampleLevel(gPointSampler, uv, lod).r;
+    return computeViewPosition(uv, depth);
 }
 
 // ssaoUtils.fs
@@ -120,8 +120,7 @@ void computeAmbientOcclusionSAO(inout float occlusion, float i, float ssDiskRadi
     float level = clamp(floor(log2(ssRadius)) - kLog2LodRate, 0.0, float(gMaxLevel));
     float2 uvSample = uv + float2(ssRadius * tap.xy) * gResolution.zw;
 
-    float occlusionDepth = sampleDepthLinear(uvSample, level);
-    float3 p = computeViewSpacePositionFromDepth(uvSample, occlusionDepth);
+    float3 p = sampleViewPosition(uvSample, level);
 
     float3 v = p - origin;
     float vv = dot(v, v);
@@ -140,8 +139,8 @@ float3 computeViewSpaceNormalMediumQ(float2 uv, float3 position, float2 texel)
 {
     float2 uvdx = uv + float2(texel.x, 0.0);
     float2 uvdy = uv + float2(0.0, texel.y);
-    float3 px = computeViewSpacePositionFromDepth(uvdx, sampleDepthLinear(uvdx, 0.0));
-    float3 py = computeViewSpacePositionFromDepth(uvdy, sampleDepthLinear(uvdy, 0.0));
+    float3 px = sampleViewPosition(uvdx, 0.0);
+    float3 py = sampleViewPosition(uvdy, 0.0);
     float3 dpdx = px - position;
     float3 dpdy = py - position;
     return normalize(cross(dpdx, dpdy));
@@ -162,16 +161,16 @@ void ssaoMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
 
-    float linearDepth = linearizeDepth(depth);
-    float3 origin = computeViewSpacePositionFromDepth(uv, linearDepth);
+    float3 origin = computeViewPosition(uv, depth);
     float3 normal = computeViewSpaceNormalMediumQ(uv, origin, gResolution.zw);
 
     float noise = interleavedGradientNoise(coord);
     float2 tapPosition = startPosition(noise);
     float2x2 angleStep = tapAngleStep();
 
-    // saoImpl.fs: negative sign with view-space Z from linearized depth
-    float ssDiskRadius = -(gProjectionScaleRadius / origin.z);
+    // Falcor/D3D projection paths can produce either signed view-space Z convention.
+    // SAO only needs a positive screen-space disk radius.
+    float ssDiskRadius = gProjectionScaleRadius / max(abs(origin.z), 1e-4);
 
     float obscurance = 0.0;
     for (float i = 0.0; i < gSampleCount.x; i += 1.0)
@@ -184,7 +183,7 @@ void ssaoMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     float aoVisibility = pow(saturate(1.0 - obscurance), gPower);
 
     // Normalized view-space Z for bilateral depth rejection (Filament packs to gb; we store linear)
-    float packedZ = saturate(origin.z * gInvFarPlane);
+    float packedZ = saturate(abs(origin.z) * gInvFarPlane);
     gDst[dispatchThreadId.xy] = float2(aoVisibility, packedZ);
 }
 

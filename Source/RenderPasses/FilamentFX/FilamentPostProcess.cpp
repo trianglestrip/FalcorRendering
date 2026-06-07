@@ -547,7 +547,7 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
         }
         var["gDepth"] = pDepth;
         var["gStructureDepth"] = mpStructureDepth;
-        var["gDst"] = mpAOBuffer;
+        var["gDst"].setUav(mpAOBuffer->getUAV(0));
         var["gPointSampler"] = mpPointSampler;
 
         mpSSAOPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
@@ -578,7 +578,7 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
                 cb["gBlurKernel"][i] = kGaussianSamples[i];
         }
         var["gAOBuffer"] = blurInput;
-        var["gBlurredAO"] = blurOutputs[pass];
+        var["gBlurredAO"].setUav(blurOutputs[pass]->getUAV(0));
         var["gPointSampler"] = mpPointSampler;
 
         mpSSAOBlurPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
@@ -848,7 +848,7 @@ void FilamentPostProcess::executeGTAO(RenderContext* pRenderContext, const ref<T
         if (camCB.isValid())
             camCB["gInvProj"] = settings.invProj;
         var["gStructureDepth"] = mpStructureDepth;
-        var["gDst"] = mpAOBuffer;
+        var["gDst"].setUav(mpAOBuffer->getUAV(0));
         var["gPointSampler"] = mpPointSampler;
         mpGTAOPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
     }
@@ -877,7 +877,7 @@ void FilamentPostProcess::executeGTAO(RenderContext* pRenderContext, const ref<T
                 cb["gBlurKernel"][i] = kGaussianSamples[i];
         }
         var["gAOBuffer"] = blurInput;
-        var["gBlurredAO"] = blurOutputs[pass];
+        var["gBlurredAO"].setUav(blurOutputs[pass]->getUAV(0));
         var["gPointSampler"] = mpPointSampler;
         mpSSAOBlurPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
         blurInput = blurOutputs[pass];
