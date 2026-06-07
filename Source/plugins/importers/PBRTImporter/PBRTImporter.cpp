@@ -88,8 +88,12 @@
 
 #include <taskflow.hpp>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <limits>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -347,6 +351,8 @@ struct BuilderContext
     bool usePBRTMaterials = false;
     bool rotateImageTextures90 = false;
     bool flipTextureV = true;
+    uint32_t plyIOConcurrency = 0;
+    bool logPlyTiming = true;
     uint32_t nonConstantRoughnessFallbackCount = 0;
     uint32_t anisotropicRoughnessFallbackCount = 0;
 
@@ -1901,23 +1907,49 @@ void executePlyMeshPlan(BuilderContext& ctx, PlyMeshPlan& plan)
 
     tf::Taskflow taskflow;
     std::vector<tf::Task> geometryTasks(plan.geometryJobs.size());
+    const uint32_t hardwareThreads = (std::max)(2u, std::thread::hardware_concurrency());
+    const uint32_t defaultIOConcurrency = (std::min)(16u, (std::max)(4u, hardwareThreads / 2u));
+    const uint32_t ioConcurrency = ctx.plyIOConcurrency > 0 ? ctx.plyIOConcurrency : defaultIOConcurrency;
+    tf::Semaphore ioSemaphore(ioConcurrency);
+
+    std::atomic<uint64_t> loadMicros = 0;
+    std::atomic<uint64_t> processMicros = 0;
+    std::atomic<uint32_t> loadedResources = 0;
+    std::atomic<uint32_t> failedResources = 0;
+    std::atomic<uint32_t> processedMeshes = 0;
+    uint32_t usedResources = 0;
+
+    auto elapsedMicros = [](const std::chrono::steady_clock::time_point& start) -> uint64_t {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start
+        ).count();
+    };
 
     for (size_t i = 0; i < plan.geometryJobs.size(); ++i)
     {
         if (!plan.geometryJobs[i].used)
             continue;
+        usedResources++;
 
         geometryTasks[i] = taskflow.emplace([&, i]() {
+            const auto start = std::chrono::steady_clock::now();
             auto& geometry = plan.geometryJobs[i];
             if (!geometry.pResource)
                 return;
             geometry.valid = geometry.pResource->mesh.loaded || ::pbrtio::loadPbrtMeshResource(*geometry.pResource);
+            loadMicros.fetch_add(elapsedMicros(start), std::memory_order_relaxed);
+            if (geometry.valid)
+                loadedResources.fetch_add(1, std::memory_order_relaxed);
+            else
+                failedResources.fetch_add(1, std::memory_order_relaxed);
         });
+        geometryTasks[i].acquire(ioSemaphore).release(ioSemaphore);
     }
 
     for (size_t i = 0; i < plan.plyJobs.size(); ++i)
     {
         auto meshTask = taskflow.emplace([&, i]() {
+            const auto start = std::chrono::steady_clock::now();
             auto& job = plan.plyJobs[i];
             if (job.resourceIndex >= plan.geometryJobs.size()) return;
             const auto& geometry = plan.geometryJobs[job.resourceIndex];
@@ -1925,15 +1957,43 @@ void executePlyMeshPlan(BuilderContext& ctx, PlyMeshPlan& plan)
             const bool frontFaceCW = job.reverseOrientation;
             job.mesh = processPbrtMeshView(ctx.builder, geometry.pResource->mesh.name, geometry.pResource->mesh.view(), job.pMaterial, frontFaceCW);
             job.valid = true;
+            processMicros.fetch_add(elapsedMicros(start), std::memory_order_relaxed);
+            processedMeshes.fetch_add(1, std::memory_order_relaxed);
         });
         geometryTasks[plan.plyJobs[i].resourceIndex].precede(meshTask);
     }
 
-    tf::Executor executor(std::max(2u, std::thread::hardware_concurrency()));
+    tf::Executor executor(hardwareThreads);
     executor.run(taskflow).get();
 
+    const auto addStart = std::chrono::steady_clock::now();
+    uint32_t addedMeshes = 0;
     for (auto& job : plan.plyJobs)
-        if (job.valid) job.meshID = ctx.builder.addProcessedMesh(job.mesh);
+    {
+        if (job.valid)
+        {
+            job.meshID = ctx.builder.addProcessedMesh(job.mesh);
+            addedMeshes++;
+        }
+    }
+    const uint64_t addMicros = elapsedMicros(addStart);
+
+    if (ctx.logPlyTiming)
+    {
+        logInfo(
+            "PBRTImporter: PLY DAG resources={} jobs={} ioConcurrency={} loaded={} failed={} processed={} added={} loadSum={:.3f}ms processSum={:.3f}ms add={:.3f}ms",
+            usedResources,
+            plan.plyJobs.size(),
+            ioConcurrency,
+            loadedResources.load(std::memory_order_relaxed),
+            failedResources.load(std::memory_order_relaxed),
+            processedMeshes.load(std::memory_order_relaxed),
+            addedMeshes,
+            double(loadMicros.load(std::memory_order_relaxed)) / 1000.0,
+            double(processMicros.load(std::memory_order_relaxed)) / 1000.0,
+            double(addMicros) / 1000.0
+        );
+    }
 }
 
 bool instantiatePlannedPlyMesh(BuilderContext& ctx, const PlyMeshPlan& plan, const ShapeSceneEntity& entity)
@@ -2263,6 +2323,8 @@ void PBRTImporter::importScene(
         ctx.usePBRTMaterials = builder.getSettings().getOption("PBRTImporter:usePBRTMaterials", false);
         ctx.rotateImageTextures90 = builder.getSettings().getOption("PBRTImporter:rotateImageTextures90", false);
         ctx.flipTextureV = builder.getSettings().getOption("PBRTImporter:flipTextureV", true);
+        ctx.plyIOConcurrency = builder.getSettings().getOption("PBRTImporter:plyIOConcurrency", 0);
+        ctx.logPlyTiming = builder.getSettings().getOption("PBRTImporter:logPlyTiming", true);
         pbrt::buildScene(ctx);
         timeReport.measure("Building pbrt scene");
         timeReport.printToLog();
