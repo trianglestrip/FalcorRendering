@@ -25,11 +25,12 @@ public:
         bool dithering = true;
 
         // Light & IBL
-        float iblIntensity = 30000.0f;
+        float iblIntensity = 1.0f;
         float iblRotation = 0.0f;
-        float sunIntensity = 100000.0f;
+        float sunIntensity = 0.0f;
         float3 sunColor = float3(1.0f, 1.0f, 1.0f);
         float3 sunDirection = float3(0.0f, -1.0f, 0.0f);
+        float ambientIntensity = 0.0f;
 
         // Bloom
         bool enableBloom = false;

@@ -10,6 +10,10 @@ cbuffer PerFrameCB
 {
     uint2 gFrameDim;
     uint gSSAOEnabled;
+    float gSunIntensity;
+    float3 gSunColor;
+    float3 gSunDirection;
+    float gAmbientIntensity;
     uint gDebugView;
 };
 
@@ -96,5 +100,29 @@ float4 main(float2 texC : TEXCOORD) : SV_TARGET
     if (gDebugView == 5u) return float4(ao.xxx, 1.0f);
 
     float3 color = emissive + evaluateStableFilamentIBL(base.rgb, f0, perceptualRoughness, N, V, ao);
+    color += base.rgb * gAmbientIntensity;
+
+    float3 sunL = normalize(-gSunDirection);
+    float NoL = saturate(dot(N, sunL));
+    if (gSunIntensity > 0.0f && NoL > 0.0f)
+    {
+        float glossy = saturate(1.0f - roughness * 0.8f);
+        float specLum = dot(f0, float3(0.2126f, 0.7152f, 0.0722f));
+        float sunScale = min(gSunIntensity * 0.00001f, 3.0f);
+        float3 sunRadiance = gSunColor * sunScale;
+        color += base.rgb * sunRadiance * NoL;
+
+        if (specLum > 0.0f)
+        {
+            float3 H = normalize(sunL + V);
+            float NoH = saturate(dot(N, H));
+            float VoH = saturate(dot(V, H));
+            float specPower = lerp(8.0f, 160.0f, glossy);
+            float3 fresnel = f0 + (1.0f - f0) * pow(1.0f - VoH, 5.0f);
+            float spec = pow(NoH, specPower) * glossy * NoL;
+            color += fresnel * sunRadiance * spec * 0.5f;
+        }
+    }
+
     return float4(color, 1.0f);
 }

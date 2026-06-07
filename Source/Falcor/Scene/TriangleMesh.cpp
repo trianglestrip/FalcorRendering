@@ -35,6 +35,8 @@
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
 #include <cmath>
+#include <fstream>
+#include <sstream>
 
 namespace Falcor
 {
@@ -62,6 +64,214 @@ namespace Falcor
             if (!isFinite(v)) return fallback;
             const float len = length(v);
             return len > 1e-12f && std::isfinite(len) ? v / len : fallback;
+        }
+
+        struct PlyProperty
+        {
+            std::string type;
+            std::string name;
+        };
+
+        size_t getPlyScalarSize(const std::string& type)
+        {
+            if (type == "float" || type == "float32" || type == "int" || type == "int32" || type == "uint" || type == "uint32")
+                return 4;
+            if (type == "double" || type == "float64")
+                return 8;
+            if (type == "char" || type == "int8" || type == "uchar" || type == "uint8")
+                return 1;
+            if (type == "short" || type == "int16" || type == "ushort" || type == "uint16")
+                return 2;
+            return 0;
+        }
+
+        bool readPlyFloat(std::istream& stream, const std::string& type, float& value)
+        {
+            if (type == "float" || type == "float32")
+            {
+                stream.read(reinterpret_cast<char*>(&value), sizeof(float));
+                return bool(stream);
+            }
+            if (type == "double" || type == "float64")
+            {
+                double v = 0.0;
+                stream.read(reinterpret_cast<char*>(&v), sizeof(double));
+                value = static_cast<float>(v);
+                return bool(stream);
+            }
+
+            const size_t size = getPlyScalarSize(type);
+            if (size == 0) return false;
+            char discard[8] = {};
+            stream.read(discard, size);
+            value = 0.f;
+            return bool(stream);
+        }
+
+        bool readPlyIndex(std::istream& stream, const std::string& type, int32_t& value)
+        {
+            if (type == "int" || type == "int32")
+            {
+                stream.read(reinterpret_cast<char*>(&value), sizeof(int32_t));
+                return bool(stream);
+            }
+            if (type == "uint" || type == "uint32")
+            {
+                uint32_t v = 0;
+                stream.read(reinterpret_cast<char*>(&v), sizeof(uint32_t));
+                value = static_cast<int32_t>(v);
+                return bool(stream);
+            }
+
+            return false;
+        }
+
+        ref<TriangleMesh> tryCreateBinaryLittleEndianPly(const std::filesystem::path& path)
+        {
+            std::ifstream stream(path, std::ios::binary);
+            if (!stream) return nullptr;
+
+            std::string line;
+            if (!std::getline(stream, line) || line != "ply") return nullptr;
+
+            bool binaryLittleEndian = false;
+            bool inVertex = false;
+            bool hasFaceList = false;
+            size_t vertexCount = 0;
+            size_t faceCount = 0;
+            std::string faceCountType;
+            std::string faceIndexType;
+            std::vector<PlyProperty> vertexProperties;
+
+            while (std::getline(stream, line))
+            {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line == "end_header") break;
+
+                std::istringstream ls(line);
+                std::string token;
+                ls >> token;
+                if (token == "format")
+                {
+                    std::string format;
+                    ls >> format;
+                    binaryLittleEndian = format == "binary_little_endian";
+                }
+                else if (token == "element")
+                {
+                    std::string element;
+                    size_t count = 0;
+                    ls >> element >> count;
+                    inVertex = element == "vertex";
+                    if (element == "vertex") vertexCount = count;
+                    else if (element == "face") faceCount = count;
+                }
+                else if (token == "property")
+                {
+                    std::string type;
+                    ls >> type;
+                    if (inVertex)
+                    {
+                        std::string name;
+                        ls >> name;
+                        if (getPlyScalarSize(type) == 0) return nullptr;
+                        vertexProperties.push_back({type, name});
+                    }
+                    else if (type == "list")
+                    {
+                        std::string name;
+                        ls >> faceCountType >> faceIndexType >> name;
+                        hasFaceList = name == "vertex_indices" && faceCountType == "uint8" && (faceIndexType == "int" || faceIndexType == "int32");
+                    }
+                }
+            }
+
+            if (!binaryLittleEndian || vertexCount == 0 || faceCount == 0 || vertexProperties.empty() || !hasFaceList)
+                return nullptr;
+
+            TriangleMesh::VertexList vertices;
+            vertices.reserve(vertexCount);
+
+            for (size_t i = 0; i < vertexCount; ++i)
+            {
+                float3 position(0.f);
+                float3 normal(0.f, 1.f, 0.f);
+                float2 texCoord(0.f);
+
+                for (const auto& property : vertexProperties)
+                {
+                    float value = 0.f;
+                    if (!readPlyFloat(stream, property.type, value)) return nullptr;
+
+                    if (property.name == "x") position.x = value;
+                    else if (property.name == "y") position.y = value;
+                    else if (property.name == "z") position.z = value;
+                    else if (property.name == "nx") normal.x = value;
+                    else if (property.name == "ny") normal.y = value;
+                    else if (property.name == "nz") normal.z = value;
+                    else if (property.name == "u" || property.name == "s") texCoord.x = value;
+                    else if (property.name == "v" || property.name == "t") texCoord.y = value;
+                }
+
+                vertices.emplace_back(TriangleMesh::Vertex{
+                    position,
+                    safeNormalize(normal, float3(0.f, 1.f, 0.f)),
+                    isFinite(texCoord) ? texCoord : float2(0.f)
+                });
+            }
+
+            TriangleMesh::IndexList indices;
+            indices.reserve(faceCount * 3);
+            size_t skippedFaceCount = 0;
+            size_t skippedInvalidFaceCount = 0;
+
+            for (size_t faceIdx = 0; faceIdx < faceCount; ++faceIdx)
+            {
+                uint8_t count = 0;
+                stream.read(reinterpret_cast<char*>(&count), sizeof(uint8_t));
+                if (!stream) return nullptr;
+
+                std::vector<int32_t> faceIndices(count);
+                for (uint8_t i = 0; i < count; ++i)
+                {
+                    if (!readPlyIndex(stream, faceIndexType, faceIndices[i])) return nullptr;
+                }
+
+                if (count != 3)
+                {
+                    skippedFaceCount++;
+                    continue;
+                }
+
+                bool validFace = true;
+                for (uint8_t i = 0; i < 3; ++i)
+                {
+                    const int32_t index = faceIndices[i];
+                    if (index < 0 || static_cast<size_t>(index) >= vertices.size() || !isUsablePosition(vertices[index].position))
+                    {
+                        validFace = false;
+                        break;
+                    }
+                }
+                if (!validFace)
+                {
+                    skippedInvalidFaceCount++;
+                    continue;
+                }
+
+                for (uint8_t i = 0; i < 3; ++i)
+                    indices.emplace_back(static_cast<uint32_t>(faceIndices[i]));
+            }
+
+            if (indices.empty())
+                return nullptr;
+
+            if (skippedFaceCount > 0)
+                logDebug("Skipped {} non-triangle face(s) while loading binary PLY triangle mesh from '{}'.", skippedFaceCount, path);
+            if (skippedInvalidFaceCount > 0)
+                logDebug("Skipped {} face(s) with invalid vertex positions while loading binary PLY triangle mesh from '{}'.", skippedInvalidFaceCount, path);
+
+            return TriangleMesh::create(vertices, indices);
         }
     }
 
@@ -238,6 +448,12 @@ namespace Falcor
         flags |= is_set(importFlags, ImportFlags::JoinIdenticalVertices) ? aiProcess_JoinIdenticalVertices : 0;
 
         const aiScene* scene = nullptr;
+
+        if (hasExtension(path, "ply"))
+        {
+            if (auto pTriangleMesh = tryCreateBinaryLittleEndianPly(path))
+                return pTriangleMesh;
+        }
 
         if (hasExtension(path, "gz"))
         {

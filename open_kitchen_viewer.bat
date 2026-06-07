@@ -9,14 +9,13 @@ set "ROOT=%~dp0"
 set "EXE=%ROOT%build\windows-vs2022\bin\Release\PBRTOfflineRenderer.exe"
 set "SCENE=D:\models\pbrt-v4-scenes\zero-day\frame35.pbrt"
 
-if not exist "%EXE%" (
-    echo [INFO] PBRTOfflineRenderer.exe not found. Building...
-    call "%ROOT%build_pbrt_renderer.bat"
-    if errorlevel 1 (
-        echo [ERROR] Build failed.
-        pause
-        exit /b 1
-    )
+REM Always rebuild to pick up latest changes
+echo [INFO] Building PBRTOfflineRenderer...
+call "%ROOT%build_pbrt_renderer.bat"
+if errorlevel 1 (
+    echo [ERROR] Build failed.
+    pause
+    exit /b 1
 )
 
 if "%~1"=="" (

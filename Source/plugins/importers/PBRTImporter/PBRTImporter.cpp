@@ -59,7 +59,7 @@
  */
 
 #include "PBRTImporter.h"
-#include "EnvMapConverter.h"
+#include "mio.hpp"
 
 #include <pbrtio/Parser.h>
 #include <pbrtio/Builder.h>
@@ -87,13 +87,12 @@
 #include "Scene/Material/PBRT/PBRTDiffuseTransmissionMaterial.h"
 #include "Scene/Curves/CurveTessellation.h"
 
-#include <pybind11/pybind11.h>
-
 #include <taskflow.hpp>
 
 #include <cmath>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Falcor
 {
@@ -287,10 +286,9 @@ struct PlyGeometryJob
     bool used = false;
 };
 
-struct TopLevelPlyMeshPlan
+struct PlyMeshPlan
 {
-    std::vector<bool> usePlyResource;
-    std::vector<size_t> shapeToPlyJob;
+    std::unordered_map<const ShapeSceneEntity*, size_t> shapeToPlyJob;
     std::vector<PlyGeometryJob> geometryJobs;
     std::vector<PlyMeshJob> plyJobs;
 };
@@ -773,8 +771,6 @@ float3 getConductorSpecularAlbedo(
 
 Camera createCamera(BuilderContext& ctx, const CameraSceneEntity& entity)
 {
-    auto warnUnsupported = [&]() { warnUnsupportedType(entity.loc, "Camera", entity.name); };
-
     const auto& type = entity.name;
     const auto& params = entity.params;
 
@@ -782,8 +778,6 @@ Camera createCamera(BuilderContext& ctx, const CameraSceneEntity& entity)
 
     if (type == "perspective")
     {
-        // Parameters:
-        // Float lensradius, Float focaldistance, Float fov, Float frameaspectratio, Float[4] screenwindow
         warnUnsupportedParameters(params, {"screenwindow"});
 
         auto lensradius = params.getFloat("lensradius", 0.f);
@@ -810,23 +804,9 @@ Camera createCamera(BuilderContext& ctx, const CameraSceneEntity& entity)
         camera.pCamera = pCamera;
         camera.transform = toFalcor(entity.transform);
     }
-    else if (type == "orthographic")
+    else if (type == "orthographic" || type == "realistic" || type == "spherical")
     {
-        // Parameters:
-        // Float lensradius, Float focaldistance, Float frameaspectratio, Float[4] screenwindow
-        warnUnsupported();
-    }
-    else if (type == "realistic")
-    {
-        // Parameters:
-        // String lensfile, Float aperturediameter, Float focusdistance, String aperture
-        warnUnsupported();
-    }
-    else if (type == "spherical")
-    {
-        // Parameters:
-        // Float lensradius, Float focaldistance, Float frameaspectratio, Float[4] screenwindow, String mapping
-        warnUnsupported();
+        warnUnsupportedType(entity.loc, "Camera", entity.name);
     }
     else
     {
@@ -838,36 +818,15 @@ Camera createCamera(BuilderContext& ctx, const CameraSceneEntity& entity)
 
 Light createLight(BuilderContext& ctx, const LightSceneEntity& entity)
 {
-    auto warnUnsupported = [&]() { warnUnsupportedType(entity.loc, "Light", entity.name); };
-
     const auto& type = entity.name;
     const auto& params = entity.params;
 
     Light light;
 
-    if (type == "point")
+    // Unsupported light types.
+    if (type == "point" || type == "spot" || type == "goniometric" || type == "projection")
     {
-        // Parameters:
-        // Spectrum I, Float scale, Float power, Point3 from
-        warnUnsupported();
-    }
-    else if (type == "spot")
-    {
-        // Parameters:
-        // Spectrum I, Float scale, Float power, Float coneangle, Float conedeltaangle, Point3 from, Point3 to
-        warnUnsupported();
-    }
-    else if (type == "goniometric")
-    {
-        // Parameters:
-        // Spectrum I, Float scale, String filename, Float power
-        warnUnsupported();
-    }
-    else if (type == "projection")
-    {
-        // Parameters:
-        // Float scale, Float power, Float fov, String filename
-        warnUnsupported();
+        warnUnsupportedType(entity.loc, "Light", entity.name);
     }
     else if (type == "distant")
     {
@@ -919,15 +878,8 @@ Light createLight(BuilderContext& ctx, const LightSceneEntity& entity)
         else if (!filename.empty())
         {
             auto path = ctx.resolver(filename);
-            auto pOctTexture = Falcor::Texture::createFromFile(ctx.builder.getDevice(), path, false, false);
-            // TODO: Use equal-area octahedral parametrization when env map supports it.
-            logWarning(
-                entity.loc,
-                "Environment map is converted from equal-area octahedral to lat-long parametrization. Exact results cannot be expected."
-            );
-            EnvMapConverter envMapConverter(ctx.builder.getDevice());
-            auto pLatLongTexture = envMapConverter.convertEqualAreaOctToLatLong(ctx.builder.getDevice()->getRenderContext(), pOctTexture);
-            auto pEnvMap = Falcor::EnvMap::create(ctx.builder.getDevice(), pLatLongTexture);
+            auto pTexture = Falcor::Texture::createFromFile(ctx.builder.getDevice(), path, false, false);
+            auto pEnvMap = Falcor::EnvMap::create(ctx.builder.getDevice(), pTexture);
             pEnvMap->setIntensity(scale);
 
             float3 rotation;
@@ -945,10 +897,47 @@ Light createLight(BuilderContext& ctx, const LightSceneEntity& entity)
     return light;
 }
 
+// Shared imagemap loading: resolves filter, encoding, path, and creates the GPU texture.
+inline Falcor::ref<Texture> loadImageMapTexture(
+    BuilderContext& ctx, const TextureSceneEntity& entity, Transform& outTransform)
+{
+    const auto& params = entity.params;
+    warnUnsupportedParameters(params, {"maxanisotropy", "wrap", "invert"});
+
+    auto path = ctx.resolver(params.getString("filename", ""));
+
+    auto filter = params.getString("filter", "bilinear");
+    if (filter != "bilinear" && filter != "trilinear")
+    {
+        logWarning(entity.loc, "Filter '{}' is not currently supported, using 'bilinear' instead.", filter);
+        filter = "bilinear";
+    }
+    bool generateMips = (filter == "trilinear");
+
+    std::string defaultEncoding = hasExtension(path, "png") ? "sRGB" : "linear";
+    auto encoding = params.getString("encoding", defaultEncoding);
+    if (encoding != "linear" && encoding != "sRGB")
+    {
+        logWarning(entity.loc, "Encoding '{}' is not currently supported, using '{}' instead.", encoding, defaultEncoding);
+        encoding = defaultEncoding;
+    }
+    bool sRGB = (encoding == "sRGB");
+
+    outTransform = createPbrtImageTextureTransform(params, entity.loc, ctx.rotateImageTextures90, ctx.flipTextureV);
+    return Falcor::Texture::createFromFile(ctx.builder.getDevice(), path, generateMips, sRGB);
+}
+
+// Check if a type is in the unsupported set and emit warning.
+inline bool isUnsupportedTextureType(const std::string& type)
+{
+    static const std::unordered_set<std::string> kUnsupported = {
+        "mix", "directionmix", "bilerp", "checkerboard", "dots", "ptex",
+    };
+    return kUnsupported.count(type) > 0;
+}
+
 FloatTexture createFloatTexture(BuilderContext& ctx, const TextureSceneEntity& entity)
 {
-    auto warnUnsupported = [&]() { warnUnsupportedType(entity.loc, "Float texture", entity.name); };
-
     const auto& type = entity.name;
     const auto& params = entity.params;
 
@@ -960,14 +949,10 @@ FloatTexture createFloatTexture(BuilderContext& ctx, const TextureSceneEntity& e
 
     if (type == "constant")
     {
-        // Parameters:
-        // Float value
         floatTexture.texture = params.getFloat("value", 1.f);
     }
     else if (type == "scale")
     {
-        // Parameters:
-        // FloatTexture tex, FloatTexture scale
         const float scale = params.hasFloat("scale") ? params.getFloat("scale", 1.f) : 1.f;
         if (params.hasTexture("scale"))
             (void)params.getTexture("scale");
@@ -982,104 +967,26 @@ FloatTexture createFloatTexture(BuilderContext& ctx, const TextureSceneEntity& e
         {
             const auto texName = params.getTexture("tex");
             auto it = ctx.floatTextures.find(texName);
-            if (it != ctx.floatTextures.end())
-                floatTexture = it->second;
-            else
+            floatTexture = (it != ctx.floatTextures.end()) ? it->second : FloatTexture{};
+            if (it == ctx.floatTextures.end())
                 floatTexture.texture = scale;
         }
         else
         {
-                floatTexture.texture = scale;
+            floatTexture.texture = scale;
         }
 
         if (!scaleApplied && floatTexture.isConstant())
             floatTexture.texture = floatTexture.getConstant() * scale;
     }
-    else if (type == "mix")
-    {
-        // Parameters:
-        // FloatTexture tex1, FloatTexture tex2, FloatTexture amount
-        warnUnsupported();
-    }
-    else if (type == "directionmix")
-    {
-        // Parameters:
-        // FloatTexture tex1, FloatTexture tex2, Vector3 dir
-        warnUnsupported();
-    }
-    else if (type == "bilerp")
-    {
-        // Parameters:
-        // Float v00, Float v01, Float v10, Float v11
-        warnUnsupported();
-    }
     else if (type == "imagemap")
     {
-        // Parameters:
-        // Float maxanisotropy, String filter, String wrap
-        // Float scale, Bool invert
-        // String filename, String encoding
-        warnUnsupportedParameters(params, {"maxanisotropy", "wrap", "invert"});
-        const float imageScale = params.getFloat("scale", 1.f);
-        (void)imageScale;
-
-        auto path = ctx.resolver(params.getString("filename", ""));
-
-        auto filter = params.getString("filter", "bilinear");
-        // "ewa", "point" filter is not currently supported.
-        if (filter != "bilinear" && filter != "trilinear")
-        {
-            logWarning(entity.loc, "Filter '{}' is currently not supported, using 'bilinear' instead.", filter);
-            filter = "bilinear";
-        }
-        bool generateMips = filter == "trilinear";
-
-        std::string defaultEncoding = hasExtension(path, "png") ? "sRGB" : "linear";
-        auto encoding = params.getString("encoding", defaultEncoding);
-        // "gamma x" encoding is not currently supported.
-        if (encoding != "linear" && encoding != "sRGB")
-        {
-            logWarning(entity.loc, "Encoding '{}' is currently not supported, using '{}' instead.", encoding, defaultEncoding);
-            encoding = defaultEncoding;
-        }
-        bool sRGB = encoding == "sRGB";
-
-        floatTexture.transform = createPbrtImageTextureTransform(params, entity.loc, ctx.rotateImageTextures90, ctx.flipTextureV);
-        floatTexture.texture = Falcor::Texture::createFromFile(ctx.builder.getDevice(), path, generateMips, sRGB);
+        (void)params.getFloat("scale", 1.f);
+        floatTexture.texture = loadImageMapTexture(ctx, entity, floatTexture.transform);
     }
-    else if (type == "checkerboard")
+    else if (isUnsupportedTextureType(type) || type == "fbm" || type == "wrinkled" || type == "windy")
     {
-        // Parameters:
-        // FloatTexture tex1, FloatTexture tex2, Int dimension
-        warnUnsupported();
-    }
-    else if (type == "dots")
-    {
-        // Parameters:
-        // FloatTexture inside, FloatTexture outside
-        warnUnsupported();
-    }
-    else if (type == "fbm")
-    {
-        // Parameters:
-        // Int octaves, Float roughness
-        warnUnsupported();
-    }
-    else if (type == "wrinkled")
-    {
-        // Parameters:
-        // Int octaves, Float roughness
-        warnUnsupported();
-    }
-    else if (type == "windy")
-    {
-        warnUnsupported();
-    }
-    else if (type == "ptex")
-    {
-        // Parameters:
-        // String filename, String encoding, Float scale
-        warnUnsupported();
+        warnUnsupportedType(entity.loc, "Float texture", entity.name);
     }
     else
     {
@@ -1091,28 +998,22 @@ FloatTexture createFloatTexture(BuilderContext& ctx, const TextureSceneEntity& e
 
 SpectrumTexture createSpectrumTexture(BuilderContext& ctx, const TextureSceneEntity& entity)
 {
-    auto warnUnsupported = [&]() { warnUnsupportedType(entity.loc, "Spectrum texture", entity.name); };
-
     const auto& type = entity.name;
     const auto& params = entity.params;
 
     SpectrumTexture spectrumTexture;
-
     spectrumTexture.spectrumType = SpectrumType::Albedo;
+
     const float4x4 textureFromRender = toFalcor(entity.transform);
     if (textureFromRender != float4x4::identity())
         logWarning(entity.loc, "Texture transforms are currently not supported and ignored.");
 
     if (type == "constant")
     {
-        // Parameters:
-        // Spectrum value
         spectrumTexture.texture = params.getSpectrum("value", makePbrtSpectrum(float3(1.f)), ctx.resolver);
     }
     else if (type == "scale")
     {
-        // Parameters:
-        // SpectrumTexture tex, FloatTexture scale
         const float scale = params.hasFloat("scale") ? params.getFloat("scale", 1.f) : 1.f;
         if (params.hasTexture("scale"))
             (void)params.getTexture("scale");
@@ -1128,9 +1029,8 @@ SpectrumTexture createSpectrumTexture(BuilderContext& ctx, const TextureSceneEnt
         {
             const auto texName = params.getTexture("tex");
             auto it = ctx.spectrumTextures.find(texName);
-            if (it != ctx.spectrumTextures.end())
-                spectrumTexture = it->second;
-            else
+            spectrumTexture = (it != ctx.spectrumTextures.end()) ? it->second : SpectrumTexture{};
+            if (it == ctx.spectrumTextures.end())
                 spectrumTexture.texture = makePbrtSpectrum(float3(scale));
         }
         else
@@ -1142,85 +1042,18 @@ SpectrumTexture createSpectrumTexture(BuilderContext& ctx, const TextureSceneEnt
         if (!scaleApplied && spectrumTexture.isConstant())
             spectrumTexture.texture = makePbrtSpectrum(spectrumToRGB(spectrumTexture.getConstant(), spectrumTexture.spectrumType) * scale);
     }
-    else if (type == "mix")
-    {
-        // Parameters:
-        // SpectrumTexture tex1, SpectrumTexture tex2, FloatTexture amount
-        warnUnsupported();
-    }
-    else if (type == "directionmix")
-    {
-        // Parameters:
-        // SpectrumTexture tex1, SpectrumTexture tex2, Vector3 dir
-        warnUnsupported();
-    }
-    else if (type == "bilerp")
-    {
-        // Parameters:
-        // Spectrum v00, Spectrum v01, Spectrum v10, Spectrum v11
-        warnUnsupported();
-    }
     else if (type == "imagemap")
     {
-        // Parameters:
-        // Float maxanisotropy, String filter, String wrap
-        // Float scale, Bool invert
-        // String filename, String encoding
-        warnUnsupportedParameters(params, {"maxanisotropy", "wrap", "invert"});
-        const float imageScale = params.getFloat("scale", 1.f);
-        (void)imageScale;
-
-        auto path = ctx.resolver(params.getString("filename", ""));
-
-        auto filter = params.getString("filter", "bilinear");
-        // "ewa", "point" filter is not currently supported.
-        if (filter != "bilinear" && filter != "trilinear")
-        {
-            logWarning(entity.loc, "Filter '{}' is currently not supported, using 'bilinear' instead.", filter);
-            filter = "bilinear";
-        }
-        bool generateMips = filter == "trilinear";
-
-        std::string defaultEncoding = hasExtension(path, "png") ? "sRGB" : "linear";
-        auto encoding = params.getString("encoding", defaultEncoding);
-        // "gamma x" encoding is not currently supported.
-        if (encoding != "linear" && encoding != "sRGB")
-        {
-            logWarning(entity.loc, "Encoding '{}' is currently not supported, using '{}' instead.", encoding, defaultEncoding);
-            encoding = defaultEncoding;
-        }
-        bool sRGB = encoding == "sRGB";
-
-        spectrumTexture.transform = createPbrtImageTextureTransform(params, entity.loc, ctx.rotateImageTextures90, ctx.flipTextureV);
-        spectrumTexture.texture = Falcor::Texture::createFromFile(ctx.builder.getDevice(), path, generateMips, sRGB);
+        (void)params.getFloat("scale", 1.f);
+        spectrumTexture.texture = loadImageMapTexture(ctx, entity, spectrumTexture.transform);
     }
-    else if (type == "checkerboard")
+    else if (isUnsupportedTextureType(type) || type == "marble")
     {
-        // Parameters:
-        // SpectrumTexture tex1, SpectrumTexture tex2, Int dimension
-        warnUnsupported();
-    }
-    else if (type == "dots")
-    {
-        // Parameters:
-        // SpectrumTexture inside, SpectrumTexture outside
-        warnUnsupported();
-    }
-    else if (type == "marble")
-    {
-        // Parameters:
-        // Int octaves, Float roughness, Float scale, Float variation
-        warnUnsupported();
-    }
-    else if (type == "ptex")
-    {
-        // Parameters:
-        // String filename, String encoding, Float scale
-        warnUnsupported();
+        warnUnsupportedType(entity.loc, "Spectrum texture", entity.name);
     }
     else
     {
-        throwError(entity.loc, "Unknown float texture type '{}'.", type);
+        throwError(entity.loc, "Unknown spectrum texture type '{}'.", type);
     }
 
     return spectrumTexture;
@@ -1616,35 +1449,8 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
 
 Medium createMedium(BuilderContext& ctx, const MediumSceneEntity& entity)
 {
-    const auto& type = entity.params.getString("type", "");
-    const auto& params = entity.params;
-
-    auto warnUnsupported = [&]() { warnUnsupportedType(entity.loc, "Medium", type); };
-
-    Medium medium;
-
-    if (type == "homogeneous")
-    {
-        warnUnsupported();
-    }
-    else if (type == "uniformgrid")
-    {
-        warnUnsupported();
-    }
-    else if (type == "rgbgrid")
-    {
-        warnUnsupported();
-    }
-    else if (type == "cloud")
-    {
-        warnUnsupported();
-    }
-    else if (type == "nanovdb")
-    {
-        warnUnsupported();
-    }
-
-    return medium;
+    warnUnsupportedType(entity.loc, "Medium", entity.params.getString("type", ""));
+    return {};
 }
 
 void createAreaLight(BuilderContext& ctx, const SceneEntity& entity, const Falcor::ref<Falcor::Material>& pMaterial)
@@ -1855,11 +1661,15 @@ Shape createShape(BuilderContext& ctx, const ShapeSceneEntity& entity)
 
         auto filename = params.getString("filename", "");
         auto path = ctx.resolver(filename);
-
-        shape.pTriangleMesh = Falcor::TriangleMesh::createFromFile(path.string());
-        if (shape.pTriangleMesh)
-            shape.pTriangleMesh->setName(filename);
         shape.transform = toFalcor(entity.transform);
+
+        // Area-light plymeshes are emissive-only in PBRT; do not add visible geometry.
+        if (entity.lightIndex == -1)
+        {
+            shape.pTriangleMesh = Falcor::TriangleMesh::createFromFile(path.string());
+            if (shape.pTriangleMesh)
+                shape.pTriangleMesh->setName(filename);
+        }
     }
     else if (type == "loopsubdiv")
     {
@@ -1972,12 +1782,9 @@ std::string normalizedResourceKey(const std::filesystem::path& path)
     return path.lexically_normal().string();
 }
 
-TopLevelPlyMeshPlan collectTopLevelPlyMeshes(BuilderContext& ctx)
+PlyMeshPlan collectPlyMeshes(BuilderContext& ctx)
 {
-    const auto& shapes = ctx.scene.getShapes();
-    TopLevelPlyMeshPlan plan;
-    plan.usePlyResource.resize(shapes.size(), false);
-    plan.shapeToPlyJob.resize(shapes.size(), std::numeric_limits<size_t>::max());
+    PlyMeshPlan plan;
 
     std::unordered_map<std::string, ::pbrtio::PbrtResourceIndex> meshResourceMap;
     const auto meshResources = ctx.resources.getMeshResources();
@@ -1990,28 +1797,26 @@ TopLevelPlyMeshPlan collectTopLevelPlyMeshes(BuilderContext& ctx)
 
     std::unordered_map<PlyMeshKey, size_t, PlyMeshKeyHash> plyJobMap;
 
-    for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
+    auto addShape = [&](const ShapeSceneEntity& entity)
     {
-        const auto& entity = shapes[shapeIndex];
         if (entity.name != "plymesh" || entity.lightIndex != -1)
-            continue;
+            return;
 
         warnUnsupportedParameters(entity.params, {"displacement", "displacement.edgelength"});
-        plan.usePlyResource[shapeIndex] = true;
 
         auto filename = entity.params.getString("filename", "");
         if (filename.empty())
         {
             logWarning(entity.loc, "Missing plymesh filename. Skipping.");
-            continue;
+            return;
         }
 
         const auto path = ctx.resolver(filename);
         const auto geometryIt = meshResourceMap.find(normalizedResourceKey(path));
         if (geometryIt == meshResourceMap.end())
         {
-            logWarning(entity.loc, "PLY resource '{}' was not collected by pbrtio. Skipping.", filename);
-            continue;
+            logWarning(entity.loc, "PLY resource '{}' was not collected by pbrtio. Falling back to direct loading.", filename);
+            return;
         }
 
         const ::pbrtio::PbrtResourceIndex resourceIndex = geometryIt->second;
@@ -2021,10 +1826,10 @@ TopLevelPlyMeshPlan collectTopLevelPlyMeshes(BuilderContext& ctx)
         PlyMeshKey key{resourceIndex, pMaterial.get(), reverseOrientation};
         auto [it, inserted] = plyJobMap.emplace(key, plan.plyJobs.size());
         const size_t jobIndex = it->second;
-        plan.shapeToPlyJob[shapeIndex] = jobIndex;
+        plan.shapeToPlyJob.emplace(&entity, jobIndex);
 
         if (!inserted)
-            continue;
+            return;
 
         PlyMeshJob job;
         job.filename = filename;
@@ -2032,18 +1837,35 @@ TopLevelPlyMeshPlan collectTopLevelPlyMeshes(BuilderContext& ctx)
         job.pMaterial = pMaterial;
         job.reverseOrientation = reverseOrientation;
         plan.plyJobs.push_back(std::move(job));
+    };
+
+    for (const auto& entity : ctx.scene.getShapes())
+        addShape(entity);
+
+    std::unordered_set<std::string> usedInstanceDefinitions;
+    for (const auto& instance : ctx.scene.getInstances())
+        usedInstanceDefinitions.insert(instance.name);
+
+    for (const auto& [name, instanceDefinition] : ctx.scene.getInstanceDefinitions())
+    {
+        if (usedInstanceDefinitions.find(name) == usedInstanceDefinitions.end())
+            continue;
+
+        for (const auto& entity : instanceDefinition.shapes)
+            addShape(entity);
     }
 
     return plan;
 }
 
-void executePlyMeshGraph(BuilderContext& ctx, TopLevelPlyMeshPlan& plan)
+void executePlyMeshPlan(BuilderContext& ctx, PlyMeshPlan& plan)
 {
-    if (plan.geometryJobs.empty())
+    if (plan.geometryJobs.empty() || plan.plyJobs.empty())
         return;
 
     tf::Taskflow taskflow;
     std::vector<tf::Task> geometryTasks(plan.geometryJobs.size());
+
     for (size_t i = 0; i < plan.geometryJobs.size(); ++i)
     {
         if (!plan.geometryJobs[i].used)
@@ -2062,13 +1884,9 @@ void executePlyMeshGraph(BuilderContext& ctx, TopLevelPlyMeshPlan& plan)
     {
         auto meshTask = taskflow.emplace([&, i]() {
             auto& job = plan.plyJobs[i];
-            if (job.resourceIndex >= plan.geometryJobs.size())
-                return;
-
+            if (job.resourceIndex >= plan.geometryJobs.size()) return;
             auto pTriangleMesh = plan.geometryJobs[job.resourceIndex].pTriangleMesh;
-            if (!pTriangleMesh)
-                return;
-
+            if (!pTriangleMesh) return;
             const bool frontFaceCW = job.reverseOrientation ? !pTriangleMesh->getFrontFaceCW() : pTriangleMesh->getFrontFaceCW();
             job.mesh = processTriangleMesh(ctx.builder, pTriangleMesh, job.pMaterial, frontFaceCW);
             job.valid = true;
@@ -2076,55 +1894,44 @@ void executePlyMeshGraph(BuilderContext& ctx, TopLevelPlyMeshPlan& plan)
         geometryTasks[plan.plyJobs[i].resourceIndex].precede(meshTask);
     }
 
-    tf::Executor executor;
-    executor.run(taskflow).wait();
+    tf::Executor executor(std::max(2u, std::thread::hardware_concurrency()));
+    executor.run(taskflow).get();
 
     for (auto& job : plan.plyJobs)
-    {
-        if (job.valid)
-            job.meshID = ctx.builder.addProcessedMesh(job.mesh);
-    }
+        if (job.valid) job.meshID = ctx.builder.addProcessedMesh(job.mesh);
 }
 
-bool instantiatePlannedPlyMesh(BuilderContext& ctx, const TopLevelPlyMeshPlan& plan, size_t shapeIndex)
+bool instantiatePlannedPlyMesh(BuilderContext& ctx, const PlyMeshPlan& plan, const ShapeSceneEntity& entity)
 {
-    if (!plan.usePlyResource[shapeIndex])
+    const auto it = plan.shapeToPlyJob.find(&entity);
+    if (it == plan.shapeToPlyJob.end())
         return false;
 
-    const size_t jobIndex = plan.shapeToPlyJob[shapeIndex];
-    if (jobIndex == std::numeric_limits<size_t>::max())
-        return true;
-
+    const size_t jobIndex = it->second;
     const auto& job = plan.plyJobs[jobIndex];
     if (job.meshID.isValid())
     {
-        const auto& entity = ctx.scene.getShapes()[shapeIndex];
         auto nodeID = ctx.builder.addNode({job.filename, toFalcor(entity.transform)});
         ctx.builder.addMeshInstance(nodeID, job.meshID);
     }
     return true;
 }
 
-void createTopLevelShapes(BuilderContext& ctx)
+bool instantiatePlannedPlyMesh(
+    const PlyMeshPlan& plan,
+    const ShapeSceneEntity& entity,
+    InstanceDefinition& instanceDefinition
+)
 {
-    auto plan = collectTopLevelPlyMeshes(ctx);
-    executePlyMeshGraph(ctx, plan);
+    const auto it = plan.shapeToPlyJob.find(&entity);
+    if (it == plan.shapeToPlyJob.end())
+        return false;
 
-    const auto& shapes = ctx.scene.getShapes();
-    for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
-    {
-        if (instantiatePlannedPlyMesh(ctx, plan, shapeIndex))
-            continue;
+    const auto& job = plan.plyJobs[it->second];
+    if (job.meshID.isValid())
+        instanceDefinition.meshes.emplace_back(job.meshID, toFalcor(entity.transform));
 
-        const auto& entity = shapes[shapeIndex];
-        auto shape = createShape(ctx, entity);
-        if (shape.pTriangleMesh)
-        {
-            auto nodeID = ctx.builder.addNode({entity.name, shape.transform});
-            auto meshID = ctx.builder.addTriangleMesh(shape.pTriangleMesh, shape.pMaterial);
-            ctx.builder.addMeshInstance(nodeID, meshID);
-        }
-    }
+    return true;
 }
 
 /**
@@ -2214,12 +2021,15 @@ std::variant<Falcor::MeshID, Falcor::CurveID> createCurveGeometry(BuilderContext
     }
 }
 
-InstanceDefinition createInstanceDefinition(BuilderContext& ctx, const InstanceDefinitionSceneEntity& entity)
+InstanceDefinition createInstanceDefinition(BuilderContext& ctx, const InstanceDefinitionSceneEntity& entity, const PlyMeshPlan& plyPlan)
 {
     InstanceDefinition instanceDefinition;
 
     for (const auto& shapeEntity : entity.shapes)
     {
+        if (instantiatePlannedPlyMesh(plyPlan, shapeEntity, instanceDefinition))
+            continue;
+
         // Process shapes and create meshes.
         auto shape = createShape(ctx, shapeEntity);
         if (shape.pTriangleMesh)
@@ -2253,10 +2063,9 @@ InstanceDefinition createInstanceDefinition(BuilderContext& ctx, const InstanceD
 
 void buildScene(BuilderContext& ctx)
 {
-    // Load float textures.
+    // Load textures before materials because PBRT material parameters can reference named textures.
     for (const auto& [name, entity] : ctx.scene.getFloatTextures())
         ctx.floatTextures.emplace(name, createFloatTexture(ctx, entity));
-
     for (const auto& [name, entity] : ctx.scene.getSpectrumTextures())
         ctx.spectrumTextures.emplace(name, createSpectrumTexture(ctx, entity));
 
@@ -2264,28 +2073,22 @@ void buildScene(BuilderContext& ctx)
     for (const auto& entity : ctx.scene.getMedia())
         ctx.media.emplace(entity.name, createMedium(ctx, entity));
 
-    // Create named materials.
+    // Create materials before geometry because mesh processing needs material texture transforms.
     for (const auto& [name, entity] : ctx.scene.getNamedMaterials())
         ctx.namedMaterials.emplace(name, createMaterial(ctx, entity));
-
-    // Create unnamed materials.
     for (const auto& entity : ctx.scene.getMaterials())
         ctx.materials.push_back(createMaterial(ctx, entity));
 
     if (ctx.nonConstantRoughnessFallbackCount > 0)
-    {
         logInfo(
             "PBRTImporter: {} material roughness values are texture/non-constant and are currently approximated as constant roughness 0.5.",
             ctx.nonConstantRoughnessFallbackCount
         );
-    }
     if (ctx.anisotropicRoughnessFallbackCount > 0)
-    {
         logInfo(
             "PBRTImporter: {} anisotropic roughness values are currently approximated with the average of u/v roughness.",
             ctx.anisotropicRoughnessFallbackCount
         );
-    }
 
     // Create camera.
     auto camera = createCamera(ctx, ctx.scene.getCamera());
@@ -2317,9 +2120,27 @@ void buildScene(BuilderContext& ctx)
         }
     }
 
-    createTopLevelShapes(ctx);
+    // Create shared PLY geometry for top-level and instanced shapes.
+    auto plan = collectPlyMeshes(ctx);
+    executePlyMeshPlan(ctx, plan);
 
-    // Create curves from curve aggregates assembled during the processing step above.
+    const auto& shapes = ctx.scene.getShapes();
+    for (size_t shapeIndex = 0; shapeIndex < shapes.size(); ++shapeIndex)
+    {
+        const auto& entity = shapes[shapeIndex];
+        if (instantiatePlannedPlyMesh(ctx, plan, entity))
+            continue;
+
+        auto shape = createShape(ctx, entity);
+        if (shape.pTriangleMesh)
+        {
+            auto nodeID = ctx.builder.addNode({entity.name, shape.transform});
+            auto meshID = ctx.builder.addTriangleMesh(shape.pTriangleMesh, shape.pMaterial);
+            ctx.builder.addMeshInstance(nodeID, meshID);
+        }
+    }
+
+    // Create curves from curve aggregates assembled during shape processing.
     for (const auto& [_, curveAggregate] : ctx.curveAggregates)
     {
         auto nodeID = ctx.builder.addNode({"curves", curveAggregate.transform});
@@ -2339,7 +2160,7 @@ void buildScene(BuilderContext& ctx)
     }
     ctx.curveAggregates.clear();
 
-    auto getInstanceDefinition = [&ctx](const InstanceSceneEntity& entity)
+    auto getInstanceDefinition = [&ctx, &plan](const InstanceSceneEntity& entity)
     {
         auto it = ctx.instanceDefinitions.find(entity.name);
         if (it == ctx.instanceDefinitions.end())
@@ -2349,7 +2170,7 @@ void buildScene(BuilderContext& ctx)
             {
                 throwError(entity.loc, "Object instance '{}' not defined.", entity.name);
             }
-            it = ctx.instanceDefinitions.emplace(entity.name, createInstanceDefinition(ctx, it2->second)).first;
+            it = ctx.instanceDefinitions.emplace(entity.name, createInstanceDefinition(ctx, it2->second, plan)).first;
         }
         return it->second;
     };
@@ -2360,14 +2181,12 @@ void buildScene(BuilderContext& ctx)
         const auto& instanceDefinition = getInstanceDefinition(entity);
         auto instanceTransform = toFalcor(entity.transform);
 
-        // Instantiate meshes.
         for (const auto& [meshID, transform] : instanceDefinition.meshes)
         {
             auto nodeID = ctx.builder.addNode({"instance", mul(instanceTransform, transform)});
             ctx.builder.addMeshInstance(nodeID, meshID);
         }
 
-        // Instantiate curves.
         for (const auto& [curveID, transform] : instanceDefinition.curves)
         {
             auto nodeID = ctx.builder.addNode({"instance_curve", mul(instanceTransform, transform)});

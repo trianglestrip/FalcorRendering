@@ -262,6 +262,10 @@ static void addShape(const BasicScene& scene, const ShapeSceneEntity& shape,
     if (shape.name != "plymesh") {
         return;
     }
+    // Area-light carrier plymeshes are lights in PBRT, not renderable scene geometry.
+    if (shape.lightIndex >= 0) {
+        return;
+    }
     const auto filename = shape.params.getString("filename", "");
     if (filename.empty()) {
         return;

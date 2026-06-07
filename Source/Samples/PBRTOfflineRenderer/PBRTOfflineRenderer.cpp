@@ -16,6 +16,8 @@ static const float4 kClear = float4(0.1f, 0.1f, 0.12f, 1.f);
 namespace
 {
     constexpr float kDefaultIblIntensityScale = 1.0f;
+    constexpr float kPreviewIblIntensityScale = 1.0f;
+    constexpr float kPreviewAmbientIntensity = 0.0f;
     constexpr float kDefaultSSAORadius = 0.3f;
     constexpr float kDefaultSSAOIntensity = 1.0f;
 
@@ -131,8 +133,10 @@ PBRTOfflineRenderer::PBRTOfflineRenderer(const SampleAppConfig& c) : SampleApp(c
     mFilamentSettings.ssaoSampleCount = 11;
     mFilamentSettings.iblIntensity = kDefaultIblIntensityScale;
     mFilamentSettings.sunIntensity = 0.f;
+    mFilamentSettings.sunColor = float3(1.f, 0.95f, 0.85f);
+    mFilamentSettings.sunDirection = normalize(float3(0.3f, 1.f, 0.5f));
     mFilamentSettings.enableShadows = false;
-    mFilamentSettings.exposure = -1.0f;
+    mFilamentSettings.exposure = 0.0f;
     mFilamentSettings.toneMapping = 0; // ACES
     buildTaskGraph();
 }
@@ -164,11 +168,12 @@ void PBRTOfflineRenderer::setPreviewMode(bool enabled)
     mFilamentSettings.ssaoPower = 1.0f;
     mFilamentSettings.ssaoResolution = 0.5f;
     mFilamentSettings.ssaoSampleCount = 11;
-    mFilamentSettings.iblIntensity = kDefaultIblIntensityScale;
+    mFilamentSettings.iblIntensity = kPreviewIblIntensityScale;
     mFilamentSettings.sunIntensity = 0.f;
     mFilamentSettings.enableShadows = false;
-    mFilamentSettings.exposure = -1.0f; // ~ f/8, 1/125s, ISO 100
-    mFilamentSettings.toneMapping = 0; // ACES (Filament ColorGrading::ToneMapping::ACES)
+    mFilamentSettings.exposure = 0.0f;
+    mFilamentSettings.toneMapping = 0; // ACES
+    mFilamentSettings.ambientIntensity = kPreviewAmbientIntensity;
 }
 
 void PBRTOfflineRenderer::onLoad(RenderContext* pCtx)
@@ -213,6 +218,8 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         // Enable emissive lights and build light collection (needed for PBRT area lights)
         mpScene->getRenderSettings().useEmissiveLights = true;
         mpScene->getLightCollection(pCtx);
+
+        initSunFromScene();
 
         logInfo("Scene OK. Geometry: {}, Lights: a={}, e={}, env={}",
             mpScene->getGeometryCount(), mpScene->useAnalyticLights(),
@@ -694,6 +701,14 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
                     perFrameCB["gFrameDim"] = frameDim;
                 if (perFrameCB.findMember("gDebugView").isValid())
                     perFrameCB["gDebugView"] = mDebugView;
+                if (perFrameCB.findMember("gSunIntensity").isValid())
+                    perFrameCB["gSunIntensity"] = mFilamentSettings.sunIntensity;
+                if (perFrameCB.findMember("gSunColor").isValid())
+                    perFrameCB["gSunColor"] = mFilamentSettings.sunColor;
+                if (perFrameCB.findMember("gSunDirection").isValid())
+                    perFrameCB["gSunDirection"] = normalize(mFilamentSettings.sunDirection);
+                if (perFrameCB.findMember("gAmbientIntensity").isValid())
+                    perFrameCB["gAmbientIntensity"] = mFilamentSettings.ambientIntensity;
             }
             root["gBaseColor"] = mpGBufferBaseColor;
             root["gNormalW"] = mpGBufferNormalW;
@@ -710,7 +725,7 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     mpLightingPass->execute(pCtx, pLightingFbo);
 
     // Sync FilamentSettings to FilamentPostProcess pass
-    if (mpFilamentPostProcess && mFilamentSettings.postProcessingEnabled)
+    if (mpFilamentPostProcess && mFilamentSettings.postProcessingEnabled && mDebugView == 0)
     {
         const ref<Texture> pMotionVec = (mFilamentSettings.antiAliasing == 2) ? mpVelocityTexture : nullptr;
         mpFilamentPostProcess->executeCustom(pCtx, mpIntermediateTexture, mpIntermediateDepth, mpPostProcessOutput, mFilamentSettings,
@@ -773,13 +788,13 @@ void PBRTOfflineRenderer::buildTaskGraph()
 
 void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
 {
-    Gui::Window w(pGui, "PBRT Renderer", {300, 200});
+    Gui::Window w(pGui, "PBRT Renderer", {380, 700});
     if (mpScene) { w.text(fmt::format("Scene: {}", mScenePath.filename().string())); w.text(fmt::format("Geometry: {}", mpScene->getGeometryCount())); }
     else w.text("No scene. Drag .pbrt file or use --scene <path>");
     w.text(fmt::format("Frame: {}", mFrameCount));
     if (w.button("Save Screenshot")) { if (mOutputPath.empty()) { mOutputPath = mScenePath; mOutputPath.replace_extension(".exr"); } saveOutput(getRenderContext()); }
     
-    if (auto g = w.group("Filament Settings"))
+    if (auto g = w.group("Filament Settings", true))
     {
         if (auto viewGroup = g.group("View")) {
             viewGroup.checkbox("Post-processing", mFilamentSettings.postProcessingEnabled);
@@ -939,7 +954,6 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
         }
     }
 
-    renderGlobalUI(pGui);
 }
 
 bool PBRTOfflineRenderer::onKeyEvent(const KeyboardEvent& e)
@@ -991,7 +1005,7 @@ struct PBRTOfflineRendererOptions
     bool preview = false;
     uint32_t debugView = 0;
     uint32_t width = 1920;
-    uint32_t height = 840;
+    uint32_t height = 1080;
     std::vector<uint32_t> inspectInstanceIDs;
 };
 
