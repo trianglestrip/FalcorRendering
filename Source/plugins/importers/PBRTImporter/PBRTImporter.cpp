@@ -59,7 +59,6 @@
  */
 
 #include "PBRTImporter.h"
-#include "mio.hpp"
 
 #include <pbrtio/Parser.h>
 #include <pbrtio/Builder.h>
@@ -282,7 +281,8 @@ struct PlyMeshJob
 struct PlyGeometryJob
 {
     std::filesystem::path path;
-    Falcor::ref<Falcor::TriangleMesh> pTriangleMesh;
+    ::pbrtio::PbrtMeshResource* pResource = nullptr;
+    bool valid = false;
     bool used = false;
 };
 
@@ -326,7 +326,7 @@ struct BuilderContext
 {
     BasicScene& scene;
     SceneBuilder& builder;
-    const ::pbrtio::PbrtLoadedScene& resources;
+    ::pbrtio::PbrtLoadedScene& resources;
 
     std::map<std::string, FloatTexture> floatTextures;
     std::map<std::string, SpectrumTexture> spectrumTextures;
@@ -1777,6 +1777,41 @@ Falcor::SceneBuilder::ProcessedMesh processTriangleMesh(
     return builder.processMesh(mesh);
 }
 
+Falcor::SceneBuilder::ProcessedMesh processPbrtMeshView(
+    const SceneBuilder& builder,
+    const std::string& name,
+    ::pbrtio::PbrtMeshView view,
+    const Falcor::ref<Falcor::Material>& pMaterial,
+    bool frontFaceCW
+)
+{
+    static_assert(sizeof(::pbrtio::pbrt::float2) == sizeof(Falcor::float2));
+    static_assert(sizeof(::pbrtio::pbrt::float3) == sizeof(Falcor::float3));
+
+    FALCOR_CHECK(!view.positions.empty(), "'positions' is missing");
+    FALCOR_CHECK(!view.indices.empty(), "'indices' is missing");
+    FALCOR_CHECK(view.indices.size() % 3 == 0, "'indices' must contain complete triangles");
+    FALCOR_CHECK(pMaterial != nullptr, "'pMaterial' is missing");
+
+    Falcor::SceneBuilder::Mesh mesh;
+    mesh.name = name;
+    mesh.faceCount = (uint32_t)(view.indices.size() / 3);
+    mesh.vertexCount = (uint32_t)view.positions.size();
+    mesh.indexCount = (uint32_t)view.indices.size();
+    mesh.pIndices = view.indices.data();
+    mesh.topology = Vao::Topology::TriangleList;
+    mesh.isFrontFaceCW = frontFaceCW;
+    mesh.pMaterial = pMaterial;
+
+    mesh.positions = {reinterpret_cast<const float3*>(view.positions.data()), SceneBuilder::Mesh::AttributeFrequency::Vertex};
+    if (view.normals.size() == view.positions.size())
+        mesh.normals = {reinterpret_cast<const float3*>(view.normals.data()), SceneBuilder::Mesh::AttributeFrequency::Vertex};
+    if (view.texcoords.size() == view.positions.size())
+        mesh.texCrds = {reinterpret_cast<const float2*>(view.texcoords.data()), SceneBuilder::Mesh::AttributeFrequency::Vertex};
+
+    return builder.processMesh(mesh);
+}
+
 std::string normalizedResourceKey(const std::filesystem::path& path)
 {
     return path.lexically_normal().string();
@@ -1787,11 +1822,12 @@ PlyMeshPlan collectPlyMeshes(BuilderContext& ctx)
     PlyMeshPlan plan;
 
     std::unordered_map<std::string, ::pbrtio::PbrtResourceIndex> meshResourceMap;
-    const auto meshResources = ctx.resources.getMeshResources();
+    auto& meshResources = ctx.resources.meshResources;
     plan.geometryJobs.resize(meshResources.size());
     for (::pbrtio::PbrtResourceIndex i = 0; i < meshResources.size(); ++i)
     {
         plan.geometryJobs[i].path = meshResources[i].plyPath;
+        plan.geometryJobs[i].pResource = &meshResources[i];
         meshResourceMap.emplace(normalizedResourceKey(meshResources[i].plyPath), i);
     }
 
@@ -1873,10 +1909,9 @@ void executePlyMeshPlan(BuilderContext& ctx, PlyMeshPlan& plan)
 
         geometryTasks[i] = taskflow.emplace([&, i]() {
             auto& geometry = plan.geometryJobs[i];
-            auto pTriangleMesh = Falcor::TriangleMesh::createFromFile(geometry.path.string());
-            if (pTriangleMesh)
-                pTriangleMesh->setName(geometry.path.filename().string());
-            geometry.pTriangleMesh = pTriangleMesh;
+            if (!geometry.pResource)
+                return;
+            geometry.valid = geometry.pResource->mesh.loaded || ::pbrtio::loadPbrtMeshResource(*geometry.pResource);
         });
     }
 
@@ -1885,10 +1920,10 @@ void executePlyMeshPlan(BuilderContext& ctx, PlyMeshPlan& plan)
         auto meshTask = taskflow.emplace([&, i]() {
             auto& job = plan.plyJobs[i];
             if (job.resourceIndex >= plan.geometryJobs.size()) return;
-            auto pTriangleMesh = plan.geometryJobs[job.resourceIndex].pTriangleMesh;
-            if (!pTriangleMesh) return;
-            const bool frontFaceCW = job.reverseOrientation ? !pTriangleMesh->getFrontFaceCW() : pTriangleMesh->getFrontFaceCW();
-            job.mesh = processTriangleMesh(ctx.builder, pTriangleMesh, job.pMaterial, frontFaceCW);
+            const auto& geometry = plan.geometryJobs[job.resourceIndex];
+            if (!geometry.valid || !geometry.pResource || !geometry.pResource->mesh.loaded) return;
+            const bool frontFaceCW = job.reverseOrientation;
+            job.mesh = processPbrtMeshView(ctx.builder, geometry.pResource->mesh.name, geometry.pResource->mesh.view(), job.pMaterial, frontFaceCW);
             job.valid = true;
         });
         geometryTasks[plan.plyJobs[i].resourceIndex].precede(meshTask);
@@ -1909,11 +1944,11 @@ bool instantiatePlannedPlyMesh(BuilderContext& ctx, const PlyMeshPlan& plan, con
 
     const size_t jobIndex = it->second;
     const auto& job = plan.plyJobs[jobIndex];
-    if (job.meshID.isValid())
-    {
-        auto nodeID = ctx.builder.addNode({job.filename, toFalcor(entity.transform)});
-        ctx.builder.addMeshInstance(nodeID, job.meshID);
-    }
+    if (!job.meshID.isValid())
+        return false;
+
+    auto nodeID = ctx.builder.addNode({job.filename, toFalcor(entity.transform)});
+    ctx.builder.addMeshInstance(nodeID, job.meshID);
     return true;
 }
 
@@ -1928,8 +1963,10 @@ bool instantiatePlannedPlyMesh(
         return false;
 
     const auto& job = plan.plyJobs[it->second];
-    if (job.meshID.isValid())
-        instanceDefinition.meshes.emplace_back(job.meshID, toFalcor(entity.transform));
+    if (!job.meshID.isValid())
+        return false;
+
+    instanceDefinition.meshes.emplace_back(job.meshID, toFalcor(entity.transform));
 
     return true;
 }

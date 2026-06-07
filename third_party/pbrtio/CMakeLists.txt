@@ -38,5 +38,6 @@ set(SRCS
 include_directories(${PUBLIC_HDR_DIR})
 add_library(${TARGET} STATIC ${PUBLIC_HDRS} ${SRCS})
 target_include_directories(${TARGET} PUBLIC ${PUBLIC_HDR_DIR} ${PBRTIO_GLM_INCLUDE_DIR})
+target_include_directories(${TARGET} PRIVATE ${PBRTIO_THIRD_PARTY_DIR}/taskflow)
 target_compile_features(${TARGET} PUBLIC cxx_std_20)
 set_target_properties(${TARGET} PROPERTIES FOLDER Libs)

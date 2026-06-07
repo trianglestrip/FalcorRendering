@@ -38,8 +38,34 @@ struct PbrtMeshInstance {
     pbrt::float4 baseColorUvTransform{ 1.f, 1.f, 0.f, 0.f };
 };
 
+struct PbrtMeshView {
+    std::span<const pbrt::float3> positions;
+    std::span<const pbrt::float3> normals;
+    std::span<const pbrt::float2> texcoords;
+    std::span<const uint32_t> indices;
+};
+
+struct PbrtMeshData {
+    std::string name;
+    std::vector<pbrt::float3> positions;
+    std::vector<pbrt::float3> normals;
+    std::vector<pbrt::float2> texcoords;
+    std::vector<uint32_t> indices;
+    bool loaded = false;
+
+    PbrtMeshView view() const {
+        return PbrtMeshView{
+            std::span<const pbrt::float3>(positions),
+            std::span<const pbrt::float3>(normals),
+            std::span<const pbrt::float2>(texcoords),
+            std::span<const uint32_t>(indices),
+        };
+    }
+};
+
 struct PbrtMeshResource {
     std::filesystem::path plyPath;
+    PbrtMeshData mesh;
 };
 
 struct PbrtImageResource {
@@ -121,10 +147,21 @@ struct PbrtLoadedScene {
     std::span<const PbrtMeshInstance> getMeshes() const { return meshes; }
 };
 
+struct PbrtLoadOptions {
+    bool loadMeshes = true;
+    uint32_t workerCount = 0;
+};
+
 /** Collect renderer-neutral scene/resource references from an already parsed PBRT scene. */
 void collectPbrtScene(const pbrt::BasicScene& scene, PbrtLoadedScene& out);
 
+/** Load mesh/image resource data referenced by a collected PBRT scene. */
+bool loadPbrtSceneResources(PbrtLoadedScene& scene, const PbrtLoadOptions& options = {});
+
+/** Load one mesh resource into owned CPU memory. */
+bool loadPbrtMeshResource(PbrtMeshResource& resource);
+
 /** Parse PBRT file into scene description (meshes, lights, camera). */
-bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out);
+bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out, const PbrtLoadOptions& options = {});
 
 } // namespace pbrtio

@@ -8,13 +8,308 @@
 #include <pbrtio/Parser.h>
 #include <pbrtio/PbrtSpectrum.h>
 
+#include <mio.hpp>
+#include <taskflow.hpp>
+
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstring>
 #include <cmath>
+#include <sstream>
+#include <string_view>
+#include <system_error>
+#include <thread>
 #include <unordered_map>
 
 namespace pbrtio {
 
 using namespace pbrtio::pbrt;
+
+namespace {
+
+constexpr float kMaxImportedPositionMagnitude = 1e4f;
+
+struct PlyProperty {
+    std::string type;
+    std::string name;
+};
+
+bool isFinite(const float2& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y);
+}
+
+bool isFinite(const float3& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
+bool isUsablePosition(const float3& p) {
+    return isFinite(p) && glm::all(glm::lessThan(glm::abs(p), float3(kMaxImportedPositionMagnitude)));
+}
+
+float3 safeNormalize(const float3& v, const float3& fallback) {
+    if (!isFinite(v)) return fallback;
+    const float len = length(v);
+    return len > 1e-12f && std::isfinite(len) ? v / len : fallback;
+}
+
+size_t getPlyScalarSize(const std::string& type) {
+    if (type == "float" || type == "float32" || type == "int" || type == "int32" || type == "uint" || type == "uint32")
+        return 4;
+    if (type == "double" || type == "float64")
+        return 8;
+    if (type == "char" || type == "int8" || type == "uchar" || type == "uint8")
+        return 1;
+    if (type == "short" || type == "int16" || type == "ushort" || type == "uint16")
+        return 2;
+    return 0;
+}
+
+template<typename T>
+bool readScalar(const char*& cursor, const char* end, T& value) {
+    if (static_cast<size_t>(end - cursor) < sizeof(T)) return false;
+    std::memcpy(&value, cursor, sizeof(T));
+    cursor += sizeof(T);
+    return true;
+}
+
+bool skipScalar(const char*& cursor, const char* end, const std::string& type) {
+    const size_t size = getPlyScalarSize(type);
+    if (size == 0 || static_cast<size_t>(end - cursor) < size) return false;
+    cursor += size;
+    return true;
+}
+
+bool readPlyFloat(const char*& cursor, const char* end, const std::string& type, float& value) {
+    if (type == "float" || type == "float32")
+        return readScalar(cursor, end, value);
+    if (type == "double" || type == "float64") {
+        double v = 0.0;
+        if (!readScalar(cursor, end, v)) return false;
+        value = static_cast<float>(v);
+        return true;
+    }
+
+    value = 0.f;
+    return skipScalar(cursor, end, type);
+}
+
+bool readPlyListCount(const char*& cursor, const char* end, const std::string& type, uint32_t& value) {
+    if (type == "uchar" || type == "uint8") {
+        uint8_t v = 0;
+        if (!readScalar(cursor, end, v)) return false;
+        value = v;
+        return true;
+    }
+    if (type == "char" || type == "int8") {
+        int8_t v = 0;
+        if (!readScalar(cursor, end, v)) return false;
+        if (v < 0) return false;
+        value = static_cast<uint32_t>(v);
+        return true;
+    }
+    if (type == "ushort" || type == "uint16") {
+        uint16_t v = 0;
+        if (!readScalar(cursor, end, v)) return false;
+        value = v;
+        return true;
+    }
+    if (type == "short" || type == "int16") {
+        int16_t v = 0;
+        if (!readScalar(cursor, end, v)) return false;
+        if (v < 0) return false;
+        value = static_cast<uint32_t>(v);
+        return true;
+    }
+    if (type == "uint" || type == "uint32") {
+        uint32_t v = 0;
+        if (!readScalar(cursor, end, v)) return false;
+        value = v;
+        return true;
+    }
+    if (type == "int" || type == "int32") {
+        int32_t v = 0;
+        if (!readScalar(cursor, end, v)) return false;
+        if (v < 0) return false;
+        value = static_cast<uint32_t>(v);
+        return true;
+    }
+    return false;
+}
+
+bool readPlyIndex(const char*& cursor, const char* end, const std::string& type, int32_t& value) {
+    if (type == "int" || type == "int32")
+        return readScalar(cursor, end, value);
+    if (type == "uint" || type == "uint32") {
+        uint32_t v = 0;
+        if (!readScalar(cursor, end, v)) return false;
+        if (v > static_cast<uint32_t>((std::numeric_limits<int32_t>::max)())) return false;
+        value = static_cast<int32_t>(v);
+        return true;
+    }
+    if (type == "short" || type == "int16") {
+        int16_t v = 0;
+        if (!readScalar(cursor, end, v)) return false;
+        value = v;
+        return true;
+    }
+    if (type == "ushort" || type == "uint16") {
+        uint16_t v = 0;
+        if (!readScalar(cursor, end, v)) return false;
+        value = v;
+        return true;
+    }
+    return false;
+}
+
+std::string_view trimLine(std::string_view line) {
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    return line;
+}
+
+bool loadBinaryLittleEndianPly(const std::filesystem::path& path, PbrtMeshData& mesh) {
+    std::error_code error;
+#ifdef _WIN32
+    auto mapping = mio::make_mmap_source(path.wstring(), error);
+#else
+    auto mapping = mio::make_mmap_source(path.string(), error);
+#endif
+    if (error || !mapping.is_open() || mapping.empty()) return false;
+
+    const char* data = mapping.data();
+    const char* end = data + mapping.size();
+    const char* cursor = data;
+
+    auto nextLine = [&]() -> std::string_view {
+        if (cursor >= end) return {};
+        const char* begin = cursor;
+        while (cursor < end && *cursor != '\n') ++cursor;
+        const char* lineEnd = cursor;
+        if (cursor < end && *cursor == '\n') ++cursor;
+        return trimLine(std::string_view(begin, static_cast<size_t>(lineEnd - begin)));
+    };
+
+    if (nextLine() != "ply") return false;
+
+    bool binaryLittleEndian = false;
+    bool inVertex = false;
+    bool hasFaceList = false;
+    size_t vertexCount = 0;
+    size_t faceCount = 0;
+    std::string faceCountType;
+    std::string faceIndexType;
+    std::vector<PlyProperty> vertexProperties;
+
+    while (cursor < end) {
+        const std::string line(nextLine());
+        if (line == "end_header") break;
+
+        std::istringstream ls(line);
+        std::string token;
+        ls >> token;
+        if (token == "format") {
+            std::string format;
+            ls >> format;
+            binaryLittleEndian = format == "binary_little_endian";
+        } else if (token == "element") {
+            std::string element;
+            size_t count = 0;
+            ls >> element >> count;
+            inVertex = element == "vertex";
+            if (element == "vertex") vertexCount = count;
+            else if (element == "face") faceCount = count;
+        } else if (token == "property") {
+            std::string type;
+            ls >> type;
+            if (inVertex) {
+                std::string name;
+                ls >> name;
+                if (getPlyScalarSize(type) == 0) return false;
+                vertexProperties.push_back({type, name});
+            } else if (type == "list") {
+                std::string name;
+                ls >> faceCountType >> faceIndexType >> name;
+                hasFaceList = name == "vertex_indices";
+            }
+        }
+    }
+
+    if (!binaryLittleEndian || vertexCount == 0 || faceCount == 0 || vertexProperties.empty() || !hasFaceList)
+        return false;
+
+    PbrtMeshData result;
+    result.name = path.filename().string();
+    result.positions.reserve(vertexCount);
+    result.normals.reserve(vertexCount);
+    result.texcoords.reserve(vertexCount);
+
+    for (size_t i = 0; i < vertexCount; ++i) {
+        float3 position(0.f);
+        float3 normal(0.f, 1.f, 0.f);
+        float2 texCoord(0.f);
+
+        for (const auto& property : vertexProperties) {
+            float value = 0.f;
+            if (!readPlyFloat(cursor, end, property.type, value)) return false;
+
+            if (property.name == "x") position.x = value;
+            else if (property.name == "y") position.y = value;
+            else if (property.name == "z") position.z = value;
+            else if (property.name == "nx") normal.x = value;
+            else if (property.name == "ny") normal.y = value;
+            else if (property.name == "nz") normal.z = value;
+            else if (property.name == "u" || property.name == "s") texCoord.x = value;
+            else if (property.name == "v" || property.name == "t") texCoord.y = value;
+        }
+
+        result.positions.push_back(position);
+        result.normals.push_back(safeNormalize(normal, float3(0.f, 1.f, 0.f)));
+        result.texcoords.push_back(isFinite(texCoord) ? texCoord : float2(0.f));
+    }
+
+    result.indices.reserve(faceCount * 3);
+    for (size_t faceIdx = 0; faceIdx < faceCount; ++faceIdx) {
+        uint32_t count = 0;
+        if (!readPlyListCount(cursor, end, faceCountType, count)) return false;
+
+        std::array<int32_t, 16> localFaceIndices{};
+        std::vector<int32_t> largeFaceIndices;
+        int32_t* faceIndices = localFaceIndices.data();
+        if (count > localFaceIndices.size()) {
+            largeFaceIndices.resize(count);
+            faceIndices = largeFaceIndices.data();
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!readPlyIndex(cursor, end, faceIndexType, faceIndices[i])) return false;
+        }
+        if (count < 3) continue;
+
+        bool validFace = true;
+        for (uint32_t i = 0; i < count; ++i) {
+            const int32_t index = faceIndices[i];
+            if (index < 0 || static_cast<size_t>(index) >= result.positions.size() ||
+                    !isUsablePosition(result.positions[index])) {
+                validFace = false;
+                break;
+            }
+        }
+        if (!validFace) continue;
+
+        for (uint32_t i = 1; i + 1 < count; ++i) {
+            result.indices.push_back(static_cast<uint32_t>(faceIndices[0]));
+            result.indices.push_back(static_cast<uint32_t>(faceIndices[i]));
+            result.indices.push_back(static_cast<uint32_t>(faceIndices[i + 1]));
+        }
+    }
+
+    if (result.positions.empty() || result.indices.empty()) return false;
+
+    result.loaded = true;
+    mesh = std::move(result);
+    return true;
+}
+
+} // namespace
 
 static float3 spectrumToColor(const Spectrum& spectrum) {
     return spectrumToRGB(spectrum);
@@ -47,7 +342,7 @@ static void extractCamera(const BasicScene& scene, float sceneRadius, PbrtCamera
     const int yres = film.params.getInt("yresolution", 720);
     camera.aspectRatio = yres > 0 ? static_cast<float>(xres) / static_cast<float>(yres) : (16.f / 9.f);
 
-    const float radius = std::max(sceneRadius, 0.1f);
+    const float radius = (std::max)(sceneRadius, 0.1f);
     camera.nearPlane = radius * 0.01f;
     camera.farPlane = radius * 20.f;
 }
@@ -140,7 +435,7 @@ static bool tryAddRectAreaLight(const BasicScene& scene, const ShapeSceneEntity&
     }
 
     PbrtRectAreaLight areaMesh;
-    const size_t vertexCount = std::min(worldPoints.size(), size_t(4));
+    const size_t vertexCount = (std::min)(worldPoints.size(), size_t(4));
     for (size_t i = 0; i < vertexCount; ++i) {
         areaMesh.positions[i] = worldPoints[i];
     }
@@ -367,15 +662,15 @@ void collectPbrtScene(const BasicScene& scene, PbrtLoadedScene& out) {
     for (const auto& mesh : out.meshes) {
         const float4 t = mesh.transform[3];
         const float3 p(t.x, t.y, t.z);
-        bmin = glm::min(bmin, p);
-        bmax = glm::max(bmax, p);
+        bmin = (glm::min)(bmin, p);
+        bmax = (glm::max)(bmax, p);
     }
     if (out.meshes.empty()) {
         out.sceneCenter = float3(0.f);
         out.sceneRadius = 1.f;
     } else {
         out.sceneCenter = (bmin + bmax) * 0.5f;
-        out.sceneRadius = std::max(length(bmax - bmin) * 0.5f, 0.5f);
+        out.sceneRadius = (std::max)(length(bmax - bmin) * 0.5f, 0.5f);
     }
 
     extractCamera(scene, out.sceneRadius, out.camera);
@@ -390,7 +685,35 @@ void collectPbrtScene(const BasicScene& scene, PbrtLoadedScene& out) {
     }
 }
 
-bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out) {
+bool loadPbrtMeshResource(PbrtMeshResource& resource) {
+    resource.mesh = {};
+    if (resource.plyPath.empty()) return false;
+    return loadBinaryLittleEndianPly(resource.plyPath, resource.mesh);
+}
+
+bool loadPbrtSceneResources(PbrtLoadedScene& scene, const PbrtLoadOptions& options) {
+    if (!options.loadMeshes || scene.meshResources.empty()) {
+        return true;
+    }
+
+    tf::Taskflow taskflow;
+    std::atomic_bool ok = true;
+    for (auto& resource : scene.meshResources) {
+        taskflow.emplace([&resource, &ok]() {
+            if (!loadPbrtMeshResource(resource)) {
+                ok = false;
+            }
+        });
+    }
+
+    const uint32_t hardwareWorkers = (std::max)(1u, std::thread::hardware_concurrency());
+    const uint32_t workerCount = options.workerCount > 0 ? options.workerCount : hardwareWorkers;
+    tf::Executor executor((std::max)(1u, workerCount));
+    executor.run(taskflow).get();
+    return ok.load();
+}
+
+bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out, const PbrtLoadOptions& options) {
     if (!std::filesystem::exists(pbrtPath)) {
         return false;
     }
@@ -400,6 +723,9 @@ bool loadPbrtScene(const std::filesystem::path& pbrtPath, PbrtLoadedScene& out) 
     parseFile(builder, pbrtPath);
 
     collectPbrtScene(scene, out);
+    if (!loadPbrtSceneResources(out, options)) {
+        return false;
+    }
     return !out.meshes.empty();
 }
 
