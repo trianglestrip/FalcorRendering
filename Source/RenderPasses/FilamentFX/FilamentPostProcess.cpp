@@ -27,6 +27,7 @@ namespace
     const char kFXAAShader[] = "RenderPasses/FilamentFX/FXAA.cs.slang";
     const char kStructureShader[] = "RenderPasses/FilamentFX/StructurePass.cs.slang";
     const char kSSAOShader[] = "RenderPasses/FilamentFX/SSAO.cs.slang";
+    const char kDeferredSSAOShader[] = "RenderPasses/FilamentFX/DeferredSSAO.cs.slang";
     const char kShadowMapShader[] = "RenderPasses/FilamentFX/ShadowMap.cs.slang";
     const char kShadowEVSMShader[] = "RenderPasses/FilamentFX/ShadowEVSM.cs.slang";
     const char kDoFShader[] = "RenderPasses/FilamentFX/DoF.cs.slang";
@@ -197,6 +198,11 @@ FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& 
     ssaoDesc.addShaderLibrary(kSSAOShader).csEntry("ssaoMain");
     ssaoDesc.addCompilerArguments({"-Wno-30081"});
     mpSSAOPass = ComputePass::create(mpDevice, ssaoDesc, defines);
+
+    ProgramDesc deferredSSAODesc;
+    deferredSSAODesc.addShaderLibrary(kDeferredSSAOShader).csEntry("deferredSSAO");
+    deferredSSAODesc.addCompilerArguments({"-Wno-30081"});
+    mpDeferredSSAOPass = ComputePass::create(mpDevice, deferredSSAODesc, defines);
 
     ProgramDesc ssaoBlurDesc;
     ssaoBlurDesc.addShaderLibrary(kSSAOShader).csEntry("ssaoBlur");
@@ -586,6 +592,96 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
     }
 }
 
+void FilamentPostProcess::executeDeferredSSAOInternal(RenderContext* pRenderContext, const ref<Texture>& pDepth, const ref<Texture>& pNormalW, const FilamentSettings& settings)
+{
+    if (!mpDeferredSSAOPass || !mpSSAOBlurPass || !pDepth || !pNormalW || !mpStructureDepth) return;
+
+    const uint2 fullResolution = uint2(pDepth->getWidth(), pDepth->getHeight());
+    updateAOTextures(mpDevice, fullResolution.x, fullResolution.y, settings.ssaoResolution);
+    const uint2 resolution = uint2(mAOBufferWidth, mAOBufferHeight);
+
+    const AOQualityParams quality = getAOQualityParams(settings);
+    float sampleCount = quality.sampleCount;
+    float radius = settings.ssaoRadius;
+    float invRadiusSquared = 1.0f / (radius * radius);
+    float angleInc = (2.0f * 3.14159265f) / (sampleCount - 0.5f) * quality.spiralTurns;
+
+    float2 posParams = settings.positionParams;
+    float projectionScale = getProjectionScale(posParams, resolution);
+    float projectionScaleRadius = projectionScale * radius;
+
+    float peak = 0.1f * radius;
+    float peak2 = peak * peak;
+    float intensity = (6.283185307f * peak * settings.ssaoIntensity) / sampleCount;
+    float power = settings.ssaoPower * 2.0f;
+
+    {
+        auto var = mpDeferredSSAOPass->getRootVar();
+        auto cb = var["PerFrameCB"];
+        if (cb.isValid())
+        {
+            cb["gResolution"] = float4((float)resolution.x, (float)resolution.y, 1.f / resolution.x, 1.f / resolution.y);
+            cb["gPositionParams"] = posParams;
+            cb["gInvRadiusSquared"] = invRadiusSquared;
+            cb["gMinHorizonAngleSineSquared"] = settings.ssaoMinHorizonAngleSineSquared;
+            cb["gBias"] = settings.ssaoBias;
+            cb["gPeak2"] = peak2;
+            cb["gProjectionScaleRadius"] = projectionScaleRadius;
+            cb["gIntensity"] = intensity;
+            cb["gPower"] = power;
+            cb["gSpiralTurns"] = quality.spiralTurns;
+            cb["gSampleCount"] = float2(sampleCount, 1.0f / (sampleCount - 0.5f));
+            cb["gAngleIncCosSin"] = float2(cos(angleInc), sin(angleInc));
+            cb["gInvFarPlane"] = 1.0f / std::max(settings.farPlane, 1.0f);
+            cb["gMaxLevel"] = (int)std::max(0u, mStructureLevelCount - 1);
+        }
+        auto camCB = var["CameraCB"];
+        if (camCB.isValid())
+        {
+            camCB["gInvProj"] = settings.invProj;
+            camCB["gInvView"] = settings.invView;
+        }
+        var["gStructureDepth"] = mpStructureDepth;
+        var["gNormalW"] = pNormalW;
+        var["gDst"].setUav(mpAOBuffer->getUAV(0));
+        var["gPointSampler"] = mpPointSampler;
+
+        mpDeferredSSAOPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
+    }
+
+    float kGaussianSamples[16] = {};
+    const uint32_t gaussianSampleCount = makeGaussianKernel(kGaussianSamples, quality.kernelSize, quality.standardDeviation);
+
+    const float farPlaneOverEdgeDistance = settings.farPlane / std::max(settings.ssaoBilateralThreshold, 1e-4f);
+    const float2 axes[2] = {
+        float2(quality.blurScale / resolution.x, 0.f),
+        float2(0.f, quality.blurScale / resolution.y)
+    };
+    ref<Texture> blurInput = mpAOBuffer;
+    ref<Texture> blurOutputs[2] = { mpAOBlurTemp, mpAOBlurTarget };
+
+    for (uint32_t pass = 0; pass < 2; ++pass)
+    {
+        auto var = mpSSAOBlurPass->getRootVar();
+        auto cb = var["PerFrameCB"];
+        if (cb.isValid())
+        {
+            cb["gResolution"] = float4((float)resolution.x, (float)resolution.y, 1.f / resolution.x, 1.f / resolution.y);
+            cb["gBlurAxis"] = axes[pass];
+            cb["gFarPlaneOverEdgeDistance"] = farPlaneOverEdgeDistance;
+            cb["gBlurSampleCount"] = (int)gaussianSampleCount;
+            for (uint32_t i = 0; i < gaussianSampleCount; ++i)
+                cb["gBlurKernel"][i] = kGaussianSamples[i];
+        }
+        var["gAOBuffer"] = blurInput;
+        var["gBlurredAO"].setUav(blurOutputs[pass]->getUAV(0));
+        var["gPointSampler"] = mpPointSampler;
+
+        mpSSAOBlurPass->execute(pRenderContext, uint3(resolution.x, resolution.y, 1));
+        blurInput = blurOutputs[pass];
+    }
+}
+
 void FilamentPostProcess::blurShadowMoments(RenderContext* pRenderContext, const ref<Texture>& pMoments, const ref<Texture>& pTemp, const FilamentSettings& settings)
 {
     if (!mpShadowEVSMBlurPass || !pMoments || !pTemp || settings.vsmBlurWidth <= 0.f)
@@ -908,6 +1004,13 @@ void FilamentPostProcess::executePrePassSSAO(RenderContext* pRenderContext, cons
         executeGTAO(pRenderContext, pDepth, settings);
     else if (mpSSAOPass)
         executeSSAO(pRenderContext, pDepth, settings);
+}
+
+void FilamentPostProcess::executeDeferredSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const ref<Texture>& pNormalW, const FilamentSettings& settings)
+{
+    if (!settings.enableSSAO || !pDepth || !pNormalW) return;
+    executeStructure(pRenderContext, pDepth);
+    executeDeferredSSAOInternal(pRenderContext, pDepth, pNormalW, settings);
 }
 
 ref<Texture> FilamentPostProcess::getAOTexture(const FilamentSettings& settings) const

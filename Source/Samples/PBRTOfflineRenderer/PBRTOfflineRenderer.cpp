@@ -18,8 +18,8 @@ namespace
     constexpr float kDefaultIblIntensityScale = 0.35f;
     constexpr float kPreviewIblIntensityScale = 0.35f;
     constexpr float kPreviewAmbientIntensity = 0.0f;
-    constexpr float kDefaultSSAORadius = 0.65f;
-    constexpr float kDefaultSSAOIntensity = 2.0f;
+    constexpr float kDefaultSSAORadius = 0.3f;
+    constexpr float kDefaultSSAOIntensity = 1.0f;
 
     struct CascadeAtlasLayout { uint32_t cols; uint32_t rows; };
 
@@ -128,16 +128,16 @@ PBRTOfflineRenderer::PBRTOfflineRenderer(const SampleAppConfig& c) : SampleApp(c
     mFilamentSettings.forwardSSAO = true;
     mFilamentSettings.ssaoRadius = kDefaultSSAORadius;
     mFilamentSettings.ssaoIntensity = kDefaultSSAOIntensity;
-    mFilamentSettings.ssaoPower = 1.5f;
-    mFilamentSettings.ssaoResolution = 1.0f;
-    mFilamentSettings.ssaoSampleCount = 16;
+    mFilamentSettings.ssaoPower = 1.0f;
+    mFilamentSettings.ssaoResolution = 0.5f;
+    mFilamentSettings.ssaoSampleCount = 11;
     mFilamentSettings.iblIntensity = kDefaultIblIntensityScale;
     mFilamentSettings.sunIntensity = 0.f;
     mFilamentSettings.sunColor = float3(1.f, 0.95f, 0.85f);
     mFilamentSettings.sunDirection = normalize(float3(0.3f, 1.f, 0.5f));
     mFilamentSettings.enableShadows = false;
     mFilamentSettings.exposure = 0.0f;
-    mFilamentSettings.toneMapping = 0; // ACES
+    mFilamentSettings.toneMapping = 2; // Linear: preserve PBRT material colors by default.
     buildTaskGraph();
 }
 PBRTOfflineRenderer::~PBRTOfflineRenderer() { mExecutor.wait_for_all(); }
@@ -165,14 +165,14 @@ void PBRTOfflineRenderer::setPreviewMode(bool enabled)
     mFilamentSettings.forwardSSAO = true;
     mFilamentSettings.ssaoRadius = kDefaultSSAORadius;
     mFilamentSettings.ssaoIntensity = kDefaultSSAOIntensity;
-    mFilamentSettings.ssaoPower = 1.5f;
-    mFilamentSettings.ssaoResolution = 1.0f;
-    mFilamentSettings.ssaoSampleCount = 16;
+    mFilamentSettings.ssaoPower = 1.0f;
+    mFilamentSettings.ssaoResolution = 0.5f;
+    mFilamentSettings.ssaoSampleCount = 11;
     mFilamentSettings.iblIntensity = kPreviewIblIntensityScale;
     mFilamentSettings.sunIntensity = 0.f;
     mFilamentSettings.enableShadows = false;
     mFilamentSettings.exposure = 0.0f;
-    mFilamentSettings.toneMapping = 0; // ACES
+    mFilamentSettings.toneMapping = 2; // Linear: preserve PBRT material colors by default.
     mFilamentSettings.ambientIntensity = kPreviewAmbientIntensity;
 }
 
@@ -679,7 +679,8 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     mpGBufferPass->getState()->setViewport(0, fullViewport, true);
     mpScene->rasterize(pCtx, mpGBufferPass->getState().get(), mpGBufferPass->getVars().get());
 
-    // GBuffer depth -> SSAO.
+    // GBuffer depth -> SSAO. Keep the stable depth-derived path for the main preview
+    // while the world-space/GBuffer-normal AO path is validated separately.
     if (mFilamentSettings.postProcessingEnabled && mFilamentSettings.enableSSAO && mFilamentSettings.forwardSSAO && mpFilamentPostProcess)
     {
         mpFilamentPostProcess->executePrePassSSAO(pCtx, mpIntermediateDepth, mFilamentSettings);
@@ -939,7 +940,7 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                 }
 
                 if (auto cgGroup = ppGroup.group("Color Grading")) {
-                    Gui::DropdownList tmModes = {{0, "ACES"}, {1, "Filmic"}, {2, "Linear"}, {3, "Display"}};
+                    Gui::DropdownList tmModes = {{2, "Linear"}, {0, "ACES"}, {1, "Filmic"}, {3, "Display"}};
                     cgGroup.dropdown("Tone Mapping", tmModes, (uint32_t&)mFilamentSettings.toneMapping);
                     cgGroup.checkbox("3D LUT", mFilamentSettings.enableColorGradingLUT);
                     if (mFilamentSettings.enableColorGradingLUT) {

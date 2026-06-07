@@ -102,7 +102,7 @@ public:
         float3 vignetteColor = float3(0.0f, 0.0f, 0.0f);
 
         // Color Grading
-        int toneMapping = 0; // 0: ACES, 1: Filmic, 2: Linear, 3: Display
+        int toneMapping = 2; // 0: ACES approximation, 1: Filmic, 2: Linear, 3: Display
         float exposure = 0.0f; // EV
         float contrast = 1.0f;
         float vibrance = 1.0f;
@@ -133,6 +133,8 @@ public:
 
     // Pre-pass SSAO (depth prepass -> structure -> SSAO), consumed by forward shader via getAOTexture().
     void executePrePassSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
+    // Deferred MRT SSAO (depth + GBuffer normal -> structure -> SAO), consumed by fullscreen lighting via getAOTexture().
+    void executeDeferredSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const ref<Texture>& pNormalW, const FilamentSettings& settings);
     ref<Texture> getAOTexture(const FilamentSettings& settings) const;
     ref<Sampler> getLinearSampler() const { return mpLinearSampler; }
     ref<Sampler> getPointSampler() const { return mpPointSampler; }
@@ -150,6 +152,7 @@ private:
     ref<ComputePass> mpFogPass;
     ref<ComputePass> mpFSRPass;
     ref<ComputePass> mpGTAOPass;
+    ref<ComputePass> mpDeferredSSAOPass;
     ref<ComputePass> mpTAAPass;
 
     // Structure depth pyramid (SSAO LOD)
@@ -204,6 +207,7 @@ private:
     void updateAOTextures(ref<Device> pDevice, uint32_t width, uint32_t height, float resolutionScale);
     void createNoiseTexture(ref<Device> pDevice);
     void executeSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
+    void executeDeferredSSAOInternal(RenderContext* pRenderContext, const ref<Texture>& pDepth, const ref<Texture>& pNormalW, const FilamentSettings& settings);
     void executeGTAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
     void executeFSR(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings);
     void executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings, const ref<Texture>& pShadowMapDepth = nullptr, const ref<Texture>& pShadowMoments = nullptr);

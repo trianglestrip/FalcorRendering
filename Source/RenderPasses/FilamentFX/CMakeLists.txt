@@ -23,6 +23,7 @@ add_library(FilamentPostProcessLib STATIC
     ShadowMap.cs.slang
     ShadowEVSM.cs.slang
     DoF.cs.slang
+    DeferredSSAO.cs.slang
     Fog.cs.slang
     FSR.cs.slang
     GTAO.cs.slang
@@ -56,6 +57,7 @@ target_sources(FilamentFX PRIVATE
     ShadowMap.cs.slang
     ShadowEVSM.cs.slang
     DoF.cs.slang
+    DeferredSSAO.cs.slang
     Fog.cs.slang
     FSR.cs.slang
     GTAO.cs.slang
