@@ -561,6 +561,8 @@ target_sources(Falcor PRIVATE
     Utils/PathResolving.h
     Utils/Properties.cpp
     Utils/Properties.h
+    Utils/RenderTaskQueue.cpp
+    Utils/RenderTaskQueue.h
     Utils/SharedCache.h
     Utils/SlangUtils.slang
     Utils/SplitBuffer.h

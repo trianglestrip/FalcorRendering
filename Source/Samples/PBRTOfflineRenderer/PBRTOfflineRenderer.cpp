@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <utility>
 
 #include <imgui.h>
 
@@ -365,22 +366,8 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         mpLightingPass = FullScreenPass::create(getDevice(), "Samples/PBRTOfflineRenderer/PBRTIBLLighting.ps.slang");
         viewerTimeReport.measure("PBRT viewer create lighting pass");
 
-        setLoadingStatus("Creating shadow resources");
-        logInfo("Creating shadow resources.");
-        ensureShadowMapResources();
-        if (!mpShadowPointSampler)
-        {
-            Sampler::Desc shadowSamplerDesc;
-            shadowSamplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point);
-            shadowSamplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
-            mpShadowPointSampler = getDevice()->createSampler(shadowSamplerDesc);
-        }
-        viewerTimeReport.measure("PBRT viewer create shadow resources");
-
-        setLoadingStatus("Creating shadow pass");
-        if (mFilamentSettings.enableShadows)
-            ensureShadowPassResources();
-        viewerTimeReport.measure("PBRT viewer create shadow pass");
+        logInfo("Deferring shadow resources until shadows are enabled.");
+        viewerTimeReport.measure("PBRT viewer defer shadow setup");
 
         setLoadingStatus("Creating Filament post-process");
         logInfo("Creating Filament post-process.");
@@ -420,6 +407,55 @@ void PBRTOfflineRenderer::setLoadingStatus(const std::string& status)
             : "Falcor Scene Viewer";
         pWindow->setWindowTitle(title);
     }
+}
+
+void PBRTOfflineRenderer::requestRenderTask(const std::string& name, RenderTaskQueue::Task task)
+{
+    mRenderTaskQueue.enqueue(name, std::move(task));
+}
+
+void PBRTOfflineRenderer::requestShadowWarmup()
+{
+    requestRenderTask("Warmup Shadow Resources", [this](RenderContext*)
+    {
+        ensureShadowPassResources();
+        mFilamentSettings.enableSunlight = true;
+        if (mFilamentSettings.sunIntensity <= 0.f)
+            mFilamentSettings.sunIntensity = 30000.f;
+        mFilamentSettings.enableShadows = true;
+    });
+}
+
+void PBRTOfflineRenderer::requestDeferredAOWarmup()
+{
+    if (mpDeferredAOPass)
+    {
+        mDeferredAOSettings.enabled = true;
+        return;
+    }
+
+    requestRenderTask("Warmup Deferred AO Pass", [this](RenderContext*)
+    {
+        if (!mpDeferredAOPass)
+            mpDeferredAOPass = DeferredAOPass::create(getDevice(), Properties{});
+        mDeferredAOSettings.enabled = true;
+    });
+}
+
+void PBRTOfflineRenderer::requestAutoExposureWarmup()
+{
+    if (mpAutoExposurePass)
+    {
+        mAutoExposureSettings.enabled = true;
+        return;
+    }
+
+    requestRenderTask("Warmup Auto Exposure Pass", [this](RenderContext*)
+    {
+        if (!mpAutoExposurePass)
+            mpAutoExposurePass = AutoExposurePass::create(getDevice(), Properties{});
+        mAutoExposureSettings.enabled = true;
+    });
 }
 
 void PBRTOfflineRenderer::ensureShadowMapResources()
@@ -748,6 +784,8 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
         return;
     }
 
+    mRenderTaskQueue.execute(pCtx, 1);
+
     if (mFrameCount == 0)
         logInfo("Rendering first frame.");
 
@@ -1001,6 +1039,13 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
     Gui::Window w(pGui, "Filament", {380, sidebarHeight}, {0, 0}, kFilamentSidebarFlags);
     if (!mLoadingStatus.empty())
         w.text(fmt::format("Status: {}", mLoadingStatus));
+    if (!mRenderTaskQueue.empty() || !mRenderTaskQueue.getCurrentTaskName().empty())
+    {
+        const std::string& taskName = !mRenderTaskQueue.getCurrentTaskName().empty()
+            ? mRenderTaskQueue.getCurrentTaskName()
+            : mRenderTaskQueue.getLastCompletedTaskName();
+        w.text(fmt::format("Render Queue: {} pending ({})", mRenderTaskQueue.size(), taskName));
+    }
     if (mpScene)
     {
         w.text(fmt::format("Loaded: {}", mLoadedScenePath.filename().string()));
@@ -1030,15 +1075,62 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
             viewGroup.checkbox("Post-processing", s.postProcessingEnabled);
             if (auto ppViewGroup = viewGroup.group("Post-processing")) {
                 ppViewGroup.checkbox("Dithering", s.dithering);
-                ppViewGroup.checkbox("Bloom", s.enableBloom);
+                bool bloom = s.enableBloom;
+                if (ppViewGroup.checkbox("Bloom", bloom))
+                {
+                    if (bloom)
+                    {
+                        requestRenderTask("Warmup Bloom", [this](RenderContext*)
+                        {
+                            if (mpFilamentPostProcess)
+                                mpFilamentPostProcess->ensureBloomPasses();
+                            mFilamentSettings.enableBloom = true;
+                        });
+                    }
+                    else
+                    {
+                        mRenderTaskQueue.remove("Warmup Bloom");
+                        s.enableBloom = false;
+                    }
+                }
 
                 bool taa = s.antiAliasing == 2;
                 if (ppViewGroup.checkbox("TAA", taa))
-                    s.antiAliasing = taa ? 2 : 1;
+                {
+                    if (taa)
+                    {
+                        requestRenderTask("Warmup TAA", [this](RenderContext*)
+                        {
+                            if (mpFilamentPostProcess)
+                                mpFilamentPostProcess->ensureTAAPass();
+                            mFilamentSettings.antiAliasing = 2;
+                        });
+                    }
+                    else if (s.antiAliasing == 2)
+                    {
+                        mRenderTaskQueue.remove("Warmup TAA");
+                        s.antiAliasing = 1;
+                    }
+                }
 
                 bool fxaa = s.antiAliasing == 1;
                 if (ppViewGroup.checkbox("FXAA", fxaa))
-                    s.antiAliasing = fxaa ? 1 : 0;
+                {
+                    if (fxaa)
+                    {
+                        requestRenderTask("Warmup FXAA", [this](RenderContext*)
+                        {
+                            if (mpFilamentPostProcess)
+                                mpFilamentPostProcess->ensureFXAAPass();
+                            mFilamentSettings.antiAliasing = 1;
+                        });
+                    }
+                    else if (s.antiAliasing == 1)
+                    {
+                        mRenderTaskQueue.remove("Warmup FXAA");
+                        s.antiAliasing = 0;
+                    }
+                }
             }
             viewGroup.checkbox("MSAA 4x", s.enableMSAA);
             if (auto msaaGroup = viewGroup.group("MSAA 4x"))
@@ -1102,6 +1194,24 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
             s.dynamicResolutionMinScale = std::min(s.dynamicResolutionMinScale, s.dynamicResolutionMaxScale);
             s.dynamicResolutionScale = s.dynamicResolutionMinScale;
             dsrGroup.slider("quality", s.dynamicResolutionQuality, 0, 3);
+            bool fsr = s.enableFSR;
+            if (dsrGroup.checkbox("FSR RCAS", fsr))
+            {
+                if (fsr)
+                {
+                    requestRenderTask("Warmup FSR", [this](RenderContext*)
+                    {
+                        if (mpFilamentPostProcess)
+                            mpFilamentPostProcess->ensureFSRPass();
+                        mFilamentSettings.enableFSR = true;
+                    });
+                }
+                else
+                {
+                    mRenderTaskQueue.remove("Warmup FSR");
+                    s.enableFSR = false;
+                }
+            }
             dsrGroup.slider("sharpness", s.fsrSharpness, 0.0f, 1.0f);
         }
 
@@ -1135,7 +1245,25 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                 }
             }
             if (auto shadowsGroup = lightGroup.group("Shadows")) {
-                shadowsGroup.checkbox("Enable shadows", s.enableShadows);
+                bool enableShadows = s.enableShadows;
+                if (shadowsGroup.checkbox("Enable shadows", enableShadows))
+                {
+                    if (enableShadows)
+                    {
+                        requestShadowWarmup();
+                        requestRenderTask("Warmup Post Shadow", [this](RenderContext*)
+                        {
+                            if (mpFilamentPostProcess)
+                                mpFilamentPostProcess->ensureShadowPasses();
+                        });
+                    }
+                    else
+                    {
+                        mRenderTaskQueue.remove("Warmup Shadow Resources");
+                        mRenderTaskQueue.remove("Warmup Post Shadow");
+                        s.enableShadows = false;
+                    }
+                }
                 shadowsGroup.slider("Shadow map size", s.shadowMapSize, 32u, 2048u);
                 shadowsGroup.checkbox("Stable Shadows", s.shadowStable);
                 shadowsGroup.checkbox("Enable LiSPSM", s.shadowLiSPSM);
@@ -1165,7 +1293,24 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
         }
 
         if (auto fogGroup = g.group("Fog")) {
-            fogGroup.checkbox("Enable large-scale fog", s.enableFog);
+            bool fog = s.enableFog;
+            if (fogGroup.checkbox("Enable large-scale fog", fog))
+            {
+                if (fog)
+                {
+                    requestRenderTask("Warmup Fog", [this](RenderContext*)
+                    {
+                        if (mpFilamentPostProcess)
+                            mpFilamentPostProcess->ensureFogPass();
+                        mFilamentSettings.enableFog = true;
+                    });
+                }
+                else
+                {
+                    mRenderTaskQueue.remove("Warmup Fog");
+                    s.enableFog = false;
+                }
+            }
             fogGroup.slider("Start [m]", s.fogStart, 0.0f, 100.0f);
             fogGroup.slider("Extinction [1/m]", s.fogDensity, 0.0f, 1.0f);
             fogGroup.slider("Floor [m]", s.fogHeight, 0.0f, 100.0f);
@@ -1201,7 +1346,24 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
             cameraGroup.slider("Far", s.farPlane, 1.0f, 10000.0f);
 
             if (auto dofGroup = cameraGroup.group("DoF")) {
-                dofGroup.checkbox("Enabled##dofEnabled", s.enableDoF);
+                bool dof = s.enableDoF;
+                if (dofGroup.checkbox("Enabled##dofEnabled", dof))
+                {
+                    if (dof)
+                    {
+                        requestRenderTask("Warmup DoF", [this](RenderContext*)
+                        {
+                            if (mpFilamentPostProcess)
+                                mpFilamentPostProcess->ensureDoFPass();
+                            mFilamentSettings.enableDoF = true;
+                        });
+                    }
+                    else
+                    {
+                        mRenderTaskQueue.remove("Warmup DoF");
+                        s.enableDoF = false;
+                    }
+                }
                 dofGroup.slider("Focus distance", s.cameraFocusDistance, 0.0f, 30.0f);
                 s.dofFocalDistance = s.cameraFocusDistance;
                 dofGroup.slider("Blur scale", s.dofCocScale, 0.1f, 10.0f);
@@ -1256,7 +1418,27 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
     {
         auto& s = mFilamentSettings;
 
-        aoW.checkbox("Enable SSAO", s.enableSSAO);
+        bool ssao = s.enableSSAO;
+        if (aoW.checkbox("Enable SSAO", ssao))
+        {
+            if (ssao)
+            {
+                requestRenderTask("Warmup Filament AO", [this](RenderContext*)
+                {
+                    if (mpFilamentPostProcess)
+                    {
+                        mpFilamentPostProcess->ensureStructurePasses();
+                        mpFilamentPostProcess->ensureSSAOPasses(mFilamentSettings.ssaoMode != 1, mFilamentSettings.ssaoMode == 1);
+                    }
+                    mFilamentSettings.enableSSAO = true;
+                });
+            }
+            else
+            {
+                mRenderTaskQueue.remove("Warmup Filament AO");
+                s.enableSSAO = false;
+            }
+        }
 
         bool aoDebugView = (mDebugView == 5);
         if (aoW.checkbox("AO Debug View", aoDebugView))
@@ -1264,7 +1446,17 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
 
         if (auto ssaoGroup = aoW.group("SSAO Options")) {
             Gui::DropdownList aoTypes = {{0, "SAO"}, {1, "GTAO"}};
-            ssaoGroup.dropdown("AO Type", aoTypes, (uint32_t&)s.ssaoMode);
+            if (ssaoGroup.dropdown("AO Type", aoTypes, (uint32_t&)s.ssaoMode) && s.enableSSAO)
+            {
+                requestRenderTask("Warmup Filament AO", [this](RenderContext*)
+                {
+                    if (mpFilamentPostProcess)
+                    {
+                        mpFilamentPostProcess->ensureStructurePasses();
+                        mpFilamentPostProcess->ensureSSAOPasses(mFilamentSettings.ssaoMode != 1, mFilamentSettings.ssaoMode == 1);
+                    }
+                });
+            }
             ssaoGroup.slider("Quality", s.ssaoQuality, 0, 3);
             ssaoGroup.slider("Low Pass", s.ssaoLowPassFilter, 0, 2);
             ssaoGroup.checkbox("Bent Normals", s.ssaoBentNormals);
@@ -1312,7 +1504,17 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
     {
         auto& d = mDeferredAOSettings;
 
-        daoW.checkbox("Enable Deferred AO", d.enabled);
+        bool deferredAO = d.enabled;
+        if (daoW.checkbox("Enable Deferred AO", deferredAO))
+        {
+            if (deferredAO)
+                requestDeferredAOWarmup();
+            else
+            {
+                mRenderTaskQueue.remove("Warmup Deferred AO Pass");
+                d.enabled = false;
+            }
+        }
 
         if (auto daoGroup = daoW.group("Deferred AO Options"))
         {
@@ -1332,7 +1534,17 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
     {
         auto& a = mAutoExposureSettings;
 
-        aeW.checkbox("Enable Auto Exposure", a.enabled);
+        bool autoExposure = a.enabled;
+        if (aeW.checkbox("Enable Auto Exposure", autoExposure))
+        {
+            if (autoExposure)
+                requestAutoExposureWarmup();
+            else
+            {
+                mRenderTaskQueue.remove("Warmup Auto Exposure Pass");
+                a.enabled = false;
+            }
+        }
         if (mpAutoExposurePass)
             aeW.text(fmt::format("Current Exposure: {:.4f}", mpAutoExposurePass->getExposure()));
 

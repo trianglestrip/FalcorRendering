@@ -12,7 +12,9 @@
 #include "FilamentIBL.h"
 #include "DeferredAOPass.h"
 #include "AutoExposurePass.h"
+#include "Utils/RenderTaskQueue.h"
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
+#include <functional>
 #include <taskflow.hpp>
 
 using namespace Falcor;
@@ -54,6 +56,10 @@ private:
     void saveOutput(RenderContext* pCtx);
     void buildTaskGraph();
     void setLoadingStatus(const std::string& status);
+    void requestRenderTask(const std::string& name, RenderTaskQueue::Task task);
+    void requestShadowWarmup();
+    void requestDeferredAOWarmup();
+    void requestAutoExposureWarmup();
     void renderShadowMap(RenderContext* pCtx);
     void ensureShadowMapResources();
     void ensureShadowPassResources();
@@ -111,6 +117,7 @@ private:
     std::mutex mSaveMutex;
     std::filesystem::path mSavePath;
     ref<Texture> mSaveTexture;
+    RenderTaskQueue mRenderTaskQueue;
 
     FilamentPostProcess::FilamentSettings mFilamentSettings;
 
