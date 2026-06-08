@@ -4,6 +4,7 @@
 #include "PBRTOfflineRenderer.h"
 #include "Core/Platform/OS.h"
 #include "Scene/Importer.h"
+#include "Scene/SceneBuilder.h"
 #include "Utils/Math/FalcorMath.h"
 #include "Utils/Settings/Settings.h"
 #include "Utils/SampleGenerators/HaltonSamplePattern.h"
@@ -145,7 +146,7 @@ namespace
         return false;
     }
 
-    Settings buildSceneImportSettings(const std::filesystem::path& path)
+    Settings buildSceneImportSettings(const std::filesystem::path& path, bool usePBRTMaterials)
     {
         Settings settings;
         if (getExtensionFromPath(path) == "pbrt")
@@ -154,10 +155,20 @@ namespace
                 {"PBRTImporter:rotateImageTextures90", false},
                 {"PBRTImporter:rotateImageTextures180", true},
                 {"PBRTImporter:flipTextureV", true},
-                {"PBRTImporter:usePBRTMaterials", true},
+                {"PBRTImporter:usePBRTMaterials", usePBRTMaterials},
             });
         }
         return settings;
+    }
+
+    SceneBuilder::Flags buildSceneFlags(bool useCache, bool rebuildCache)
+    {
+        SceneBuilder::Flags flags = SceneBuilder::Flags::Default;
+        if (useCache)
+            flags |= SceneBuilder::Flags::UseCache;
+        if (rebuildCache)
+            flags |= SceneBuilder::Flags::RebuildCache;
+        return flags;
     }
 }
 
@@ -266,7 +277,18 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         }
 
         setLoadingStatus("Importing scene");
-        mpScene = Scene::create(getDevice(), mScenePath, buildSceneImportSettings(mScenePath));
+        logInfo(
+            "PBRT viewer import options: sceneCache={}, rebuildSceneCache={}, pbrtMaterials={}",
+            mUseSceneCache,
+            mRebuildSceneCache,
+            mUsePBRTMaterials
+        );
+        mpScene = SceneBuilder(
+            getDevice(),
+            mScenePath,
+            buildSceneImportSettings(mScenePath, mUsePBRTMaterials),
+            buildSceneFlags(mUseSceneCache, mRebuildSceneCache)
+        ).getScene();
         if (!mpScene)
         {
             logError("Failed to load scene.");
@@ -428,16 +450,13 @@ void PBRTOfflineRenderer::requestShadowWarmup()
 
 void PBRTOfflineRenderer::requestDeferredAOWarmup()
 {
-    if (mpDeferredAOPass)
-    {
-        mDeferredAOSettings.enabled = true;
-        return;
-    }
-
     requestRenderTask("Warmup Deferred AO Pass", [this](RenderContext*)
     {
-        if (!mpDeferredAOPass)
-            mpDeferredAOPass = DeferredAOPass::create(getDevice(), Properties{});
+        if (mpFilamentPostProcess)
+        {
+            mpFilamentPostProcess->ensureStructurePasses();
+            mpFilamentPostProcess->ensureSSAOPasses(true, false);
+        }
         mDeferredAOSettings.enabled = true;
     });
 }
@@ -575,25 +594,48 @@ void PBRTOfflineRenderer::syncFilamentCameraSettings()
     mFilamentSettings.cameraJitter = float2(pCam->getJitterX(), pCam->getJitterY());
 }
 
+FilamentPostProcess::FilamentSettings PBRTOfflineRenderer::getLightingAOSettings() const
+{
+    auto settings = mFilamentSettings;
+    if (mDeferredAOSettings.enabled)
+    {
+        settings.postProcessingEnabled = true;
+        settings.enableSSAO = true;
+        settings.forwardSSAO = false;
+        settings.ssaoMode = 0;
+        settings.ssaoResolution = 1.0f;
+        settings.ssaoRadius = mDeferredAOSettings.radius;
+        settings.ssaoIntensity = mDeferredAOSettings.intensity;
+        settings.ssaoBias = std::max(mDeferredAOSettings.bias, 0.0001f);
+        settings.ssaoPower = mDeferredAOSettings.power;
+        settings.ssaoSampleCount = int(std::clamp(mDeferredAOSettings.sampleCount, 4u, 64u));
+        settings.ssaoQuality = settings.ssaoSampleCount >= 32 ? 3 : (settings.ssaoSampleCount >= 16 ? 2 : 1);
+        settings.ssaoLowPassFilter = mDeferredAOSettings.blurRadius > 0 ? 1 : 0;
+        settings.ssaoBilateralThreshold = 1.0f / std::max(mDeferredAOSettings.blurSharpness, 1.0f);
+        settings.ssaoHighQualityUpsampling = false;
+        settings.ssaoBentNormals = false;
+    }
+    return settings;
+}
+
 void PBRTOfflineRenderer::setAOShaderVars(const ShaderVar& var)
 {
     if (!var.isValid() || !mpFilamentPostProcess) return;
 
-    const bool useForwardSSAO = mFilamentSettings.postProcessingEnabled
-        && mFilamentSettings.enableSSAO
-        && (mFilamentSettings.forwardSSAO || mDebugView == 5);
+    const auto aoSettings = getLightingAOSettings();
+    const bool useAO = aoSettings.postProcessingEnabled && aoSettings.enableSSAO;
 
     auto perFrameCB = var.findMember("PerFrameCB");
     if (perFrameCB.isValid() && perFrameCB.findMember("gSSAOEnabled").isValid())
-        perFrameCB["gSSAOEnabled"] = useForwardSSAO ? 1u : 0u;
-
-    if (var.findMember("gSSAO").isValid())
-        var["gSSAO"] = mpFilamentPostProcess->getAOTexture(mFilamentSettings);
-    if (var.findMember("gSSAOLinearSampler").isValid())
-        var["gSSAOLinearSampler"] = mpFilamentPostProcess->getLinearSampler();
+        perFrameCB["gSSAOEnabled"] = useAO ? 1u : 0u;
 
     if (var.findMember("AODataCB").isValid())
-        mpFilamentPostProcess->bindAOShaderVars(var, mFilamentSettings, mpIntermediateDepth);
+        mpFilamentPostProcess->bindAOShaderVars(var, aoSettings, mpIntermediateDepth);
+
+    if (var.findMember("gSSAO").isValid())
+        var["gSSAO"] = mpFilamentPostProcess->getAOTexture(aoSettings);
+    if (var.findMember("gSSAOLinearSampler").isValid())
+        var["gSSAOLinearSampler"] = mpFilamentPostProcess->getLinearSampler();
 }
 
 void PBRTOfflineRenderer::setShadowShaderVars(const ShaderVar& var)
@@ -862,41 +904,13 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     mpGBufferPass->getState()->setViewport(0, fullViewport, true);
     mpScene->rasterize(pCtx, mpGBufferPass->getState().get(), mpGBufferPass->getVars().get());
 
-    if (mFilamentSettings.postProcessingEnabled && mFilamentSettings.enableSSAO && mpFilamentPostProcess && (mFilamentSettings.forwardSSAO || mDebugView == 5))
+    const auto lightingAOSettings = getLightingAOSettings();
+    const bool useLightingAO = lightingAOSettings.postProcessingEnabled
+        && lightingAOSettings.enableSSAO
+        && mpFilamentPostProcess;
+    if (useLightingAO)
     {
-        mpFilamentPostProcess->executeDeferredSSAO(pCtx, mpIntermediateDepth, mpGBufferNormalW, mFilamentSettings);
-    }
-
-    // --- Stage 3: Deferred AO (UE-style standalone pass) ---
-    if (mDeferredAOSettings.enabled)
-    {
-        if (!mpDeferredAOPass)
-        {
-            logInfo("Creating Deferred AO pass.");
-            mpDeferredAOPass = DeferredAOPass::create(getDevice(), Properties{});
-        }
-
-        if (!mpDeferredAOTexture || mpDeferredAOTexture->getWidth() != frameDim.x || mpDeferredAOTexture->getHeight() != frameDim.y)
-        {
-            mpDeferredAOTexture = getDevice()->createTexture2D(
-                frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::RenderTarget | ResourceBindFlags::UnorderedAccess);
-        }
-
-        // Sync DeferredAOPass params from UI settings
-        Properties daoProps;
-        daoProps["radius"] = mDeferredAOSettings.radius;
-        daoProps["intensity"] = mDeferredAOSettings.intensity;
-        daoProps["bias"] = mDeferredAOSettings.bias;
-        daoProps["power"] = mDeferredAOSettings.power;
-        daoProps["sampleCount"] = mDeferredAOSettings.sampleCount;
-        daoProps["blurRadius"] = mDeferredAOSettings.blurRadius;
-        daoProps["blurSharpness"] = mDeferredAOSettings.blurSharpness;
-        daoProps["normalMode"] = mDeferredAOSettings.normalMode;
-        mpDeferredAOPass->setProperties(daoProps);
-        mpDeferredAOPass->setScene(pCtx, mpScene);
-
-        mpDeferredAOPass->executeDirect(pCtx, mpIntermediateDepth, mpGBufferNormalW, mpDeferredAOTexture);
+        mpFilamentPostProcess->executeDeferredSSAO(pCtx, mpIntermediateDepth, mpGBufferNormalW, lightingAOSettings);
     }
 
     auto pLightingFbo = Fbo::create(getDevice(), {mpIntermediateTexture});
@@ -1144,6 +1158,7 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                 {2, "Normal"},
                 {3, "Material ID"},
                 {4, "Instance ID"},
+                {5, "AO"},
                 {6, "Shadow"},
                 {7, "Shadow Map"},
             };
@@ -1500,7 +1515,7 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
         }
     }
 
-    if (auto daoW = w.group("DeferredAOPass", true))
+    if (auto daoW = w.group("Filament Deferred AO", true))
     {
         auto& d = mDeferredAOSettings;
 
@@ -1525,8 +1540,6 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
             daoGroup.slider("Sample Count", d.sampleCount, 4u, 64u);
             daoGroup.slider("Blur Radius", d.blurRadius, 0u, 8u);
             daoGroup.slider("Blur Sharpness", d.blurSharpness, 1.0f, 200.0f);
-            Gui::DropdownList normalModes = {{0, "Packed [0,1]"}, {1, "Signed [-1,1]"}};
-            daoGroup.dropdown("Normal Mode", normalModes, d.normalMode);
         }
     }
 
@@ -1618,8 +1631,13 @@ struct PBRTOfflineRendererOptions
     bool headless = false;
     bool singleFrame = false;
     bool preview = false;
+    bool warmupCache = false;
     bool enableShadows = false;
     bool disableSSAO = false;
+    bool enableDeferredAO = false;
+    bool useSceneCache = true;
+    bool rebuildSceneCache = false;
+    bool usePBRTMaterials = true;
     float ssaoResolution = 0.0f;
     uint32_t debugView = 0;
     uint32_t width = 1920;
@@ -1641,8 +1659,27 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
             options.headless = true;
         else if (a == "--preview")
             options.preview = true;
+        else if (a == "--warmup-cache")
+        {
+            options.warmupCache = true;
+            options.headless = true;
+            options.singleFrame = true;
+            options.preview = true;
+            options.enableShadows = true;
+            options.enableDeferredAO = true;
+        }
+        else if (a == "--no-scene-cache")
+            options.useSceneCache = false;
+        else if (a == "--rebuild-scene-cache")
+            options.rebuildSceneCache = true;
+        else if (a == "--fast-materials")
+            options.usePBRTMaterials = false;
+        else if (a == "--pbrt-materials")
+            options.usePBRTMaterials = true;
         else if (a == "--enable-shadows")
             options.enableShadows = true;
+        else if (a == "--deferred-ao")
+            options.enableDeferredAO = true;
         else if (a == "--disable-ssao")
             options.disableSSAO = true;
         else if (a == "--ssao-fullres")
@@ -1694,14 +1731,25 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
 
 int runMain(int argc, char** argv)
 {
-    const auto options = parseArgs(argc, argv);
+    auto options = parseArgs(argc, argv);
     SampleAppConfig c;
     c.windowDesc.title = "Falcor Scene Viewer"; c.windowDesc.resizableWindow = true; c.windowDesc.width = options.width; c.windowDesc.height = options.height;
     c.headless = options.headless;
     c.showUI = !options.headless;
     PBRTOfflineRenderer app(c);
-    logInfo("Options: headless={}, singleFrame={}, scene='{}', output='{}'",
-        options.headless, options.singleFrame || options.headless, options.scenePath.string(), options.outputPath.string());
+    logInfo(
+        "Options: headless={}, singleFrame={}, scene='{}', output='{}', sceneCache={}, rebuildSceneCache={}, pbrtMaterials={}, warmupCache={}",
+        options.headless,
+        options.singleFrame || options.headless,
+        options.scenePath.string(),
+        options.outputPath.string(),
+        options.useSceneCache,
+        options.rebuildSceneCache,
+        options.usePBRTMaterials,
+        options.warmupCache
+    );
+    if (options.warmupCache)
+        logInfo("PBRT viewer cache warmup enabled: prewarming scene cache, GBuffer, lighting, shadow, Filament deferred AO, and post-process shaders.");
     if (options.headless)
     {
         app.setHeadlessProbeMode(true);
@@ -1711,11 +1759,16 @@ int runMain(int argc, char** argv)
         app.setEnableShadows(true);
     if (options.disableSSAO)
         app.setEnableSSAO(false);
+    if (options.enableDeferredAO)
+        app.setEnableDeferredAO(true);
     if (options.ssaoResolution > 0.0f)
         app.setSSAOResolution(options.ssaoResolution);
     app.setScenePath(options.scenePath);
     app.setOutputPath(options.outputPath);
     app.setSingleFrame(options.singleFrame || options.headless);
+    app.setUseSceneCache(options.useSceneCache);
+    app.setRebuildSceneCache(options.rebuildSceneCache);
+    app.setUsePBRTMaterials(options.usePBRTMaterials);
     app.setDebugView(options.debugView);
     app.setInspectInstanceIDs(options.inspectInstanceIDs);
     return app.run();

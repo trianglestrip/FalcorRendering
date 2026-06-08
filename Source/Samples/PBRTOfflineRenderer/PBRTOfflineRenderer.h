@@ -36,6 +36,9 @@ public:
     void setOutputPath(const std::filesystem::path& p) { mOutputPath = p; }
     void setSingleFrame(bool enabled) { mSingleFrame = enabled; }
     void setDebugView(uint32_t view) { mDebugView = view; }
+    void setUseSceneCache(bool enabled) { mUseSceneCache = enabled; }
+    void setRebuildSceneCache(bool enabled) { mRebuildSceneCache = enabled; }
+    void setUsePBRTMaterials(bool enabled) { mUsePBRTMaterials = enabled; }
     void setEnableShadows(bool enabled)
     {
         mFilamentSettings.enableShadows = enabled;
@@ -47,6 +50,7 @@ public:
     }
     void setEnableSSAO(bool enabled) { mFilamentSettings.enableSSAO = enabled; }
     void setSSAOResolution(float resolution) { mFilamentSettings.ssaoResolution = resolution; }
+    void setEnableDeferredAO(bool enabled) { mDeferredAOSettings.enabled = enabled; }
     void setInspectInstanceIDs(std::vector<uint32_t> ids) { mInspectInstanceIDs = std::move(ids); }
     void setHeadlessProbeMode(bool enabled);
     void setPreviewMode(bool enabled);
@@ -65,6 +69,7 @@ private:
     void ensureShadowPassResources();
     void setShadowShaderVars(const ShaderVar& var);
     void setAOShaderVars(const ShaderVar& var);
+    FilamentPostProcess::FilamentSettings getLightingAOSettings() const;
     void syncFilamentCameraSettings();
     void syncFilamentSunLight();
     void initSunFromScene();
@@ -112,6 +117,9 @@ private:
     tf::Taskflow mTaskflow;
     bool mSavePending = false;
     bool mSingleFrame = false;
+    bool mUseSceneCache = true;
+    bool mRebuildSceneCache = false;
+    bool mUsePBRTMaterials = true;
     uint32_t mDebugView = 0;
     std::vector<uint32_t> mInspectInstanceIDs;
     std::mutex mSaveMutex;
@@ -125,11 +133,11 @@ private:
     struct DeferredAOSettings
     {
         bool enabled = false;
-        float radius = 1.5f;
-        float intensity = 0.8f;
-        float bias = 0.01f;
-        float power = 2.0f;
-        uint32_t sampleCount = 32;
+        float radius = 5.0f;
+        float intensity = 3.0f;
+        float bias = 0.0f;
+        float power = 3.0f;
+        uint32_t sampleCount = 48;
         uint32_t blurRadius = 4;
         float blurSharpness = 40.0f;
         uint32_t normalMode = 0;

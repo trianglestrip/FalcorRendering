@@ -245,12 +245,14 @@ namespace Falcor
             return indexData;
         }
 
-        SceneCache::Key computeSceneCacheKey(const std::filesystem::path& path, SceneBuilder::Flags buildFlags)
+        SceneCache::Key computeSceneCacheKey(const std::filesystem::path& path, const Settings& settings, SceneBuilder::Flags buildFlags)
         {
             SceneBuilder::Flags cacheFlags = buildFlags & (~(SceneBuilder::Flags::UseCache | SceneBuilder::Flags::RebuildCache));
             SHA1 sha1;
             auto pathStr = path.string();
+            auto settingsStr = settings.getOptions().to_string();
             sha1.update(pathStr.data(), pathStr.size());
+            sha1.update(settingsStr.data(), settingsStr.size());
             sha1.update(&cacheFlags, sizeof(cacheFlags));
             return sha1.finalize();
 
@@ -276,7 +278,7 @@ namespace Falcor
         }
 
         // Compute scene cache key based on absolute scene path and build flags.
-        mSceneCacheKey = computeSceneCacheKey(resolvedPath, flags);
+        mSceneCacheKey = computeSceneCacheKey(resolvedPath, settings, flags);
 
         // Determine if scene cache should be written after import.
         bool useCache = is_set(flags, Flags::UseCache);

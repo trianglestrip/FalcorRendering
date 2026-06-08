@@ -1454,15 +1454,27 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
     {
         // Parameters:
         // String filename
-        auto path = ctx.resolver(params.getString("filename", ""));
-        try
+        if (ctx.usePBRTMaterials && !isAreaLight)
         {
-            auto pRGLMaterial = RGLMaterial::create(ctx.builder.getDevice(), entity.name, path);
-            pMaterial = pRGLMaterial;
+            auto path = ctx.resolver(params.getString("filename", ""));
+            try
+            {
+                auto pRGLMaterial = RGLMaterial::create(ctx.builder.getDevice(), entity.name, path);
+                pMaterial = pRGLMaterial;
+            }
+            catch (const RuntimeError& e)
+            {
+                logWarning(entity.loc, "Failed to load 'measured' material: {}", e.what());
+            }
         }
-        catch (const RuntimeError& e)
+        else
         {
-            logWarning(entity.loc, "Failed to load 'measured' material: {}", e.what());
+            auto pStandardMaterial = StandardMaterial::create(ctx.builder.getDevice(), entity.name);
+            pStandardMaterial->setBaseColor(float4(0.6f, 0.6f, 0.6f, 1.f));
+            pStandardMaterial->setMetallic(0.f);
+            pStandardMaterial->setRoughness(0.35f);
+            pStandardMaterial->setDoubleSided(true);
+            pMaterial = pStandardMaterial;
         }
     }
     else if (type == "subsurface")

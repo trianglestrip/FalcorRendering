@@ -94,15 +94,18 @@ void deferredAOMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         if (sampleZ >= 0.9999) continue;
 
         float3 sampleW = reconstructWorld(sampleUV, sampleZ);
+        float3 sampleV = FilamentComputeViewPosition(sampleUV, sampleZ, gInvProj);
+        float sampleViewDepth = max(abs(sampleV.z), 1e-4);
         float3 delta = sampleW - originW;
         float dist2 = dot(delta, delta);
         if (dist2 <= 1e-8 || dist2 > gRadius * gRadius) continue;
 
-        float invDist = rsqrt(dist2);
-        float nd = dot(normalW, delta * invDist);
+        float dist = sqrt(dist2);
+        float normalFacing = saturate(dot(normalW, normalize(delta)) * 0.5 + 0.5);
+        float depthOcclusion = saturate((abs(sampleViewDepth - viewDepth) - gBias) / max(gRadius * 0.05, 1e-4));
         float range = saturate(1.0 - sqrt(dist2) / gRadius);
         range *= range;
-        occlusion += max(0.0, nd - gBias) * range;
+        occlusion += depthOcclusion * range * normalFacing;
     }
 
     occlusion = (occlusion / float(sampleCount)) * gIntensity;
