@@ -330,15 +330,20 @@ GuiImpl::GuiImpl(ref<Device> pDevice, float scaleFactor) : mpDevice(pDevice), mS
     io.KeyMap[ImGuiKey_Menu] = (uint32_t)Input::Key::Menu;
     io.IniFilename = nullptr;
 
+    ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    style.Colors[ImGuiCol_WindowBg].w = 0.9f;
-    style.Colors[ImGuiCol_FrameBg].x *= 0.1f;
-    style.Colors[ImGuiCol_FrameBg].y *= 0.1f;
-    style.Colors[ImGuiCol_FrameBg].z *= 0.1f;
-    style.ScrollbarSize *= 0.7f;
-
-    style.Colors[ImGuiCol_MenuBarBg] = style.Colors[ImGuiCol_WindowBg];
     style.ScaleAllSizes(scaleFactor);
+
+    // Load default font matching Filament (Roboto-Medium, 16px)
+    {
+        std::filesystem::path fontPath = "external/imgui/misc/fonts/Roboto-Medium.ttf";
+        if (std::filesystem::exists(fontPath))
+        {
+            ImFont* pFont = io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 16.0f);
+            mFontMap["default"] = pFont;
+            mpActiveFont = pFont;
+        }
+    }
 
     // Create the pipeline state cache
     mpPipelineState = GraphicsState::create(mpDevice);

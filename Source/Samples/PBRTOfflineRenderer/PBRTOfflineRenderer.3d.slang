@@ -10,7 +10,7 @@ import Rendering.Lights.LightHelpers;
 #include "RenderPasses/FilamentFX/Shadow/FilamentShadow.slangh"
 #include "RenderPasses/FilamentFX/Lighting/FilamentIBLData.slang"
 #include "RenderPasses/FilamentFX/Lighting/FilamentIBL.slangh"
-#include "RenderPasses/FilamentFX/AO/FilamentAO.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentAO.slangh"
 
 cbuffer PerFrameCB
 {

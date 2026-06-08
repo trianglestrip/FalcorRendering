@@ -3,6 +3,8 @@ set_target_properties(PBRTOfflineRenderer PROPERTIES OUTPUT_NAME pbrt_viewer)
 
 target_include_directories(PBRTOfflineRenderer PRIVATE ${CMAKE_SOURCE_DIR}/third_party/taskflow)
 target_include_directories(PBRTOfflineRenderer PRIVATE ${CMAKE_SOURCE_DIR}/Source/RenderPasses/FilamentFX)
+target_include_directories(PBRTOfflineRenderer PRIVATE ${CMAKE_SOURCE_DIR}/Source/RenderPasses/DeferredAOPass)
+target_include_directories(PBRTOfflineRenderer PRIVATE ${CMAKE_SOURCE_DIR}/Source/RenderPasses/AutoExposurePass)
 
 target_sources(PBRTOfflineRenderer PRIVATE
     PBRTOfflineRenderer.cpp
@@ -15,7 +17,7 @@ target_sources(PBRTOfflineRenderer PRIVATE
 )
 
 # Link against FilamentPostProcessLib (standalone static library)
-target_link_libraries(PBRTOfflineRenderer PRIVATE FilamentPostProcessLib)
+target_link_libraries(PBRTOfflineRenderer PRIVATE FilamentPostProcessLib DeferredAOPassLib AutoExposurePassLib)
 
 target_copy_shaders(PBRTOfflineRenderer Samples/PBRTOfflineRenderer)
 target_copy_shaders(PBRTOfflineRenderer RenderPasses/FilamentFX)

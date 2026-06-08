@@ -2,6 +2,8 @@
  # Copyright (c) 2015-24, NVIDIA CORPORATION. All rights reserved.
  **************************************************************************/
 #include "PBRTOfflineRenderer.h"
+#include "Core/Platform/OS.h"
+#include "Scene/Importer.h"
 #include "Utils/Math/FalcorMath.h"
 #include "Utils/Settings/Settings.h"
 #include "Utils/SampleGenerators/HaltonSamplePattern.h"
@@ -125,6 +127,34 @@ namespace
         for (const auto& o : offsets)
             corners[count++] = c + o * e;
     }
+
+    bool isSupportedScenePath(const std::filesystem::path& path)
+    {
+        const std::string ext = getExtensionFromPath(path);
+        if (ext.empty())
+            return false;
+        for (const auto& supported : Importer::getSupportedExtensions())
+        {
+            if (ext == supported)
+                return true;
+        }
+        return false;
+    }
+
+    Settings buildSceneImportSettings(const std::filesystem::path& path)
+    {
+        Settings settings;
+        if (getExtensionFromPath(path) == "pbrt")
+        {
+            settings.addOptions(nlohmann::json{
+                {"PBRTImporter:rotateImageTextures90", false},
+                {"PBRTImporter:rotateImageTextures180", true},
+                {"PBRTImporter:flipTextureV", true},
+                {"PBRTImporter:usePBRTMaterials", true},
+            });
+        }
+        return settings;
+    }
 }
 
 PBRTOfflineRenderer::PBRTOfflineRenderer(const SampleAppConfig& c) : SampleApp(c), mExecutor(std::thread::hardware_concurrency())
@@ -202,7 +232,7 @@ void PBRTOfflineRenderer::setPreviewMode(bool enabled)
 void PBRTOfflineRenderer::onLoad(RenderContext* pCtx)
 {
     if (!mScenePath.empty()) loadScene(pCtx);
-    else logInfo("No scene. Drag .pbrt file, use path <file>, or choose a file in the UI.");
+    else logInfo("No scene. Drag a scene file (.pbrt/.obj/.gltf/...), use --scene <file>, or choose one in the UI.");
 }
 
 void PBRTOfflineRenderer::onShutdown()
@@ -219,14 +249,14 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
     mSceneLoaded = false;
     try
     {
-        Settings settings;
-        settings.addOptions(nlohmann::json{
-            {"PBRTImporter:rotateImageTextures90", false},
-            {"PBRTImporter:rotateImageTextures180", true},
-            {"PBRTImporter:flipTextureV", true},
-            {"PBRTImporter:usePBRTMaterials", true},
-        });
-        mpScene = Scene::create(getDevice(), mScenePath, settings);
+        if (!isSupportedScenePath(mScenePath))
+        {
+            logError("Unsupported scene extension: {}", mScenePath.extension().string());
+            logError("Supported extensions include: pbrt, pyscene, obj, gltf, glb, fbx, ... (requires importer plugins in bin/Release/plugins/)");
+            return;
+        }
+
+        mpScene = Scene::create(getDevice(), mScenePath, buildSceneImportSettings(mScenePath));
         if (!mpScene) { logError("Failed to load scene."); return; }
 
         auto pCam = mpScene->getCamera();
@@ -333,6 +363,12 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         logInfo("Creating Filament post-process.");
         Properties props;
         mpFilamentPostProcess = FilamentPostProcess::create(getDevice(), props);
+
+        logInfo("Creating Deferred AO pass.");
+        mpDeferredAOPass = DeferredAOPass::create(getDevice(), Properties{});
+
+        logInfo("Creating Auto Exposure pass.");
+        mpAutoExposurePass = AutoExposurePass::create(getDevice(), Properties{});
 
         logInfo("Loading Filament IBL.");
         mpFilamentIBL = FilamentIBL::create(getDevice());
@@ -726,6 +762,32 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
         mpFilamentPostProcess->executeDeferredSSAO(pCtx, mpIntermediateDepth, mpGBufferNormalW, mFilamentSettings);
     }
 
+    // --- Stage 3: Deferred AO (UE-style standalone pass) ---
+    if (mDeferredAOSettings.enabled && mpDeferredAOPass)
+    {
+        if (!mpDeferredAOTexture || mpDeferredAOTexture->getWidth() != frameDim.x || mpDeferredAOTexture->getHeight() != frameDim.y)
+        {
+            mpDeferredAOTexture = getDevice()->createTexture2D(
+                frameDim.x, frameDim.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::RenderTarget | ResourceBindFlags::UnorderedAccess);
+        }
+
+        // Sync DeferredAOPass params from UI settings
+        Properties daoProps;
+        daoProps["radius"] = mDeferredAOSettings.radius;
+        daoProps["intensity"] = mDeferredAOSettings.intensity;
+        daoProps["bias"] = mDeferredAOSettings.bias;
+        daoProps["power"] = mDeferredAOSettings.power;
+        daoProps["sampleCount"] = mDeferredAOSettings.sampleCount;
+        daoProps["blurRadius"] = mDeferredAOSettings.blurRadius;
+        daoProps["blurSharpness"] = mDeferredAOSettings.blurSharpness;
+        daoProps["normalMode"] = mDeferredAOSettings.normalMode;
+        mpDeferredAOPass->setProperties(daoProps);
+        mpDeferredAOPass->setScene(pCtx, mpScene);
+
+        mpDeferredAOPass->executeDirect(pCtx, mpIntermediateDepth, mpGBufferNormalW, mpDeferredAOTexture);
+    }
+
     auto pLightingFbo = Fbo::create(getDevice(), {mpIntermediateTexture});
     pCtx->clearFbo(pLightingFbo.get(), kClear, 1.f, 1.f, FboAttachmentType::All);
     pCtx->clearTexture(mpVelocityTexture.get(), float4(0.f, 0.f, 0.f, 0.f));
@@ -766,6 +828,26 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     }
 
     mpLightingPass->execute(pCtx, pLightingFbo);
+
+    // --- Stage 5: Auto Exposure (UE-style histogram + eye adaptation) ---
+    float exposureScale = 1.0f;
+    if (mAutoExposureSettings.enabled && mpAutoExposurePass)
+    {
+        Properties aeProps;
+        aeProps["minEV100"] = mAutoExposureSettings.minEV100;
+        aeProps["maxEV100"] = mAutoExposureSettings.maxEV100;
+        aeProps["speedUp"] = mAutoExposureSettings.speedUp;
+        aeProps["speedDown"] = mAutoExposureSettings.speedDown;
+        aeProps["exposureCompensation"] = mAutoExposureSettings.exposureCompensation;
+        aeProps["lowPercent"] = mAutoExposureSettings.lowPercent;
+        aeProps["highPercent"] = mAutoExposureSettings.highPercent;
+        aeProps["histogramMin"] = mAutoExposureSettings.histogramMin;
+        aeProps["histogramMax"] = mAutoExposureSettings.histogramMax;
+        aeProps["enabled"] = true;
+        mpAutoExposurePass->setProperties(aeProps);
+
+        exposureScale = mpAutoExposurePass->executeDirect(pCtx, mpIntermediateTexture);
+    }
 
     // Sync FilamentSettings to FilamentPostProcess pass
     if (mpFilamentPostProcess && mFilamentSettings.postProcessingEnabled && mDebugView == 0)
@@ -843,20 +925,17 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
     }
     w.text(mScenePath.empty() ? "Selected: <none>" : fmt::format("Selected: {}", mScenePath.string()));
     w.text(fmt::format("Frame: {}", mFrameCount));
-    if (w.button("Choose PBRT File"))
+    if (w.button("Choose Scene File"))
     {
         std::filesystem::path path = mScenePath;
-        const FileDialogFilterVec filters = {{"pbrt", "PBRT Scene"}, {"pyscene", "Falcor Python Scene"}};
-        if (openFileDialog(filters, path))
-        {
+        if (openFileDialog(Scene::getFileExtensionFilters(), path))
             mScenePath = path;
-        }
     }
-    if (w.button("Load Selected PBRT") && !mScenePath.empty())
+    if (w.button("Load Selected Scene") && !mScenePath.empty())
         loadScene(getRenderContext());
     if (w.button("Save Screenshot")) { if (mOutputPath.empty()) { mOutputPath = mScenePath; mOutputPath.replace_extension(".exr"); } saveOutput(getRenderContext()); }
     
-    if (auto g = w.group("Filament", true))
+    if (auto g = w.group("FilamentFX", true))
     {
         auto& s = mFilamentSettings;
 
@@ -877,7 +956,6 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
             viewGroup.checkbox("MSAA 4x", s.enableMSAA);
             if (auto msaaGroup = viewGroup.group("MSAA 4x"))
                 msaaGroup.checkbox("Custom resolve", s.msaaCustomResolve);
-            viewGroup.checkbox("SSAO", s.enableSSAO);
             viewGroup.checkbox("Screen-space reflections", s.enableSSR);
             viewGroup.checkbox("Screen-space Guard Band", s.screenSpaceGuardBand);
 
@@ -887,7 +965,6 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
                 {2, "Normal"},
                 {3, "Material ID"},
                 {4, "Instance ID"},
-                {5, "AO"},
                 {6, "Shadow"},
                 {7, "Shadow Map"},
             };
@@ -921,52 +998,6 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
             taaGroup.dropdown("Box Type", boxTypes, (uint32_t&)s.taaBoxType);
             taaGroup.slider("Variance Gamma", s.taaVarianceGamma, 0.75f, 1.25f);
             taaGroup.slider("RCAS", s.taaSharpness, 0.0f, 1.0f);
-        }
-
-        if (auto ssaoGroup = g.group("SSAO Options")) {
-            ssaoGroup.checkbox("Enabled", s.enableSSAO);
-            Gui::DropdownList aoTypes = {{0, "SAO"}, {1, "GTAO"}};
-            ssaoGroup.dropdown("AO Type", aoTypes, (uint32_t&)s.ssaoMode);
-            ssaoGroup.slider("Quality", s.ssaoQuality, 0, 3);
-            ssaoGroup.slider("Low Pass", s.ssaoLowPassFilter, 0, 2);
-            ssaoGroup.checkbox("Bent Normals", s.ssaoBentNormals);
-            ssaoGroup.checkbox("High quality upsampling", s.ssaoHighQualityUpsampling);
-            ssaoGroup.slider("Radius", s.ssaoRadius, 0.1f, 10.0f);
-            ssaoGroup.slider("Power", s.ssaoPower, 1.0f, 8.0f);
-
-            if (s.ssaoMode == 0) {
-                if (ssaoGroup.slider("Min Horizon angle", s.ssaoMinHorizonAngleRad, 0.0f, 0.785398f)) {
-                    const float v = std::sin(s.ssaoMinHorizonAngleRad);
-                    s.ssaoMinHorizonAngleSineSquared = v * v;
-                }
-            } else {
-                ssaoGroup.slider("Slice Count", s.gtaoSlices, 1, 10);
-                ssaoGroup.slider("Steps Per Slice", s.gtaoSteps, 1, 4);
-                ssaoGroup.checkbox("Use Visibility Bitmasks", s.gtaoUseVisibilityBitmasks);
-                if (s.gtaoUseVisibilityBitmasks) {
-                    ssaoGroup.slider("Constant Thickness", s.gtaoConstThickness, 0.01f, 10.0f);
-                    ssaoGroup.checkbox("Linear Thickness", s.gtaoLinearThickness);
-                }
-            }
-
-            ssaoGroup.slider("Bilateral Threshold", s.ssaoBilateralThreshold, 0.0f, 0.1f);
-            bool halfRes = s.ssaoResolution != 1.0f;
-            if (ssaoGroup.checkbox("Half resolution", halfRes))
-                s.ssaoResolution = halfRes ? 0.5f : 1.0f;
-
-            if (auto dlsGroup = ssaoGroup.group("Dominant Light Shadows (experimental)")) {
-                dlsGroup.checkbox("Enabled##dls", s.ssctEnabled);
-                dlsGroup.slider("Cone angle", s.ssctLightConeRad, 0.0f, 1.570796f);
-                dlsGroup.slider("Shadow Distance", s.ssctShadowDistance, 0.0f, 10.0f);
-                dlsGroup.slider("Contact dist max", s.ssctContactDistanceMax, 0.0f, 100.0f);
-                dlsGroup.slider("Intensity##dls", s.ssctIntensity, 0.0f, 10.0f);
-                dlsGroup.slider("Depth bias", s.ssctDepthBias, 0.0f, 1.0f);
-                dlsGroup.slider("Depth slope bias", s.ssctDepthSlopeBias, 0.0f, 1.0f);
-                dlsGroup.slider("Sample Count", s.ssctSampleCount, 1, 32);
-                dlsGroup.slider("Direction X##dls", s.ssctLightDirection.x, -1.0f, 1.0f);
-                dlsGroup.slider("Direction Y##dls", s.ssctLightDirection.y, -1.0f, 1.0f);
-                dlsGroup.slider("Direction Z##dls", s.ssctLightDirection.z, -1.0f, 1.0f);
-            }
         }
 
         if (auto ssrGroup = g.group("Screen-space reflections Options")) {
@@ -1134,6 +1165,102 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
         }
     }
 
+    if (auto aoW = w.group("FilamentAOPass", true))
+    {
+        auto& s = mFilamentSettings;
+
+        aoW.checkbox("Enable SSAO", s.enableSSAO);
+
+        bool aoDebugView = (mDebugView == 5);
+        if (aoW.checkbox("AO Debug View", aoDebugView))
+            mDebugView = aoDebugView ? 5 : 0;
+
+        if (auto ssaoGroup = aoW.group("SSAO Options")) {
+            Gui::DropdownList aoTypes = {{0, "SAO"}, {1, "GTAO"}};
+            ssaoGroup.dropdown("AO Type", aoTypes, (uint32_t&)s.ssaoMode);
+            ssaoGroup.slider("Quality", s.ssaoQuality, 0, 3);
+            ssaoGroup.slider("Low Pass", s.ssaoLowPassFilter, 0, 2);
+            ssaoGroup.checkbox("Bent Normals", s.ssaoBentNormals);
+            ssaoGroup.checkbox("High quality upsampling", s.ssaoHighQualityUpsampling);
+            ssaoGroup.slider("Radius", s.ssaoRadius, 0.1f, 10.0f);
+            ssaoGroup.slider("Power", s.ssaoPower, 1.0f, 8.0f);
+
+            if (s.ssaoMode == 0) {
+                if (ssaoGroup.slider("Min Horizon angle", s.ssaoMinHorizonAngleRad, 0.0f, 0.785398f)) {
+                    const float v = std::sin(s.ssaoMinHorizonAngleRad);
+                    s.ssaoMinHorizonAngleSineSquared = v * v;
+                }
+            } else {
+                ssaoGroup.slider("Slice Count", s.gtaoSlices, 1, 10);
+                ssaoGroup.slider("Steps Per Slice", s.gtaoSteps, 1, 4);
+                ssaoGroup.checkbox("Use Visibility Bitmasks", s.gtaoUseVisibilityBitmasks);
+                if (s.gtaoUseVisibilityBitmasks) {
+                    ssaoGroup.slider("Constant Thickness", s.gtaoConstThickness, 0.01f, 10.0f);
+                    ssaoGroup.checkbox("Linear Thickness", s.gtaoLinearThickness);
+                }
+            }
+
+            ssaoGroup.slider("Bilateral Threshold", s.ssaoBilateralThreshold, 0.0f, 0.1f);
+            bool halfRes = s.ssaoResolution != 1.0f;
+            if (ssaoGroup.checkbox("Half resolution", halfRes))
+                s.ssaoResolution = halfRes ? 0.5f : 1.0f;
+
+            if (auto dlsGroup = ssaoGroup.group("Dominant Light Shadows (experimental)")) {
+                dlsGroup.checkbox("Enabled##dls", s.ssctEnabled);
+                dlsGroup.slider("Cone angle", s.ssctLightConeRad, 0.0f, 1.570796f);
+                dlsGroup.slider("Shadow Distance", s.ssctShadowDistance, 0.0f, 10.0f);
+                dlsGroup.slider("Contact dist max", s.ssctContactDistanceMax, 0.0f, 100.0f);
+                dlsGroup.slider("Intensity##dls", s.ssctIntensity, 0.0f, 10.0f);
+                dlsGroup.slider("Depth bias", s.ssctDepthBias, 0.0f, 1.0f);
+                dlsGroup.slider("Depth slope bias", s.ssctDepthSlopeBias, 0.0f, 1.0f);
+                dlsGroup.slider("Sample Count", s.ssctSampleCount, 1, 32);
+                dlsGroup.slider("Direction X##dls", s.ssctLightDirection.x, -1.0f, 1.0f);
+                dlsGroup.slider("Direction Y##dls", s.ssctLightDirection.y, -1.0f, 1.0f);
+                dlsGroup.slider("Direction Z##dls", s.ssctLightDirection.z, -1.0f, 1.0f);
+            }
+        }
+    }
+
+    if (auto daoW = w.group("DeferredAOPass", true))
+    {
+        auto& d = mDeferredAOSettings;
+
+        daoW.checkbox("Enable Deferred AO", d.enabled);
+
+        if (auto daoGroup = daoW.group("Deferred AO Options"))
+        {
+            daoGroup.slider("Radius", d.radius, 0.1f, 10.0f);
+            daoGroup.slider("Intensity", d.intensity, 0.0f, 5.0f);
+            daoGroup.slider("Bias", d.bias, 0.001f, 0.5f);
+            daoGroup.slider("Power", d.power, 1.0f, 8.0f);
+            daoGroup.slider("Sample Count", d.sampleCount, 4u, 64u);
+            daoGroup.slider("Blur Radius", d.blurRadius, 0u, 8u);
+            daoGroup.slider("Blur Sharpness", d.blurSharpness, 1.0f, 200.0f);
+            Gui::DropdownList normalModes = {{0, "Packed [0,1]"}, {1, "Signed [-1,1]"}};
+            daoGroup.dropdown("Normal Mode", normalModes, d.normalMode);
+        }
+    }
+
+    if (auto aeW = w.group("AutoExposure", true))
+    {
+        auto& a = mAutoExposureSettings;
+
+        aeW.checkbox("Enable Auto Exposure", a.enabled);
+
+        if (auto aeGroup = aeW.group("Exposure Options"))
+        {
+            aeGroup.slider("Min EV100", a.minEV100, -20.0f, 0.0f);
+            aeGroup.slider("Max EV100", a.maxEV100, 0.0f, 30.0f);
+            aeGroup.slider("Speed Up", a.speedUp, 0.1f, 10.0f);
+            aeGroup.slider("Speed Down", a.speedDown, 0.1f, 10.0f);
+            aeGroup.slider("Exposure Compensation", a.exposureCompensation, -4.0f, 4.0f);
+            aeGroup.slider("Low Percent", a.lowPercent, 0.0f, 1.0f);
+            aeGroup.slider("High Percent", a.highPercent, 0.0f, 1.0f);
+            aeGroup.slider("Histogram Min", a.histogramMin, -16.0f, 0.0f);
+            aeGroup.slider("Histogram Max", a.histogramMax, 0.0f, 16.0f);
+        }
+    }
+
 }
 
 bool PBRTOfflineRenderer::onKeyEvent(const KeyboardEvent& e)
@@ -1172,8 +1299,15 @@ bool PBRTOfflineRenderer::onMouseEvent(const MouseEvent& e)
 
 void PBRTOfflineRenderer::onDroppedFile(const std::filesystem::path& p)
 {
-    auto ext = p.extension().string();
-    if (ext == ".pbrt" || ext == ".pyscene") { mScenePath = p; loadScene(getRenderContext()); }
+    if (isSupportedScenePath(p))
+    {
+        mScenePath = p;
+        loadScene(getRenderContext());
+    }
+    else
+    {
+        logWarning("Dropped file has unsupported extension: {}", p.extension().string());
+    }
 }
 
 struct PBRTOfflineRendererOptions
@@ -1251,14 +1385,8 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
         }
         else if (a == "--inspect-instance" && i + 1 < argc)
             options.inspectInstanceIDs.push_back(uint32_t(std::max(0, std::atoi(argv[++i]))));
-        else if (options.scenePath.empty())
-        {
-            std::filesystem::path pathArg(a);
-            std::string ext = pathArg.extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-            if (ext == ".pbrt" || ext == ".pyscene")
-                options.scenePath = pathArg;
-        }
+        else if (options.scenePath.empty() && isSupportedScenePath(a))
+            options.scenePath = a;
     }
     return options;
 }
@@ -1267,7 +1395,7 @@ int runMain(int argc, char** argv)
 {
     const auto options = parseArgs(argc, argv);
     SampleAppConfig c;
-    c.windowDesc.title = "PBRT Viewer - Falcor"; c.windowDesc.resizableWindow = true; c.windowDesc.width = options.width; c.windowDesc.height = options.height;
+    c.windowDesc.title = "Falcor Scene Viewer"; c.windowDesc.resizableWindow = true; c.windowDesc.width = options.width; c.windowDesc.height = options.height;
     c.headless = options.headless;
     c.showUI = !options.headless;
     PBRTOfflineRenderer app(c);

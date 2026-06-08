@@ -1,5 +1,5 @@
 #include "RenderPasses/FilamentFX/Utils/FilamentNoise.slangh"
-#include "RenderPasses/FilamentFX/AO/FilamentAO.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentAO.slangh"
 
 cbuffer PerFrameCB
 {

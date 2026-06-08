@@ -5,15 +5,6 @@ set(FILAMENT_FX_SHADER_FILES
     Utils/FilamentDepth.slangh
     Utils/FilamentGeometry.slangh
     Utils/FilamentNoise.slangh
-    AO/FilamentAO.slangh
-    AO/FilamentSSAOUtils.slangh
-    AO/FilamentSAOImpl.slangh
-    AO/FilamentGTAOImpl.slangh
-    AO/FilamentAOBilateral.slangh
-    AO/StructurePass.cs.slang
-    AO/SSAO.cs.slang
-    AO/DeferredSSAO.cs.slang
-    AO/GTAO.cs.slang
     Shadow/FilamentShadow.slangh
     Shadow/ShadowMap.cs.slang
     Shadow/ShadowEVSM.cs.slang
@@ -30,6 +21,19 @@ set(FILAMENT_FX_SHADER_FILES
     PostProcess/FilamentPostProcess.cs.slang
 )
 
+# AO shader files now live in FilamentAOPass/ (decoupled)
+set(FILAMENT_AO_EXTERNAL_SHADERS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../FilamentAOPass/FilamentAO.slangh
+    ${CMAKE_CURRENT_SOURCE_DIR}/../FilamentAOPass/FilamentSSAOUtils.slangh
+    ${CMAKE_CURRENT_SOURCE_DIR}/../FilamentAOPass/FilamentSAOImpl.slangh
+    ${CMAKE_CURRENT_SOURCE_DIR}/../FilamentAOPass/FilamentGTAOImpl.slangh
+    ${CMAKE_CURRENT_SOURCE_DIR}/../FilamentAOPass/FilamentAOBilateral.slangh
+    ${CMAKE_CURRENT_SOURCE_DIR}/../FilamentAOPass/StructurePass.cs.slang
+    ${CMAKE_CURRENT_SOURCE_DIR}/../FilamentAOPass/SSAO.cs.slang
+    ${CMAKE_CURRENT_SOURCE_DIR}/../FilamentAOPass/DeferredSSAO.cs.slang
+    ${CMAKE_CURRENT_SOURCE_DIR}/../FilamentAOPass/GTAO.cs.slang
+)
+
 # Plugin build (for Falcor RenderGraph integration)
 add_plugin(FilamentFX)
 
@@ -40,6 +44,7 @@ add_library(FilamentPostProcessLib STATIC
     FilamentIBL.cpp
     FilamentIBL.h
     ${FILAMENT_FX_SHADER_FILES}
+    ${FILAMENT_AO_EXTERNAL_SHADERS}
 )
 
 target_copy_shaders(FilamentPostProcessLib RenderPasses/FilamentFX)
@@ -56,9 +61,20 @@ target_sources(FilamentFX PRIVATE
     FilamentIBL.cpp
     FilamentIBL.h
     ${FILAMENT_FX_SHADER_FILES}
+    ${FILAMENT_AO_EXTERNAL_SHADERS}
 )
 
 target_compile_definitions(FilamentFX PRIVATE BUILDING_FILAMENT_FX)
 
 target_copy_shaders(FilamentFX RenderPasses/FilamentFX)
-target_source_group(FilamentFX "RenderPasses")
+# Use custom source_group to handle files from both FilamentFX and FilamentAOPass
+get_target_property(_fx_sources FilamentFX SOURCES)
+get_target_property(_fx_source_dir FilamentFX SOURCE_DIR)
+set(_fx_common_root ${CMAKE_CURRENT_SOURCE_DIR}/..)
+source_group(TREE ${_fx_common_root} FILES ${_fx_sources} PREFIX "")
+set_target_properties(FilamentFX PROPERTIES FOLDER "RenderPasses")
+
+get_target_property(_lib_sources FilamentPostProcessLib SOURCES)
+get_target_property(_lib_source_dir FilamentPostProcessLib SOURCE_DIR)
+source_group(TREE ${_fx_common_root} FILES ${_lib_sources} PREFIX "")
+set_target_properties(FilamentPostProcessLib PROPERTIES FOLDER "RenderPasses")

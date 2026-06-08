@@ -2,7 +2,7 @@
 // Prefiltered cubemap integration (IBL_INTEGRATION_PREFILTERED_CUBEMAP).
 
 #include "RenderPasses/FilamentFX/Lighting/FilamentPBR.slangh"
-#include "RenderPasses/FilamentFX/AO/FilamentAO.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentAO.slangh"
 
 #define MIN_PERCEPTUAL_ROUGHNESS 0.045
 #define IBL_SH_SENTINEL 65504.0

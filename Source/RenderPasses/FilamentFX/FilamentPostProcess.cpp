@@ -25,15 +25,15 @@ namespace
     const char kColorGradingShader[] = "RenderPasses/FilamentFX/PostProcess/ColorGrading.cs.slang";
     const char kBloomShader[] = "RenderPasses/FilamentFX/PostProcess/Bloom.cs.slang";
     const char kFXAAShader[] = "RenderPasses/FilamentFX/PostProcess/FXAA.cs.slang";
-    const char kStructureShader[] = "RenderPasses/FilamentFX/AO/StructurePass.cs.slang";
-    const char kSSAOShader[] = "RenderPasses/FilamentFX/AO/SSAO.cs.slang";
-    const char kDeferredSSAOShader[] = "RenderPasses/FilamentFX/AO/DeferredSSAO.cs.slang";
+    const char kStructureShader[] = "RenderPasses/FilamentAOPass/StructurePass.cs.slang";
+    const char kSSAOShader[] = "RenderPasses/FilamentAOPass/SSAO.cs.slang";
+    const char kDeferredSSAOShader[] = "RenderPasses/FilamentAOPass/DeferredSSAO.cs.slang";
     const char kShadowMapShader[] = "RenderPasses/FilamentFX/Shadow/ShadowMap.cs.slang";
     const char kShadowEVSMShader[] = "RenderPasses/FilamentFX/Shadow/ShadowEVSM.cs.slang";
     const char kDoFShader[] = "RenderPasses/FilamentFX/PostProcess/DoF.cs.slang";
     const char kFogShader[] = "RenderPasses/FilamentFX/PostProcess/Fog.cs.slang";
     const char kFSRShader[] = "RenderPasses/FilamentFX/PostProcess/FSR.cs.slang";
-    const char kGTAOShader[] = "RenderPasses/FilamentFX/AO/GTAO.cs.slang";
+    const char kGTAOShader[] = "RenderPasses/FilamentAOPass/GTAO.cs.slang";
     const char kTAAShader[] = "RenderPasses/FilamentFX/PostProcess/TAA.cs.slang";
 
     const uint32_t kNoiseTextureSize = 4; // 4x4 noise texture for SSAO

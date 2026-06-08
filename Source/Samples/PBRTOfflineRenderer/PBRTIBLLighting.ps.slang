@@ -2,7 +2,7 @@
  # PBRT preview deferred IBL lighting pass.
  **************************************************************************/
 
-#include "RenderPasses/FilamentFX/AO/FilamentAO.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentAO.slangh"
 #include "RenderPasses/FilamentFX/Lighting/FilamentPBR.slangh"
 #include "RenderPasses/FilamentFX/Shadow/FilamentShadow.slangh"
 

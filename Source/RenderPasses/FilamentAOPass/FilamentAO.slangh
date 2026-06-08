@@ -2,7 +2,7 @@
 // Supports full-res and half-res SSAO with bilateral upscale in forward/deferred pass.
 
 #include "RenderPasses/FilamentFX/Utils/FilamentDepth.slangh"
-#include "RenderPasses/FilamentFX/AO/FilamentSSAOUtils.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentSSAOUtils.slangh"
 
 cbuffer AODataCB
 {

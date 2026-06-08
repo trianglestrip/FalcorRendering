@@ -10,6 +10,8 @@
 #include "Scene/Lights/Light.h"
 #include "FilamentPostProcess.h"
 #include "FilamentIBL.h"
+#include "DeferredAOPass.h"
+#include "AutoExposurePass.h"
 #include "Utils/SampleGenerators/CPUSampleGenerator.h"
 #include <taskflow.hpp>
 
@@ -65,6 +67,10 @@ private:
     ref<FullScreenPass> mpLightingPass;
     ref<FilamentPostProcess> mpFilamentPostProcess;
     ref<FilamentIBL> mpFilamentIBL;
+    ref<DeferredAOPass> mpDeferredAOPass;
+    ref<AutoExposurePass> mpAutoExposurePass;
+    ref<Texture> mpDeferredAOTexture;
+    ref<Texture> mpExposureTexture;
     ref<Texture> mpIntermediateTexture;
     ref<Texture> mpVelocityTexture;
     ref<Texture> mpIntermediateDepth;
@@ -103,4 +109,35 @@ private:
     ref<Texture> mSaveTexture;
 
     FilamentPostProcess::FilamentSettings mFilamentSettings;
+
+    // DeferredAOPass settings (standard deferred SSAO)
+    struct DeferredAOSettings
+    {
+        bool enabled = false;
+        float radius = 1.5f;
+        float intensity = 0.8f;
+        float bias = 0.01f;
+        float power = 2.0f;
+        uint32_t sampleCount = 32;
+        uint32_t blurRadius = 4;
+        float blurSharpness = 40.0f;
+        uint32_t normalMode = 0;
+    };
+    DeferredAOSettings mDeferredAOSettings;
+
+    // AutoExposurePass settings (UE-style histogram + eye adaptation)
+    struct AutoExposureSettings
+    {
+        bool enabled = false;
+        float minEV100 = -10.0f;
+        float maxEV100 = 20.0f;
+        float speedUp = 2.0f;
+        float speedDown = 1.0f;
+        float exposureCompensation = 0.0f;
+        float lowPercent = 0.8f;
+        float highPercent = 0.98f;
+        float histogramMin = -8.0f;
+        float histogramMax = 4.0f;
+    };
+    AutoExposureSettings mAutoExposureSettings;
 };

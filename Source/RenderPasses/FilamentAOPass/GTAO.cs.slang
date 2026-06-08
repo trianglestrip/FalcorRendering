@@ -1,8 +1,8 @@
 // Filament GTAO — gtaoImpl.fs + gtao.mat
 
-#include "RenderPasses/FilamentFX/AO/FilamentSSAOUtils.slangh"
-#include "RenderPasses/FilamentFX/AO/FilamentGTAOImpl.slangh"
-#include "RenderPasses/FilamentFX/AO/FilamentAOBilateral.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentSSAOUtils.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentGTAOImpl.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentAOBilateral.slangh"
 
 cbuffer PerFrameCB
 {

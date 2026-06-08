@@ -3,7 +3,7 @@
  **************************************************************************/
 
 import Scene.Raster;
-#include "RenderPasses/FilamentFX/AO/FilamentAO.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentAO.slangh"
 
 #define MIN_PERCEPTUAL_ROUGHNESS 0.045f
 

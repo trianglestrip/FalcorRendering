@@ -1,8 +1,9 @@
-// Deferred SAO for MRT preview paths — normals from GBuffer.
+// Filament SAO (Scalable Ambient Obscurance) - strict alignment with saoImpl.fs + sao.mat
 
 #include "RenderPasses/FilamentFX/Utils/FilamentNoise.slangh"
-#include "RenderPasses/FilamentFX/AO/FilamentSSAOUtils.slangh"
-#include "RenderPasses/FilamentFX/AO/FilamentSAOImpl.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentSSAOUtils.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentSAOImpl.slangh"
+#include "RenderPasses/FilamentAOPass/FilamentAOBilateral.slangh"
 
 cbuffer PerFrameCB
 {
@@ -20,28 +21,28 @@ cbuffer PerFrameCB
     float2 gAngleIncCosSin;
     float  gInvFarPlane;
     int    gMaxLevel;
+    float2 gBlurAxis;
+    float  gFarPlaneOverEdgeDistance;
+    int    gBlurSampleCount;
+    float  gBlurKernel[16];
 };
 
 cbuffer CameraCB
 {
     float4x4 gInvProj;
-    float4x4 gInvView;
+    float    gNearPlane;
+    float    gFarPlane;
 };
 
+Texture2D<float> gDepth;
 Texture2D<float> gStructureDepth;
-Texture2D<float4> gNormalW;
+Texture2D<float4> gAOBuffer;
 RWTexture2D<float4> gDst;
+RWTexture2D<float4> gBlurredAO;
 SamplerState gPointSampler;
 
-float3 sampleWorldNormal(float2 uv)
-{
-    float3 normalW = gNormalW.SampleLevel(gPointSampler, uv, 0).xyz * 2.0 - 1.0;
-    float len2 = dot(normalW, normalW);
-    return (len2 > 1e-8) ? normalW * rsqrt(len2) : float3(0.0, 1.0, 0.0);
-}
-
 [numthreads(16, 16, 1)]
-void deferredSSAO(uint3 dispatchThreadId : SV_DispatchThreadID)
+void ssaoMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     if (any(dispatchThreadId.xy >= gResolution.xy)) return;
 
@@ -55,29 +56,27 @@ void deferredSSAO(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
 
-    float3 originW = FilamentComputeWorldPositionFromView(
-        FilamentComputeViewPosition(uv, depth, gInvProj), gInvView);
-    float3 normalW = sampleWorldNormal(uv);
-    float viewDepth = abs(FilamentComputeViewPosition(uv, depth, gInvProj).z);
+    float3 origin = FilamentComputeViewPosition(uv, depth, gInvProj);
+    float3 normal = FilamentSAOComputeViewSpaceNormalMediumQ(uv, origin, gResolution.zw, gInvProj);
 
     float noise = FilamentInterleavedGradientNoise(coord);
     float2 tapPosition = FilamentSAOStartPosition(noise);
     float2x2 angleStep = FilamentSAOTapAngleStep(gAngleIncCosSin);
-    float ssDiskRadius = gProjectionScaleRadius / max(viewDepth, 1e-4);
+    float ssDiskRadius = gProjectionScaleRadius / max(abs(origin.z), 1e-4);
 
     float obscurance = 0.0;
-    float3 bentNormal = normalW;
+    float3 bentNormal = normal;
     for (float i = 0.0; i < gSampleCount.x; i += 1.0)
     {
-        FilamentSAOComputeSampleWorld(
+        FilamentSAOComputeSampleView(
             obscurance,
 #if COMPUTE_BENT_NORMAL
             bentNormal,
 #endif
-            i, ssDiskRadius, uv, originW, normalW, viewDepth,
+            i, ssDiskRadius, uv, origin, normal, abs(origin.z),
             tapPosition, noise, gSampleCount.y,
             gInvRadiusSquared, gMinHorizonAngleSineSquared, gBias, gPeak2,
-            gMaxLevel, gResolution, gInvProj, gInvView);
+            gMaxLevel, gResolution, gInvProj);
         tapPosition = mul(angleStep, tapPosition);
     }
 
@@ -87,6 +86,18 @@ void deferredSSAO(uint3 dispatchThreadId : SV_DispatchThreadID)
     bentNormal = normalize(bentNormal);
 #endif
 
-    float packedZ = FilamentPackNormalizedDepth(-viewDepth, gInvFarPlane);
+    float packedZ = FilamentPackNormalizedDepth(origin.z, gInvFarPlane);
     gDst[dispatchThreadId.xy] = FilamentPackAOOutput(aoVisibility, packedZ, bentNormal);
+}
+
+[numthreads(16, 16, 1)]
+void ssaoBlur(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    if (any(dispatchThreadId.xy >= gResolution.xy)) return;
+
+    float2 coord = float2(dispatchThreadId.xy);
+    float2 uv = (coord + 0.5) * gResolution.zw;
+    gBlurredAO[dispatchThreadId.xy] = FilamentAOBilateralBlurCenter(
+        uv, coord, gAOBuffer, gPointSampler, gBlurAxis, gBlurSampleCount,
+        gFarPlaneOverEdgeDistance, gBlurKernel);
 }
