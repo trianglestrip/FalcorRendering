@@ -30,6 +30,12 @@
 #include "Material/HairMaterial.h"
 #include "Material/ClothMaterial.h"
 #include "Material/MaterialTextureLoader.h"
+#include "Material/PBRT/PBRTCoatedConductorMaterial.h"
+#include "Material/PBRT/PBRTCoatedDiffuseMaterial.h"
+#include "Material/PBRT/PBRTConductorMaterial.h"
+#include "Material/PBRT/PBRTDielectricMaterial.h"
+#include "Material/PBRT/PBRTDiffuseMaterial.h"
+#include "Material/PBRT/PBRTDiffuseTransmissionMaterial.h"
 #include "Utils/Logger.h"
 
 #include <lz4_stream/lz4_stream.h>
@@ -766,6 +772,24 @@ namespace Falcor
                 break;
             case MaterialType::Cloth:
                 pMaterial = ClothMaterial::create(pDevice, "");
+                break;
+            case MaterialType::PBRTDiffuse:
+                pMaterial = PBRTDiffuseMaterial::create(pDevice, "");
+                break;
+            case MaterialType::PBRTDiffuseTransmission:
+                pMaterial = PBRTDiffuseTransmissionMaterial::create(pDevice, "");
+                break;
+            case MaterialType::PBRTConductor:
+                pMaterial = PBRTConductorMaterial::create(pDevice, "");
+                break;
+            case MaterialType::PBRTDielectric:
+                pMaterial = PBRTDielectricMaterial::create(pDevice, "");
+                break;
+            case MaterialType::PBRTCoatedConductor:
+                pMaterial = PBRTCoatedConductorMaterial::create(pDevice, "");
+                break;
+            case MaterialType::PBRTCoatedDiffuse:
+                pMaterial = PBRTCoatedDiffuseMaterial::create(pDevice, "");
                 break;
             default:
                 FALCOR_THROW("Unsupported material type");

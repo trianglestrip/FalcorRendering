@@ -39,6 +39,7 @@ public:
     void setUseSceneCache(bool enabled) { mUseSceneCache = enabled; }
     void setRebuildSceneCache(bool enabled) { mRebuildSceneCache = enabled; }
     void setUsePBRTMaterials(bool enabled) { mUsePBRTMaterials = enabled; }
+    void setWarmupCache(bool enabled) { mWarmupCache = enabled; }
     void setEnableShadows(bool enabled)
     {
         mFilamentSettings.enableShadows = enabled;
@@ -60,6 +61,7 @@ private:
     void saveOutput(RenderContext* pCtx);
     void buildTaskGraph();
     void setLoadingStatus(const std::string& status);
+    void ensureRenderPasses(RenderContext* pCtx);
     void requestRenderTask(const std::string& name, RenderTaskQueue::Task task);
     void requestShadowWarmup();
     void requestDeferredAOWarmup();
@@ -120,6 +122,7 @@ private:
     bool mUseSceneCache = true;
     bool mRebuildSceneCache = false;
     bool mUsePBRTMaterials = true;
+    bool mWarmupCache = false;
     uint32_t mDebugView = 0;
     std::vector<uint32_t> mInspectInstanceIDs;
     std::mutex mSaveMutex;

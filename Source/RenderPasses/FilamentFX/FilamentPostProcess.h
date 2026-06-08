@@ -52,11 +52,11 @@ public:
         // SSAO (Filament SAO parameters)
         bool enableSSAO = true;
         bool forwardSSAO = true; // When true, SSAO is applied in forward pass (not colorGradingPrep)
-        float ssaoResolution = 0.5f;      // Filament AmbientOcclusionOptions.resolution (0.5 = half-res, 1.0 = full-res)
-        float ssaoRadius = 1.0f;          // PBRT viewer default; Filament engine default is 0.3m.
+        float ssaoResolution = 1.0f;      // Filament AmbientOcclusionOptions.resolution (0.5 = half-res, 1.0 = full-res)
+        float ssaoRadius = 0.55f;         // PBRT viewer default; Filament engine default is 0.3m.
         float ssaoBias = 0.001f;          // Filament default bias
-        float ssaoPower = 1.0f;           // power curve (doubled internally)
-        float ssaoIntensity = 1.0f;       // Filament default intensity.
+        float ssaoPower = 0.8f;           // power curve (doubled internally)
+        float ssaoIntensity = 0.55f;      // Filament default intensity.
         int   ssaoSampleCount = 11;       // Filament MEDIUM quality.
         int   ssaoSpiralTurns = 6;        // Filament MEDIUM quality.
         float ssaoMinHorizonAngleSineSquared = 0.0f;

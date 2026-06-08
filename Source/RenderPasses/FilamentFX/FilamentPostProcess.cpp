@@ -471,8 +471,8 @@ void FilamentPostProcess::executeStructure(RenderContext* pRenderContext, const 
 void FilamentPostProcess::updateAOTextures(ref<Device> pDevice, uint32_t width, uint32_t height, float resolutionScale)
 {
     const float scale = std::clamp(resolutionScale, 0.25f, 1.0f);
-    const uint32_t aoW = std::max(1u, uint32_t(std::ceil(float(width) * scale)));
-    const uint32_t aoH = std::max(1u, uint32_t(std::ceil(float(height) * scale)));
+    const uint32_t aoW = scale < 0.999f ? std::max(1u, (width + 1u) / 2u) : width;
+    const uint32_t aoH = scale < 0.999f ? std::max(1u, (height + 1u) / 2u) : height;
     mAOBufferWidth = aoW;
     mAOBufferHeight = aoH;
 

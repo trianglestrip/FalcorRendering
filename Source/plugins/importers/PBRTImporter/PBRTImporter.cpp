@@ -381,6 +381,7 @@ struct BuilderContext
     size_t curveCount = 0;
 
     bool usePBRTMaterials = false;
+    bool useMaterialTextures = true;
     bool rotateImageTextures90 = false;
     bool rotateImageTextures180 = false;
     bool flipTextureV = true;
@@ -1026,8 +1027,11 @@ FloatTexture createFloatTexture(BuilderContext& ctx, const TextureSceneEntity& e
     }
     else if (type == "imagemap")
     {
-        (void)params.getFloat("scale", 1.f);
-        floatTexture.texture = loadImageMapTexture(ctx, entity, floatTexture.transform);
+        const float scale = params.getFloat("scale", 1.f);
+        if (ctx.useMaterialTextures)
+            floatTexture.texture = loadImageMapTexture(ctx, entity, floatTexture.transform);
+        else
+            floatTexture.texture = scale;
     }
     else if (isUnsupportedTextureType(type) || type == "fbm" || type == "wrinkled" || type == "windy")
     {
@@ -1089,8 +1093,11 @@ SpectrumTexture createSpectrumTexture(BuilderContext& ctx, const TextureSceneEnt
     }
     else if (type == "imagemap")
     {
-        (void)params.getFloat("scale", 1.f);
-        spectrumTexture.texture = loadImageMapTexture(ctx, entity, spectrumTexture.transform);
+        const float scale = params.getFloat("scale", 1.f);
+        if (ctx.useMaterialTextures)
+            spectrumTexture.texture = loadImageMapTexture(ctx, entity, spectrumTexture.transform);
+        else
+            spectrumTexture.texture = makePbrtSpectrum(float3(scale));
     }
     else if (isUnsupportedTextureType(type) || type == "marble")
     {
@@ -1491,7 +1498,7 @@ Falcor::ref<Falcor::Material> createMaterial(BuilderContext& ctx, const Material
     }
 
     // Load normal map.
-    if (pMaterial)
+    if (pMaterial && ctx.useMaterialTextures)
     {
         auto normalmap = params.getString("normalmap", "");
         if (!normalmap.empty())
@@ -2407,6 +2414,7 @@ void PBRTImporter::importScene(
 
         pbrt::BuilderContext ctx{pbrtScene, builder, pbrtResources};
         ctx.usePBRTMaterials = builder.getSettings().getOption("PBRTImporter:usePBRTMaterials", false);
+        ctx.useMaterialTextures = builder.getSettings().getOption("PBRTImporter:useMaterialTextures", true);
         ctx.rotateImageTextures90 = builder.getSettings().getOption("PBRTImporter:rotateImageTextures90", false);
         ctx.rotateImageTextures180 = builder.getSettings().getOption("PBRTImporter:rotateImageTextures180", false);
         ctx.flipTextureV = builder.getSettings().getOption("PBRTImporter:flipTextureV", true);

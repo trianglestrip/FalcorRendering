@@ -295,7 +295,7 @@ namespace Falcor
             }
             catch (const std::exception& e)
             {
-                throw ImporterError(resolvedPath, "Failed to load scene cache: {}", e.what());
+                logWarning("Failed to load scene cache for '{}': {}. Re-importing scene.", resolvedPath.string(), e.what());
             }
         }
 
@@ -450,8 +450,15 @@ namespace Falcor
         // Write scene cache if requested.
         if (mWriteSceneCache)
         {
-            SceneCache::writeCache(mSceneData, mSceneCacheKey);
-            timeReport.measure("Writing cache");
+            try
+            {
+                SceneCache::writeCache(mSceneData, mSceneCacheKey);
+                timeReport.measure("Writing cache");
+            }
+            catch (const std::exception& e)
+            {
+                logWarning("Failed to write scene cache. Continuing without cache for this scene: {}", e.what());
+            }
         }
 
         const uint32_t invalidMeshWarnings = mMeshAttributeWarningStats.invalidMeshWarnings.load(std::memory_order_relaxed);

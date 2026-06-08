@@ -12,6 +12,7 @@ target_sources(PBRTOfflineRenderer PRIVATE
     PBRTOfflineRenderer.3d.slang
     ForwardFlat.3d.slang
     PBRTGBuffer.3d.slang
+    PBRTGBufferFast.3d.slang
     PBRTIBLLighting.ps.slang
     ShadowDepth.3d.slang
 )

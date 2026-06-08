@@ -25,9 +25,9 @@ namespace
     constexpr float kDefaultIblIntensityScale = 0.35f;
     constexpr float kPreviewIblIntensityScale = 0.35f;
     constexpr float kPreviewAmbientIntensity = 0.0f;
-    constexpr float kDefaultSSAORadius = 1.0f;
-    constexpr float kDefaultSSAOIntensity = 1.0f;
-    constexpr float kDefaultSSAOPower = 1.0f;
+    constexpr float kDefaultSSAORadius = 0.55f;
+    constexpr float kDefaultSSAOIntensity = 0.55f;
+    constexpr float kDefaultSSAOPower = 0.8f;
     constexpr float kDefaultSSAOResolution = 1.0f;
     constexpr float kDefaultSSAOBilateralThreshold = 0.05f;
     constexpr int kDefaultSSAOMode = 0;
@@ -156,6 +156,7 @@ namespace
                 {"PBRTImporter:rotateImageTextures180", true},
                 {"PBRTImporter:flipTextureV", true},
                 {"PBRTImporter:usePBRTMaterials", usePBRTMaterials},
+                {"PBRTImporter:useMaterialTextures", usePBRTMaterials},
             });
         }
         return settings;
@@ -261,9 +262,15 @@ void PBRTOfflineRenderer::onShutdown()
 void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
 {
     logInfo("Loading: {}", mScenePath.string());
-    TimeReport viewerTimeReport;
     mIsLoadingScene = true;
     mSceneLoaded = false;
+    mpGBufferPass = nullptr;
+    mpLightingPass = nullptr;
+    mpFilamentPostProcess = nullptr;
+    mpFilamentIBL = nullptr;
+    mpShadowRasterPass = nullptr;
+    mpDeferredAOPass = nullptr;
+    mpAutoExposurePass = nullptr;
     try
     {
         setLoadingStatus("Validating scene path");
@@ -373,37 +380,15 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
             }
         }
 
-        setLoadingStatus("Creating GBuffer pass");
-        logInfo("Creating PBRT GBuffer raster pass.");
-        ProgramDesc d;
-        d.addCompilerArguments({"-Wno-30081"});
-        d.addShaderModules(mpScene->getShaderModules());
-        d.addShaderLibrary("Samples/PBRTOfflineRenderer/PBRTGBuffer.3d.slang").vsEntry("vsMain").psEntry("psMain");
-        d.addTypeConformances(mpScene->getTypeConformances());
-        mpGBufferPass = RasterPass::create(getDevice(), d, mpScene->getSceneDefines());
-        viewerTimeReport.measure("PBRT viewer create GBuffer pass");
-
-        setLoadingStatus("Creating lighting pass");
-        logInfo("Creating PBRT IBL lighting pass.");
-        mpLightingPass = FullScreenPass::create(getDevice(), "Samples/PBRTOfflineRenderer/PBRTIBLLighting.ps.slang");
-        viewerTimeReport.measure("PBRT viewer create lighting pass");
-
-        logInfo("Deferring shadow resources until shadows are enabled.");
-        viewerTimeReport.measure("PBRT viewer defer shadow setup");
-
-        setLoadingStatus("Creating Filament post-process");
-        logInfo("Creating Filament post-process.");
-        Properties props;
-        mpFilamentPostProcess = FilamentPostProcess::create(getDevice(), props);
-        viewerTimeReport.measure("PBRT viewer create Filament post-process");
-
-        setLoadingStatus("Loading Filament IBL");
-        logInfo("Loading Filament IBL.");
-        mpFilamentIBL = FilamentIBL::create(getDevice());
-        mpFilamentIBL->loadDefault();
-        viewerTimeReport.measure("PBRT viewer load Filament IBL");
-        viewerTimeReport.addTotal("PBRT viewer setup total");
-        viewerTimeReport.printToLog();
+        if (mWarmupCache)
+        {
+            setLoadingStatus("Warming render pass cache");
+            ensureRenderPasses(pCtx);
+        }
+        else
+        {
+            logInfo("Deferring PBRT viewer render pass creation until first frame or explicit warmup.");
+        }
 
         logInfo("Using IBL-only preview lighting by default.");
         logInfo("Scene load complete.");
@@ -416,6 +401,67 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         mIsLoadingScene = false;
         setLoadingStatus("Scene load failed");
     }
+}
+
+void PBRTOfflineRenderer::ensureRenderPasses(RenderContext* pCtx)
+{
+    if (!mpScene)
+        return;
+    if (mpGBufferPass && mpLightingPass && mpFilamentPostProcess && mpFilamentIBL)
+        return;
+
+    TimeReport viewerTimeReport;
+
+    if (!mpGBufferPass)
+    {
+        setLoadingStatus("Creating GBuffer pass");
+        logInfo("Creating PBRT GBuffer raster pass.");
+        ProgramDesc d;
+        d.addCompilerArguments({"-Wno-30081"});
+        if (mUsePBRTMaterials)
+        {
+            d.addShaderModules(mpScene->getShaderModules());
+            d.addShaderLibrary("Samples/PBRTOfflineRenderer/PBRTGBuffer.3d.slang").vsEntry("vsMain").psEntry("psMain");
+            d.addTypeConformances(mpScene->getTypeConformances());
+        }
+        else
+        {
+            d.addShaderLibrary("Samples/PBRTOfflineRenderer/PBRTGBufferFast.3d.slang").vsEntry("vsMain").psEntry("psMain");
+        }
+        mpGBufferPass = RasterPass::create(getDevice(), d, mpScene->getSceneDefines());
+    }
+    viewerTimeReport.measure("PBRT viewer create GBuffer pass");
+
+    if (!mpLightingPass)
+    {
+        setLoadingStatus("Creating lighting pass");
+        logInfo("Creating PBRT IBL lighting pass.");
+        mpLightingPass = FullScreenPass::create(getDevice(), "Samples/PBRTOfflineRenderer/PBRTIBLLighting.ps.slang");
+    }
+    viewerTimeReport.measure("PBRT viewer create lighting pass");
+
+    logInfo("Deferring shadow resources until shadows are enabled.");
+    viewerTimeReport.measure("PBRT viewer defer shadow setup");
+
+    if (!mpFilamentPostProcess)
+    {
+        setLoadingStatus("Creating Filament post-process");
+        logInfo("Creating Filament post-process.");
+        Properties props;
+        mpFilamentPostProcess = FilamentPostProcess::create(getDevice(), props);
+    }
+    viewerTimeReport.measure("PBRT viewer create Filament post-process");
+
+    if (!mpFilamentIBL)
+    {
+        setLoadingStatus("Loading Filament IBL");
+        logInfo("Loading Filament IBL.");
+        mpFilamentIBL = FilamentIBL::create(getDevice());
+        mpFilamentIBL->loadDefault();
+    }
+    viewerTimeReport.measure("PBRT viewer load Filament IBL");
+    viewerTimeReport.addTotal("PBRT viewer setup total");
+    viewerTimeReport.printToLog();
 }
 
 void PBRTOfflineRenderer::setLoadingStatus(const std::string& status)
@@ -816,7 +862,7 @@ void PBRTOfflineRenderer::renderShadowMap(RenderContext* pCtx)
 void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFbo)
 {
     pCtx->clearFbo(pFbo.get(), kClear, 1.f, 0, FboAttachmentType::All);
-    if (!mSceneLoaded || !mpScene || !mpGBufferPass || !mpLightingPass)
+    if (!mSceneLoaded || !mpScene)
     {
         if (mSingleFrame && mFrameCount == 0)
         {
@@ -825,6 +871,10 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
         }
         return;
     }
+
+    ensureRenderPasses(pCtx);
+    if (!mpGBufferPass || !mpLightingPass)
+        return;
 
     mRenderTaskQueue.execute(pCtx, 1);
 
@@ -1477,7 +1527,8 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
             ssaoGroup.checkbox("Bent Normals", s.ssaoBentNormals);
             ssaoGroup.checkbox("High quality upsampling", s.ssaoHighQualityUpsampling);
             ssaoGroup.slider("Radius", s.ssaoRadius, 0.1f, 10.0f);
-            ssaoGroup.slider("Power", s.ssaoPower, 1.0f, 8.0f);
+            ssaoGroup.slider("Intensity", s.ssaoIntensity, 0.0f, 4.0f);
+            ssaoGroup.slider("Power", s.ssaoPower, 0.25f, 8.0f);
 
             if (s.ssaoMode == 0) {
                 if (ssaoGroup.slider("Min Horizon angle", s.ssaoMinHorizonAngleRad, 0.0f, 0.785398f)) {
@@ -1638,6 +1689,7 @@ struct PBRTOfflineRendererOptions
     bool useSceneCache = true;
     bool rebuildSceneCache = false;
     bool usePBRTMaterials = true;
+    bool explicitMaterialMode = false;
     float ssaoResolution = 0.0f;
     uint32_t debugView = 0;
     uint32_t width = 1920;
@@ -1673,9 +1725,15 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
         else if (a == "--rebuild-scene-cache")
             options.rebuildSceneCache = true;
         else if (a == "--fast-materials")
+        {
             options.usePBRTMaterials = false;
+            options.explicitMaterialMode = true;
+        }
         else if (a == "--pbrt-materials")
+        {
             options.usePBRTMaterials = true;
+            options.explicitMaterialMode = true;
+        }
         else if (a == "--enable-shadows")
             options.enableShadows = true;
         else if (a == "--deferred-ao")
@@ -1726,6 +1784,8 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
         else if (options.scenePath.empty() && isSupportedScenePath(a))
             options.scenePath = a;
     }
+    if (options.preview && !options.explicitMaterialMode)
+        options.usePBRTMaterials = false;
     return options;
 }
 
@@ -1750,6 +1810,8 @@ int runMain(int argc, char** argv)
     );
     if (options.warmupCache)
         logInfo("PBRT viewer cache warmup enabled: prewarming scene cache, GBuffer, lighting, shadow, Filament deferred AO, and post-process shaders.");
+    if (options.preview && !options.explicitMaterialMode && !options.usePBRTMaterials)
+        logInfo("Preview mode defaults to fast materials. Pass --pbrt-materials to use PBRT material shaders.");
     if (options.headless)
     {
         app.setHeadlessProbeMode(true);
@@ -1769,6 +1831,7 @@ int runMain(int argc, char** argv)
     app.setUseSceneCache(options.useSceneCache);
     app.setRebuildSceneCache(options.rebuildSceneCache);
     app.setUsePBRTMaterials(options.usePBRTMaterials);
+    app.setWarmupCache(options.warmupCache);
     app.setDebugView(options.debugView);
     app.setInspectInstanceIDs(options.inspectInstanceIDs);
     return app.run();

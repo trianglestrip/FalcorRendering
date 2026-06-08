@@ -60,10 +60,11 @@ float4 FilamentAOSampleHalfResNeighbors(float2 uv, out float4 aoSamples, out flo
     float2 size = gSSAOBufferSize;
     float4 b = FilamentAOBilinearWeights(uv, size);
     int2 base = int2(floor(uv * size - 0.5));
-    float4 s01 = gSSAO.Load(int3(base + int2(0, 1), 0));
-    float4 s11 = gSSAO.Load(int3(base + int2(1, 1), 0));
-    float4 s10 = gSSAO.Load(int3(base + int2(1, 0), 0));
-    float4 s00 = gSSAO.Load(int3(base + int2(0, 0), 0));
+    int2 maxCoord = int2(size) - 1;
+    float4 s01 = gSSAO.Load(int3(clamp(base + int2(0, 1), int2(0), maxCoord), 0));
+    float4 s11 = gSSAO.Load(int3(clamp(base + int2(1, 1), int2(0), maxCoord), 0));
+    float4 s10 = gSSAO.Load(int3(clamp(base + int2(1, 0), int2(0), maxCoord), 0));
+    float4 s00 = gSSAO.Load(int3(clamp(base + int2(0, 0), int2(0), maxCoord), 0));
     aoSamples = float4(s01.r, s11.r, s10.r, s00.r);
     depthSamples = float4(s01.g, s11.g, s10.g, s00.g);
     return b;
@@ -131,10 +132,11 @@ float3 evaluateSSAOBentNormalHalfResUpsample(float2 uv)
     float4 aoSamples;
     float4 b = FilamentAOSampleHalfResNeighbors(uv, aoSamples, depthSamples);
     int2 base = int2(floor(uv * gSSAOBufferSize - 0.5));
-    float4 s01 = gSSAO.Load(int3(base + int2(0, 1), 0));
-    float4 s11 = gSSAO.Load(int3(base + int2(1, 1), 0));
-    float4 s10 = gSSAO.Load(int3(base + int2(1, 0), 0));
-    float4 s00 = gSSAO.Load(int3(base + int2(0, 0), 0));
+    int2 maxCoord = int2(gSSAOBufferSize) - 1;
+    float4 s01 = gSSAO.Load(int3(clamp(base + int2(0, 1), int2(0), maxCoord), 0));
+    float4 s11 = gSSAO.Load(int3(clamp(base + int2(1, 1), int2(0), maxCoord), 0));
+    float4 s10 = gSSAO.Load(int3(clamp(base + int2(1, 0), int2(0), maxCoord), 0));
+    float4 s00 = gSSAO.Load(int3(clamp(base + int2(0, 0), int2(0), maxCoord), 0));
 
     float depth = gAODepth.SampleLevel(gAODepthPointSampler, uv, 0);
     if (FilamentIsSkyDepth(depth))
