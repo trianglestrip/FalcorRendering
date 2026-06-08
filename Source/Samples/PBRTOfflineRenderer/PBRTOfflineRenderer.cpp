@@ -245,6 +245,26 @@ void PBRTOfflineRenderer::setPreviewMode(bool enabled)
     mFilamentSettings.ambientIntensity = kPreviewAmbientIntensity;
 }
 
+void PBRTOfflineRenderer::setRealtimeGIEnabled(bool enabled)
+{
+    applyRealtimeGIPreset(enabled);
+}
+
+void PBRTOfflineRenderer::applyRealtimeGIPreset(bool enabled)
+{
+    mRealtimeGIEnabled = enabled;
+    if (!enabled)
+        return;
+
+    mFilamentSettings.postProcessingEnabled = true;
+    mFilamentSettings.iblIntensity = std::max(mFilamentSettings.iblIntensity, mRealtimeGIBounceIntensity);
+    mFilamentSettings.enableSSAO = false;
+    mDeferredAOSettings.enabled = false;
+
+    if (mRealtimeGIUseShadows)
+        setEnableShadows(true);
+}
+
 void PBRTOfflineRenderer::onLoad(RenderContext* pCtx)
 {
     if (!mScenePath.empty()) loadScene(pCtx);
@@ -1100,7 +1120,7 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
     // Filament gltf_viewer-style sidebar: no title bar, left docked, full height.
     const uint32_t sidebarHeight = (uint32_t)std::max(1.0f, ImGui::GetIO().DisplaySize.y);
     const Gui::WindowFlags kFilamentSidebarFlags = Gui::WindowFlags::AllowMove | Gui::WindowFlags::SetFocus;
-    Gui::Window w(pGui, "Filament", {380, sidebarHeight}, {0, 0}, kFilamentSidebarFlags);
+    Gui::Window w(pGui, mRealtimeGIOnlyUI ? "PBRT Realtime GI" : "Filament", {380, sidebarHeight}, {0, 0}, kFilamentSidebarFlags);
     if (!mLoadingStatus.empty())
         w.text(fmt::format("Status: {}", mLoadingStatus));
     if (!mRenderTaskQueue.empty() || !mRenderTaskQueue.getCurrentTaskName().empty())
@@ -1121,6 +1141,90 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
     }
     w.text(mScenePath.empty() ? "Selected: <none>" : fmt::format("Selected: {}", mScenePath.string()));
     w.text(fmt::format("Frame: {}", mFrameCount));
+
+    if (mRealtimeGIOnlyUI)
+    {
+        auto& s = mFilamentSettings;
+        auto& d = mDeferredAOSettings;
+
+        if (auto giGroup = w.group("Realtime GI", true))
+        {
+            if (giGroup.checkbox("Enabled", mRealtimeGIEnabled))
+            {
+                if (mRealtimeGIEnabled)
+                    applyRealtimeGIPreset(true);
+                else
+                    s.iblIntensity = kPreviewIblIntensityScale;
+            }
+
+            if (giGroup.slider("Indirect intensity", mRealtimeGIBounceIntensity, 0.0f, 4.0f) && mRealtimeGIEnabled)
+                s.iblIntensity = mRealtimeGIBounceIntensity;
+            giGroup.slider("IBL intensity", s.iblIntensity, 0.0f, 10.0f);
+            s.iblIntensity = std::clamp(s.iblIntensity, 0.0f, 10.0f);
+            s.enableSSAO = false;
+            d.enabled = false;
+        }
+
+        if (auto lightingGroup = w.group("Lighting", true))
+        {
+            lightingGroup.slider("IBL intensity", s.iblIntensity, 0.0f, 10.0f);
+            s.iblIntensity = std::clamp(s.iblIntensity, 0.0f, 10.0f);
+            lightingGroup.slider("IBL rotation", s.iblRotation, -3.14159f, 3.14159f);
+            if (mpFilamentIBL)
+            {
+                lightingGroup.text(mpFilamentIBL->usingPlaceholder()
+                    ? "IBL: procedural placeholder"
+                    : "IBL: data/ibl/lightroom_14b");
+            }
+
+            lightingGroup.checkbox("Sunlight", s.enableSunlight);
+            lightingGroup.slider("Sun intensity", s.sunIntensity, 0.0f, 150000.0f);
+            lightingGroup.slider("Sun radius [deg]", s.sunAngularRadiusDeg, 0.25f, 20.0f);
+            lightingGroup.slider("Sun direction X", s.sunDirection.x, -1.0f, 1.0f);
+            lightingGroup.slider("Sun direction Y", s.sunDirection.y, -1.0f, 1.0f);
+            lightingGroup.slider("Sun direction Z", s.sunDirection.z, -1.0f, 1.0f);
+            if (lightingGroup.button("Normalize Sun direction"))
+                s.sunDirection = normalize(s.sunDirection);
+
+            Gui::DropdownList debugViews = {
+                {0, "Shaded"},
+                {6, "Shadow"},
+                {7, "Shadow Map"},
+            };
+            lightingGroup.dropdown("Debug View", debugViews, mDebugView);
+        }
+
+        if (auto shadowGroup = w.group("Shadows", true))
+        {
+            if (shadowGroup.checkbox("Enabled", mRealtimeGIUseShadows))
+            {
+                if (mRealtimeGIUseShadows)
+                {
+                    setEnableShadows(true);
+                    requestShadowWarmup();
+                }
+                else
+                    s.enableShadows = false;
+            }
+            s.enableShadows = mRealtimeGIUseShadows;
+
+            shadowGroup.slider("Shadow map size", s.shadowMapSize, 256u, 2048u);
+            shadowGroup.slider("Cascades", s.shadowCascades, 1, 4);
+            shadowGroup.slider("Bias", s.shadowBias, 0.0f, 0.01f);
+            shadowGroup.checkbox("Stable Shadows", s.shadowStable);
+            shadowGroup.checkbox("Contact shadows", s.enableContactShadows);
+            Gui::DropdownList shadowTypes = {{0, "PCF"}, {1, "VSM"}, {2, "DPCF"}, {3, "PCSS"}, {4, "PCFd"}};
+            if (shadowGroup.dropdown("Shadow type", shadowTypes, (uint32_t&)s.shadowTypeFilament))
+                s.shadowType = (s.shadowTypeFilament == 1) ? 2 : 1;
+            if (s.shadowTypeFilament == 1)
+                shadowGroup.slider("VSM blur", s.vsmBlurWidth, 0.0f, 125.0f);
+            else if (s.shadowTypeFilament == 2 || s.shadowTypeFilament == 3)
+                shadowGroup.slider("Penumbra scale", s.softShadowPenumbraScale, 0.0f, 100.0f);
+        }
+
+        return;
+    }
+
     if (w.button("Choose Scene File"))
     {
         std::filesystem::path path = mScenePath;
@@ -1787,6 +1891,7 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
     return options;
 }
 
+#ifndef PBRT_OFFLINE_RENDERER_LIBRARY
 int runMain(int argc, char** argv)
 {
     auto options = parseArgs(argc, argv);
@@ -1835,3 +1940,4 @@ int runMain(int argc, char** argv)
     return app.run();
 }
 int main(int argc, char** argv) { return catchAndReportAllExceptions([&]() { return runMain(argc, argv); }); }
+#endif

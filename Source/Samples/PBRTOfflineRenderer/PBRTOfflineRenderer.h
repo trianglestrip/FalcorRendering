@@ -52,6 +52,8 @@ public:
     void setEnableSSAO(bool enabled) { mFilamentSettings.enableSSAO = enabled; }
     void setSSAOResolution(float resolution) { mFilamentSettings.ssaoResolution = resolution; }
     void setEnableDeferredAO(bool enabled) { mDeferredAOSettings.enabled = enabled; }
+    void setRealtimeGIEnabled(bool enabled);
+    void setRealtimeGIOnlyUI(bool enabled) { mRealtimeGIOnlyUI = enabled; }
     void setInspectInstanceIDs(std::vector<uint32_t> ids) { mInspectInstanceIDs = std::move(ids); }
     void setHeadlessProbeMode(bool enabled);
     void setPreviewMode(bool enabled);
@@ -75,6 +77,7 @@ private:
     void syncFilamentCameraSettings();
     void syncFilamentSunLight();
     void initSunFromScene();
+    void applyRealtimeGIPreset(bool enabled);
 
     std::filesystem::path mScenePath, mLoadedScenePath, mOutputPath;
     ref<Scene> mpScene;
@@ -123,6 +126,11 @@ private:
     bool mRebuildSceneCache = false;
     bool mUsePBRTMaterials = true;
     bool mWarmupCache = false;
+    bool mRealtimeGIEnabled = false;
+    bool mRealtimeGIOnlyUI = false;
+    float mRealtimeGIBounceIntensity = 1.25f;
+    bool mRealtimeGIUseDeferredAO = true;
+    bool mRealtimeGIUseShadows = true;
     uint32_t mDebugView = 0;
     std::vector<uint32_t> mInspectInstanceIDs;
     std::mutex mSaveMutex;
