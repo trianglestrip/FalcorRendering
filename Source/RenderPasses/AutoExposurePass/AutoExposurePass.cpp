@@ -3,6 +3,7 @@
  **************************************************************************/
 #include "AutoExposurePass.h"
 #include <chrono>
+#include <cmath>
 
 namespace
 {
@@ -53,6 +54,8 @@ AutoExposurePass::AutoExposurePass(ref<Device> pDevice, const Properties& props)
     linDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Point);
     linDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
     mpLinearSampler = mpDevice->createSampler(linDesc);
+
+    mpReadbackFence = mpDevice->createFence();
 }
 
 void AutoExposurePass::parseProperties(const Properties& props)
@@ -179,10 +182,14 @@ void AutoExposurePass::execute(RenderContext* pRenderContext, const RenderData& 
         mpExposurePass->execute(pRenderContext, uint3(256, 1, 1));
     }
 
-    // Read back the adapted exposure
-    // NOTE: For simplicity, we read the first float of the exposure buffer
-    // In a production pipeline, you'd use a persistent UAV or readback
-    // Here we keep mCurrentExposure as state that the shader updates each frame
+    pRenderContext->copyResource(mpExposureReadbackBuffer.get(), mpExposureBuffer.get());
+    pRenderContext->submit(false);
+    pRenderContext->signal(mpReadbackFence.get());
+    mpReadbackFence->wait();
+    const float4* pExposure = static_cast<const float4*>(mpExposureReadbackBuffer->map());
+    if (pExposure && std::isfinite(pExposure[0].x) && pExposure[0].x > 0.0f)
+        mCurrentExposure = pExposure[0].x;
+    mpExposureReadbackBuffer->unmap();
 }
 
 float AutoExposurePass::executeDirect(RenderContext* pCtx, const ref<Texture>& pColor)
@@ -246,9 +253,15 @@ float AutoExposurePass::executeDirect(RenderContext* pCtx, const ref<Texture>& p
         mpExposurePass->execute(pCtx, uint3(256, 1, 1));
     }
 
-    // The shader writes adapted exposure to mpExposureBuffer UAV.
-    // For the return value, we use the previous frame's adapted exposure
-    // (eye adaptation is smooth so one-frame lag is imperceptible).
+    pCtx->copyResource(mpExposureReadbackBuffer.get(), mpExposureBuffer.get());
+    pCtx->submit(false);
+    pCtx->signal(mpReadbackFence.get());
+    mpReadbackFence->wait();
+    const float4* pExposure = static_cast<const float4*>(mpExposureReadbackBuffer->map());
+    if (pExposure && std::isfinite(pExposure[0].x) && pExposure[0].x > 0.0f)
+        mCurrentExposure = pExposure[0].x;
+    mpExposureReadbackBuffer->unmap();
+
     return mCurrentExposure;
 }
 
@@ -295,5 +308,13 @@ void AutoExposurePass::ensureTextures(uint32_t width, uint32_t height)
             sizeof(float4), 1,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
             MemoryType::DeviceLocal, nullptr, false);
+    }
+
+    if (!mpExposureReadbackBuffer)
+    {
+        mpExposureReadbackBuffer = mpDevice->createStructuredBuffer(
+            sizeof(float4), 1,
+            ResourceBindFlags::None,
+            MemoryType::ReadBack, nullptr, false);
     }
 }

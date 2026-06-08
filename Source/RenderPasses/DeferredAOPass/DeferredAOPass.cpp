@@ -124,7 +124,7 @@ void DeferredAOPass::execute(RenderContext* pRenderContext, const RenderData& re
     {
         auto var = mpAOPass->getRootVar();
         auto cb = var["PerFrameCB"];
-        cb["gBlurResolution"] = uint2(width, height);
+        cb["gResolution"] = uint2(width, height);
         cb["gInvProj"] = mInvProj;
         cb["gInvViewProj"] = mInvViewProj;
         cb["gCameraPos"] = mCameraPos;
@@ -156,7 +156,7 @@ void DeferredAOPass::execute(RenderContext* pRenderContext, const RenderData& re
     {
         auto var = mpBlurPass->getRootVar();
         auto cb = var["BlurCB"];
-        cb["gResolution"] = uint2(width, height);
+        cb["gBlurResolution"] = uint2(width, height);
         cb["gBlurAxis"] = axes[i];
         cb["gBlurRadius"] = std::min(mBlurRadius, 8u);
         cb["gBlurSharpness"] = mBlurSharpness;
@@ -180,7 +180,7 @@ void DeferredAOPass::executeDirect(RenderContext* pCtx, const ref<Texture>& pDep
     {
         auto var = mpAOPass->getRootVar();
         auto cb = var["PerFrameCB"];
-        cb["gBlurResolution"] = uint2(width, height);
+        cb["gResolution"] = uint2(width, height);
         cb["gInvProj"] = mInvProj;
         cb["gInvViewProj"] = mInvViewProj;
         cb["gCameraPos"] = mCameraPos;
@@ -211,7 +211,7 @@ void DeferredAOPass::executeDirect(RenderContext* pCtx, const ref<Texture>& pDep
     {
         auto var = mpBlurPass->getRootVar();
         auto cb = var["BlurCB"];
-        cb["gResolution"] = uint2(width, height);
+        cb["gBlurResolution"] = uint2(width, height);
         cb["gBlurAxis"] = axes[i];
         cb["gBlurRadius"] = std::min(mBlurRadius, 8u);
         cb["gBlurSharpness"] = mBlurSharpness;

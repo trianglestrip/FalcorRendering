@@ -123,11 +123,10 @@ void deferredAOBlur(uint3 dispatchThreadId : SV_DispatchThreadID)
     float ao = center.r;
 
     int radius = int(min(gBlurRadius, 8u));
-    int2 axis = int2(round(gBlurAxis));
+    int2 axis = int2(gBlurAxis.x > 0.5 ? 1 : 0, gBlurAxis.y > 0.5 ? 1 : 0);
     for (int i = 1; i <= radius; ++i)
     {
         float spatial = exp(-float(i * i) / max(float(radius * radius), 1.0));
-        [unroll]
         for (int side = -1; side <= 1; side += 2)
         {
             int2 p = clamp(coord + axis * i * side, int2(0), int2(gBlurResolution) - 1);

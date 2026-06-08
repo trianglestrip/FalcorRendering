@@ -53,8 +53,10 @@ private:
     void loadScene(RenderContext* pCtx);
     void saveOutput(RenderContext* pCtx);
     void buildTaskGraph();
+    void setLoadingStatus(const std::string& status);
     void renderShadowMap(RenderContext* pCtx);
     void ensureShadowMapResources();
+    void ensureShadowPassResources();
     void setShadowShaderVars(const ShaderVar& var);
     void setAOShaderVars(const ShaderVar& var);
     void syncFilamentCameraSettings();
@@ -95,6 +97,8 @@ private:
 
     uint32_t mFrameCount = 0;
     bool mSceneLoaded = false;
+    bool mIsLoadingScene = false;
+    std::string mLoadingStatus;
     double mStartTime = 0.0;
 
     // Taskflow for parallel processing

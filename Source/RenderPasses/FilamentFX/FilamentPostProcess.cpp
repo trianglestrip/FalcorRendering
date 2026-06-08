@@ -195,59 +195,9 @@ FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& 
 {
     parseProperties(props);
 
-    DefineList defines;
-    DefineList aoDefines;
-    aoDefines.add("COMPUTE_BENT_NORMAL", "0");
-    aoDefines.add("USE_VISIBILITY_BITMASKS", "0");
-
-    auto createComputePass = [&](const char* shaderPath, const char* entryPoint, const DefineList& passDefines) {
-        ProgramDesc desc;
-        desc.addShaderLibrary(shaderPath).csEntry(entryPoint);
-        desc.addCompilerArguments({"-Wno-30081"});
-        return ComputePass::create(mpDevice, desc, passDefines);
-    };
-
-    // Color Grading prep (AO/shadow before TAA) + composite (bloom/grading after DoF)
-    mpColorGradingPrepPass = createComputePass(kColorGradingShader, "colorGradingPrep", defines);
-    mpColorGradingPass = createComputePass(kColorGradingShader, "colorGradingMain", defines);
-
-    // Bloom
-    mpBloomDownsamplePass = createComputePass(kBloomShader, "bloomDownsample", defines);
-    mpBloomUpsamplePass = createComputePass(kBloomShader, "bloomUpsample", defines);
-
-    // FXAA
-    mpFXAAPass = createComputePass(kFXAAShader, "fxaaMain", defines);
-
-    // Structure depth pyramid
-    mpStructureCopyPass = createComputePass(kStructureShader, "structureCopy", defines);
-    mpStructureMipmapPass = createComputePass(kStructureShader, "structureMipmap", defines);
-
-    // SSAO
-    mpSSAOPass = createComputePass(kSSAOShader, "ssaoMain", aoDefines);
-    mpDeferredSSAOPass = createComputePass(kDeferredSSAOShader, "deferredSSAO", aoDefines);
-    mpSSAOBlurPass = createComputePass(kSSAOShader, "ssaoBlur", aoDefines);
-
-    // Shadow Map
-    mpShadowMapPass = createComputePass(kShadowMapShader, "shadowMapMain", defines);
-    mpShadowEVSMBlurPass = createComputePass(kShadowEVSMShader, "evsmBlur", defines);
-
-    // Depth of Field
-    mpDoFPass = createComputePass(kDoFShader, "dofMain", defines);
-
-    // Fog
-    mpFogPass = createComputePass(kFogShader, "fogMain", defines);
-    mpFSRPass = createComputePass(kFSRShader, "fsrRcasMain", defines);
-    mpGTAOPass = createComputePass(kGTAOShader, "gtaoMain", aoDefines);
-
-    // TAA
-    mpTAAPass = createComputePass(kTAAShader, "taaMain", defines);
-
     // Samplers
     mpLinearSampler = createClampSampler(pDevice, TextureFilteringMode::Linear);
     mpPointSampler = createClampSampler(pDevice, TextureFilteringMode::Point);
-
-    // Create SSAO noise texture
-    createNoiseTexture(pDevice);
 
     // Fallback textures when AO/shadow/motion/LUT paths are disabled
     const float whitePixel[4] = {1.f, 1.f, 1.f, 1.f};
@@ -264,10 +214,107 @@ FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& 
 
     const float identityLUT[4] = {1.f, 1.f, 1.f, 1.f};
     mpIdentityLUT = create1x1Texture3D(pDevice, ResourceFormat::RGBA16Float, identityLUT);
+}
 
-    // Procedural 3D color grading LUT (exposure/contrast/saturation/vibrance baked on change)
-    FilamentSettings defaultLUTSettings;
-    updateColorGradingLUT(pDevice, defaultLUTSettings);
+ref<ComputePass> FilamentPostProcess::createComputePass(const char* shaderPath, const char* entryPoint, const DefineList& defines)
+{
+    ProgramDesc desc;
+    desc.addShaderLibrary(shaderPath).csEntry(entryPoint);
+    desc.addCompilerArguments({"-Wno-30081"});
+    return ComputePass::create(mpDevice, desc, defines);
+}
+
+void FilamentPostProcess::ensureColorGradingPasses()
+{
+    DefineList defines;
+    if (!mpColorGradingPrepPass)
+        mpColorGradingPrepPass = createComputePass(kColorGradingShader, "colorGradingPrep", defines);
+    if (!mpColorGradingPass)
+        mpColorGradingPass = createComputePass(kColorGradingShader, "colorGradingMain", defines);
+}
+
+void FilamentPostProcess::ensureBloomPasses()
+{
+    DefineList defines;
+    if (!mpBloomDownsamplePass)
+        mpBloomDownsamplePass = createComputePass(kBloomShader, "bloomDownsample", defines);
+    if (!mpBloomUpsamplePass)
+        mpBloomUpsamplePass = createComputePass(kBloomShader, "bloomUpsample", defines);
+}
+
+void FilamentPostProcess::ensureFXAAPass()
+{
+    if (!mpFXAAPass)
+        mpFXAAPass = createComputePass(kFXAAShader, "fxaaMain", DefineList{});
+}
+
+void FilamentPostProcess::ensureStructurePasses()
+{
+    DefineList defines;
+    if (!mpStructureCopyPass)
+        mpStructureCopyPass = createComputePass(kStructureShader, "structureCopy", defines);
+    if (!mpStructureMipmapPass)
+        mpStructureMipmapPass = createComputePass(kStructureShader, "structureMipmap", defines);
+}
+
+void FilamentPostProcess::ensureSSAOPasses(bool deferred, bool gtao)
+{
+    DefineList aoDefines;
+    aoDefines.add("COMPUTE_BENT_NORMAL", "0");
+    aoDefines.add("USE_VISIBILITY_BITMASKS", "0");
+
+    if (!mpSSAOBlurPass)
+        mpSSAOBlurPass = createComputePass(kSSAOShader, "ssaoBlur", aoDefines);
+    if (!mpSSAONoiseTexture)
+        createNoiseTexture(mpDevice);
+
+    if (gtao)
+    {
+        if (!mpGTAOPass)
+            mpGTAOPass = createComputePass(kGTAOShader, "gtaoMain", aoDefines);
+    }
+    else if (deferred)
+    {
+        if (!mpDeferredSSAOPass)
+            mpDeferredSSAOPass = createComputePass(kDeferredSSAOShader, "deferredSSAO", aoDefines);
+    }
+    else if (!mpSSAOPass)
+    {
+        mpSSAOPass = createComputePass(kSSAOShader, "ssaoMain", aoDefines);
+    }
+}
+
+void FilamentPostProcess::ensureShadowPasses()
+{
+    DefineList defines;
+    if (!mpShadowMapPass)
+        mpShadowMapPass = createComputePass(kShadowMapShader, "shadowMapMain", defines);
+    if (!mpShadowEVSMBlurPass)
+        mpShadowEVSMBlurPass = createComputePass(kShadowEVSMShader, "evsmBlur", defines);
+}
+
+void FilamentPostProcess::ensureDoFPass()
+{
+    if (!mpDoFPass)
+        mpDoFPass = createComputePass(kDoFShader, "dofMain", DefineList{});
+}
+
+void FilamentPostProcess::ensureFogPass()
+{
+    if (!mpFogPass)
+        mpFogPass = createComputePass(kFogShader, "fogMain", DefineList{});
+}
+
+void FilamentPostProcess::ensureFSRPass()
+{
+    if (!mpFSRPass)
+        mpFSRPass = createComputePass(kFSRShader, "fsrRcasMain", DefineList{});
+}
+
+void FilamentPostProcess::ensureTAAPass()
+{
+    if (!mpTAAPass)
+        mpTAAPass = createComputePass(kTAAShader, "taaMain", DefineList{});
 }
 
 void FilamentPostProcess::updateColorGradingLUT(ref<Device> pDevice, const FilamentSettings& settings)
@@ -376,7 +423,9 @@ void FilamentPostProcess::updateStructureTextures(ref<Device> pDevice, uint32_t 
 
 void FilamentPostProcess::executeStructure(RenderContext* pRenderContext, const ref<Texture>& pDepth)
 {
-    if (!pDepth || !mpStructureCopyPass || !mpStructureMipmapPass) return;
+    if (!pDepth) return;
+    ensureStructurePasses();
+    if (!mpStructureCopyPass || !mpStructureMipmapPass) return;
 
     const uint32_t width = pDepth->getWidth();
     const uint32_t height = pDepth->getHeight();
@@ -470,7 +519,9 @@ void FilamentPostProcess::bindAOShaderVars(const ShaderVar& var, const FilamentS
 
 void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings)
 {
-    if (!mpSSAOPass || !mpSSAOBlurPass || !pDepth || !mpStructureDepth) return;
+    if (!pDepth || !mpStructureDepth) return;
+    ensureSSAOPasses(false, false);
+    if (!mpSSAOPass || !mpSSAOBlurPass) return;
 
     const uint2 fullResolution = uint2(pDepth->getWidth(), pDepth->getHeight());
     updateAOTextures(mpDevice, fullResolution.x, fullResolution.y, settings.ssaoResolution);
@@ -573,7 +624,9 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
 
 void FilamentPostProcess::executeDeferredSSAOInternal(RenderContext* pRenderContext, const ref<Texture>& pDepth, const ref<Texture>& pNormalW, const FilamentSettings& settings)
 {
-    if (!mpDeferredSSAOPass || !mpSSAOBlurPass || !pDepth || !pNormalW || !mpStructureDepth) return;
+    if (!pDepth || !pNormalW || !mpStructureDepth) return;
+    ensureSSAOPasses(true, false);
+    if (!mpDeferredSSAOPass || !mpSSAOBlurPass) return;
 
     const uint2 fullResolution = uint2(pDepth->getWidth(), pDepth->getHeight());
     updateAOTextures(mpDevice, fullResolution.x, fullResolution.y, settings.ssaoResolution);
@@ -665,7 +718,10 @@ void FilamentPostProcess::executeDeferredSSAOInternal(RenderContext* pRenderCont
 
 void FilamentPostProcess::blurShadowMoments(RenderContext* pRenderContext, const ref<Texture>& pMoments, const ref<Texture>& pTemp, const FilamentSettings& settings)
 {
-    if (!mpShadowEVSMBlurPass || !pMoments || !pTemp || settings.vsmBlurWidth <= 0.f)
+    if (!pMoments || !pTemp || settings.vsmBlurWidth <= 0.f)
+        return;
+    ensureShadowPasses();
+    if (!mpShadowEVSMBlurPass)
         return;
 
     const uint32_t atlasSize = settings.shadowMapSize;
@@ -727,7 +783,9 @@ void FilamentPostProcess::blurShadowMoments(RenderContext* pRenderContext, const
 
 void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings, const ref<Texture>& pShadowMapDepth, const ref<Texture>& pShadowMoments)
 {
-    if (!mpShadowMapPass || !pDepth) return;
+    if (!pDepth) return;
+    ensureShadowPasses();
+    if (!mpShadowMapPass) return;
 
     const uint2 resolution = uint2(pDepth->getWidth(), pDepth->getHeight());
     
@@ -775,7 +833,9 @@ void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const 
 
 void FilamentPostProcess::executeDoF(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings)
 {
-    if (!mpDoFPass || !pSrc || !pDepth || !pDst) return;
+    if (!pSrc || !pDepth || !pDst) return;
+    ensureDoFPass();
+    if (!mpDoFPass) return;
     const uint2 resolution = uint2(pSrc->getWidth(), pSrc->getHeight());
 
     auto var = mpDoFPass->getRootVar();
@@ -797,7 +857,9 @@ void FilamentPostProcess::executeDoF(RenderContext* pRenderContext, const ref<Te
 
 void FilamentPostProcess::executeFog(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings)
 {
-    if (!mpFogPass || !pSrc || !pDepth || !pDst || !settings.enableFog) return;
+    if (!pSrc || !pDepth || !pDst || !settings.enableFog) return;
+    ensureFogPass();
+    if (!mpFogPass) return;
     const uint2 resolution = uint2(pSrc->getWidth(), pSrc->getHeight());
 
     auto var = mpFogPass->getRootVar();
@@ -849,7 +911,9 @@ void FilamentPostProcess::updateHistory(RenderContext* pRenderContext, const ref
 
 void FilamentPostProcess::executeTAA(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pMotionVec)
 {
-    if (!mpTAAPass || !pSrc || !pDepth || !pDst) return;
+    if (!pSrc || !pDepth || !pDst) return;
+    ensureTAAPass();
+    if (!mpTAAPass) return;
     const uint2 resolution = uint2(pSrc->getWidth(), pSrc->getHeight());
 
     if (!mpHistoryColor || mHistoryWidth != resolution.x || mHistoryHeight != resolution.y)
@@ -882,7 +946,9 @@ void FilamentPostProcess::executeTAA(RenderContext* pRenderContext, const ref<Te
 
 void FilamentPostProcess::executeGTAO(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings)
 {
-    if (!mpGTAOPass || !mpSSAOBlurPass || !pDepth || !mpStructureDepth) return;
+    if (!pDepth || !mpStructureDepth) return;
+    ensureSSAOPasses(false, true);
+    if (!mpGTAOPass || !mpSSAOBlurPass) return;
 
     const uint2 fullResolution = uint2(pDepth->getWidth(), pDepth->getHeight());
     updateAOTextures(mpDevice, fullResolution.x, fullResolution.y, settings.ssaoResolution);
@@ -962,7 +1028,9 @@ void FilamentPostProcess::executeGTAO(RenderContext* pRenderContext, const ref<T
 
 void FilamentPostProcess::executeFSR(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings)
 {
-    if (!mpFSRPass || !pSrc || !pDst || !settings.enableFSR) return;
+    if (!pSrc || !pDst || !settings.enableFSR) return;
+    ensureFSRPass();
+    if (!mpFSRPass) return;
     const uint2 resolution = uint2(pDst->getWidth(), pDst->getHeight());
     auto var = mpFSRPass->getRootVar();
     if (var["PerFrameCB"].isValid())
@@ -980,9 +1048,9 @@ void FilamentPostProcess::executePrePassSSAO(RenderContext* pRenderContext, cons
 {
     if (!settings.enableSSAO || !pDepth) return;
     executeStructure(pRenderContext, pDepth);
-    if (settings.ssaoMode == 1 && mpGTAOPass)
+    if (settings.ssaoMode == 1)
         executeGTAO(pRenderContext, pDepth, settings);
-    else if (mpSSAOPass)
+    else
         executeSSAO(pRenderContext, pDepth, settings);
 }
 
@@ -990,7 +1058,7 @@ void FilamentPostProcess::executeDeferredSSAO(RenderContext* pRenderContext, con
 {
     if (!settings.enableSSAO || !pDepth || !pNormalW) return;
     executeStructure(pRenderContext, pDepth);
-    if (settings.ssaoMode == 1 && mpGTAOPass)
+    if (settings.ssaoMode == 1)
         executeGTAO(pRenderContext, pDepth, settings);
     else
         executeDeferredSSAOInternal(pRenderContext, pDepth, pNormalW, settings);
@@ -1005,7 +1073,9 @@ ref<Texture> FilamentPostProcess::getAOTexture(const FilamentSettings& settings)
 
 void FilamentPostProcess::executeColorGradingPrep(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pDepth)
 {
-    if (!mpColorGradingPrepPass || !pSrc || !pDst) return;
+    if (!pSrc || !pDst) return;
+    ensureColorGradingPasses();
+    if (!mpColorGradingPrepPass) return;
     const uint2 resolution = uint2(pSrc->getWidth(), pSrc->getHeight());
 
     auto var = mpColorGradingPrepPass->getRootVar();
@@ -1027,7 +1097,9 @@ void FilamentPostProcess::executeColorGradingPrep(RenderContext* pRenderContext,
 
 void FilamentPostProcess::executeColorGradingComposite(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings)
 {
-    if (!mpColorGradingPass || !pSrc || !pDst) return;
+    if (!pSrc || !pDst) return;
+    ensureColorGradingPasses();
+    if (!mpColorGradingPass) return;
     const uint2 resolution = uint2(pSrc->getWidth(), pSrc->getHeight());
 
     auto var = mpColorGradingPass->getRootVar();
@@ -1151,11 +1223,11 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     };
 
     // --- Stage 0: Shadow visibility (debug only; forward pass applies shadows by default) ---
-    if (settings.postProcessShadow && settings.enableShadows && pDepth && mpShadowMapPass)
+    if (settings.postProcessShadow && settings.enableShadows && pDepth)
         executeShadowMap(pRenderContext, pDepth, settings, pShadowMap, pShadowMoments);
 
     // --- Stage 1: SSAO (skipped when forward pass already computed AO in prepass) ---
-    if (settings.enableSSAO && !settings.forwardSSAO && pDepth && mpSSAOPass)
+    if (settings.enableSSAO && !settings.forwardSSAO && pDepth)
     {
         executeStructure(pRenderContext, pDepth);
         executeSSAO(pRenderContext, pDepth, settings);
@@ -1167,7 +1239,7 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     currentInput = mpPrepTarget;
 
     // --- Stage 3: TAA (Filament: before DoF) ---
-    if (doTAA && mpTAAPass && pDepth)
+    if (doTAA && pDepth)
     {
         ensurePingPongTexture(mpTAATarget);
         executeTAA(pRenderContext, currentInput, pDepth, mpTAATarget, settings, pMotionVec);
@@ -1176,7 +1248,7 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     }
 
     // --- Stage 4: Depth of Field (after TAA) ---
-    if (settings.enableDoF && pDepth && mpDoFPass)
+    if (settings.enableDoF && pDepth)
     {
         ensurePingPongTexture(mpDoFTarget);
         executeDoF(pRenderContext, currentInput, pDepth, mpDoFTarget, settings);
@@ -1188,7 +1260,7 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
         executeSSR(pRenderContext, pDepth, settings);
 
     // --- Stage 4c: Fog (HDR, after DoF / before bloom + tone map) ---
-    if (settings.enableFog && pDepth && mpFogPass)
+    if (settings.enableFog && pDepth)
     {
         ensurePingPongTexture(mpFogTarget);
         executeFog(pRenderContext, currentInput, pDepth, mpFogTarget, settings);
@@ -1196,8 +1268,12 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     }
 
     // --- Stage 5: Bloom ---
-    if (settings.enableBloom && mpBloomDownsamplePass && mpBloomUpsamplePass)
+    if (settings.enableBloom)
     {
+        ensureBloomPasses();
+        if (!mpBloomDownsamplePass || !mpBloomUpsamplePass)
+            return;
+
         uint32_t levels = std::min((uint32_t)settings.bloomLevels, kMaxBloomLevels);
         updateBloomTextures(mpDevice, resolution.x, resolution.y, levels);
 
@@ -1256,8 +1332,12 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
 
     // --- Stage 7: FXAA ---
     ref<Texture> finalColor = cgTarget;
-    if (doFXAA && mpFXAAPass)
+    if (doFXAA)
     {
+        ensureFXAAPass();
+        if (!mpFXAAPass)
+            return;
+
         auto var = mpFXAAPass->getRootVar();
         var["PerFrameCB"]["gResolution"] = resolution;
         var["gSrc"] = cgTarget;
@@ -1278,7 +1358,7 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     }
 
     // --- Stage 8: FSR RCAS sharpen (optional, after FXAA/TAA output) ---
-    if (settings.enableFSR && mpFSRPass)
+    if (settings.enableFSR)
     {
         ensurePingPongTexture(mpFSRTarget);
         executeFSR(pRenderContext, finalColor, mpFSRTarget, settings);

@@ -59,8 +59,21 @@ void applyFilamentViewerStyle(ImGuiStyle& style)
     style.FrameRounding = 2.0f;
     style.GrabRounding = 2.0f;
     style.TabRounding = 0.0f;
+    style.WindowBorderSize = 0.0f;
+    style.ChildBorderSize = 0.0f;
+    style.FrameBorderSize = 0.0f;
+    style.WindowPadding = ImVec2(8.0f, 8.0f);
+    style.FramePadding = ImVec2(6.0f, 3.0f);
+    style.ItemSpacing = ImVec2(8.0f, 5.0f);
+    style.IndentSpacing = 14.0f;
 
     ImVec4* colors = style.Colors;
+    colors[ImGuiCol_Text] = ImVec4(0.86f, 0.86f, 0.86f, 1.00f);
+    colors[ImGuiCol_TextDisabled] = ImVec4(0.48f, 0.48f, 0.48f, 1.00f);
+    colors[ImGuiCol_WindowBg] = ImVec4(0.105f, 0.105f, 0.105f, 1.00f);
+    colors[ImGuiCol_ChildBg] = ImVec4(0.105f, 0.105f, 0.105f, 1.00f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.12f, 0.12f, 0.12f, 1.00f);
+    colors[ImGuiCol_Border] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
     // Filament uses ImGuiWindowFlags_NoTitleBar; keep title colors neutral when shown elsewhere.
     colors[ImGuiCol_TitleBg] = ImVec4(0.06f, 0.06f, 0.06f, 1.00f);
     colors[ImGuiCol_TitleBgActive] = ImVec4(0.06f, 0.06f, 0.06f, 1.00f);
@@ -70,6 +83,16 @@ void applyFilamentViewerStyle(ImGuiStyle& style)
     colors[ImGuiCol_Header] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
     colors[ImGuiCol_HeaderHovered] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
     colors[ImGuiCol_HeaderActive] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.19f, 0.19f, 0.19f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.25f, 0.25f, 0.25f, 1.00f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.18f, 0.18f, 0.18f, 1.00f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.26f, 0.26f, 0.26f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.32f, 0.32f, 0.32f, 1.00f);
+    colors[ImGuiCol_CheckMark] = ImVec4(0.82f, 0.82f, 0.82f, 1.00f);
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.54f, 0.54f, 0.54f, 1.00f);
+    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.72f, 0.72f, 0.72f, 1.00f);
+    colors[ImGuiCol_Separator] = ImVec4(0.22f, 0.22f, 0.22f, 1.00f);
     colors[ImGuiCol_NavHighlight] = ImVec4(0.35f, 0.35f, 0.35f, 1.00f);
 }
 } // namespace
@@ -590,6 +613,10 @@ void GuiImpl::nextColumn()
 
 bool GuiImpl::beginGroup(const char name[], bool beginExpanded)
 {
+    const bool nested = mGroupStackSize > 0;
+    if (nested)
+        ImGui::Indent(ImGui::GetStyle().IndentSpacing);
+
     // Force neutral header colors per section (global style can still be overridden by docking).
     ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.14f, 0.14f, 0.14f, 1.00f));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.20f, 0.20f, 0.20f, 1.00f));
@@ -602,13 +629,18 @@ bool GuiImpl::beginGroup(const char name[], bool beginExpanded)
     ImGui::PopStyleColor(3);
     if (visible)
         mGroupStackSize++;
+    else if (nested)
+        ImGui::Unindent(ImGui::GetStyle().IndentSpacing);
     return visible;
 }
 
 void GuiImpl::endGroup()
 {
     FALCOR_ASSERT(mGroupStackSize >= 1);
+    const bool nested = mGroupStackSize > 1;
     mGroupStackSize--;
+    if (nested)
+        ImGui::Unindent(ImGui::GetStyle().IndentSpacing);
 }
 
 void GuiImpl::indent(float i)

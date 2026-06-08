@@ -298,6 +298,17 @@ private:
 
     // Helper functions
     void updateColorGradingLUT(ref<Device> pDevice, const FilamentSettings& settings);
+    ref<ComputePass> createComputePass(const char* shaderPath, const char* entryPoint, const DefineList& defines);
+    void ensureColorGradingPasses();
+    void ensureBloomPasses();
+    void ensureFXAAPass();
+    void ensureStructurePasses();
+    void ensureSSAOPasses(bool deferred, bool gtao);
+    void ensureShadowPasses();
+    void ensureDoFPass();
+    void ensureFogPass();
+    void ensureFSRPass();
+    void ensureTAAPass();
     void updateBloomTextures(ref<Device> pDevice, uint32_t width, uint32_t height, uint32_t levels);
     void updateStructureTextures(ref<Device> pDevice, uint32_t width, uint32_t height);
     void executeStructure(RenderContext* pRenderContext, const ref<Texture>& pDepth);

@@ -76,9 +76,9 @@ void computeExposure(uint3 dtid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
     uint2 lumDim;
     gLuminanceInput.GetDimensions(lumDim.x, lumDim.y);
     uint totalPixels = lumDim.x * lumDim.y;
-    if (dtid.x < totalPixels)
+    for (uint index = gi; index < totalPixels; index += 256u)
     {
-        int2 coord = int2(dtid.x % gOutputSize.x, dtid.x / gOutputSize.x);
+        int2 coord = int2(index % lumDim.x, index / lumDim.x);
         float logLum = gLuminanceInput[coord];
         float norm = (logLum - gHistogramMin) * gInvLogLumRange;
         uint bin = uint(clamp(norm, 0.0, 1.0) * 255.0 + 0.5);

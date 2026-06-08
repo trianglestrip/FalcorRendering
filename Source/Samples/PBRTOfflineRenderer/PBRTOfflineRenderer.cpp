@@ -7,6 +7,7 @@
 #include "Utils/Math/FalcorMath.h"
 #include "Utils/Settings/Settings.h"
 #include "Utils/SampleGenerators/HaltonSamplePattern.h"
+#include "Utils/Timing/TimeReport.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -248,19 +249,32 @@ void PBRTOfflineRenderer::onShutdown()
 void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
 {
     logInfo("Loading: {}", mScenePath.string());
+    TimeReport viewerTimeReport;
+    mIsLoadingScene = true;
     mSceneLoaded = false;
     try
     {
+        setLoadingStatus("Validating scene path");
         if (!isSupportedScenePath(mScenePath))
         {
             logError("Unsupported scene extension: {}", mScenePath.extension().string());
             logError("Supported extensions include: pbrt, pyscene, obj, gltf, glb, fbx, ... (requires importer plugins in bin/Release/plugins/)");
+            mIsLoadingScene = false;
+            setLoadingStatus("Scene load failed");
             return;
         }
 
+        setLoadingStatus("Importing scene");
         mpScene = Scene::create(getDevice(), mScenePath, buildSceneImportSettings(mScenePath));
-        if (!mpScene) { logError("Failed to load scene."); return; }
+        if (!mpScene)
+        {
+            logError("Failed to load scene.");
+            mIsLoadingScene = false;
+            setLoadingStatus("Scene load failed");
+            return;
+        }
 
+        setLoadingStatus("Configuring camera");
         auto pCam = mpScene->getCamera();
         float r = mpScene->getSceneBounds().radius();
         if (!std::isfinite(r) || r <= 0.f)
@@ -273,9 +287,11 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         mSceneLoaded = true; mLoadedScenePath = mScenePath; mFrameCount = 0; mStartTime = getGlobalClock().getTime();
 
         // Enable emissive lights and build light collection (needed for PBRT area lights)
+        setLoadingStatus("Building light collection");
         mpScene->getRenderSettings().useEmissiveLights = true;
         mpScene->getLightCollection(pCtx);
 
+        setLoadingStatus("Initializing scene lights");
         initSunFromScene();
 
         logInfo("Scene OK. Geometry: {}, Lights: a={}, e={}, env={}",
@@ -334,6 +350,7 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
             }
         }
 
+        setLoadingStatus("Creating GBuffer pass");
         logInfo("Creating PBRT GBuffer raster pass.");
         ProgramDesc d;
         d.addCompilerArguments({"-Wno-30081"});
@@ -341,47 +358,67 @@ void PBRTOfflineRenderer::loadScene(RenderContext* pCtx)
         d.addShaderLibrary("Samples/PBRTOfflineRenderer/PBRTGBuffer.3d.slang").vsEntry("vsMain").psEntry("psMain");
         d.addTypeConformances(mpScene->getTypeConformances());
         mpGBufferPass = RasterPass::create(getDevice(), d, mpScene->getSceneDefines());
+        viewerTimeReport.measure("PBRT viewer create GBuffer pass");
 
+        setLoadingStatus("Creating lighting pass");
         logInfo("Creating PBRT IBL lighting pass.");
         mpLightingPass = FullScreenPass::create(getDevice(), "Samples/PBRTOfflineRenderer/PBRTIBLLighting.ps.slang");
+        viewerTimeReport.measure("PBRT viewer create lighting pass");
 
+        setLoadingStatus("Creating shadow resources");
         logInfo("Creating shadow resources.");
         ensureShadowMapResources();
+        if (!mpShadowPointSampler)
+        {
+            Sampler::Desc shadowSamplerDesc;
+            shadowSamplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point);
+            shadowSamplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+            mpShadowPointSampler = getDevice()->createSampler(shadowSamplerDesc);
+        }
+        viewerTimeReport.measure("PBRT viewer create shadow resources");
 
-        // Create shadow depth raster pass (depth-only from light POV)
-        logInfo("Creating shadow raster pass.");
-        ProgramDesc sd;
-        sd.addCompilerArguments({"-Wno-30081"});
-        sd.addShaderModules(mpScene->getShaderModules());
-        sd.addShaderLibrary("Samples/PBRTOfflineRenderer/ShadowDepth.3d.slang").vsEntry("vsMain").psEntry("psMain");
-        sd.addTypeConformances(mpScene->getTypeConformances());
-        mpShadowRasterPass = RasterPass::create(getDevice(), sd, mpScene->getSceneDefines());
+        setLoadingStatus("Creating shadow pass");
+        if (mFilamentSettings.enableShadows)
+            ensureShadowPassResources();
+        viewerTimeReport.measure("PBRT viewer create shadow pass");
 
-        Sampler::Desc shadowSamplerDesc;
-        shadowSamplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point);
-        shadowSamplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
-        mpShadowPointSampler = getDevice()->createSampler(shadowSamplerDesc);
-
+        setLoadingStatus("Creating Filament post-process");
         logInfo("Creating Filament post-process.");
         Properties props;
         mpFilamentPostProcess = FilamentPostProcess::create(getDevice(), props);
+        viewerTimeReport.measure("PBRT viewer create Filament post-process");
 
-        logInfo("Creating Deferred AO pass.");
-        mpDeferredAOPass = DeferredAOPass::create(getDevice(), Properties{});
-
-        logInfo("Creating Auto Exposure pass.");
-        mpAutoExposurePass = AutoExposurePass::create(getDevice(), Properties{});
-
+        setLoadingStatus("Loading Filament IBL");
         logInfo("Loading Filament IBL.");
         mpFilamentIBL = FilamentIBL::create(getDevice());
         mpFilamentIBL->loadDefault();
+        viewerTimeReport.measure("PBRT viewer load Filament IBL");
+        viewerTimeReport.addTotal("PBRT viewer setup total");
+        viewerTimeReport.printToLog();
 
         logInfo("Using IBL-only preview lighting by default.");
         logInfo("Scene load complete.");
+        mIsLoadingScene = false;
+        setLoadingStatus("Scene load complete");
     }
     catch (const std::exception& e)
     {
         logError("Exception: {}", e.what());
+        mIsLoadingScene = false;
+        setLoadingStatus("Scene load failed");
+    }
+}
+
+void PBRTOfflineRenderer::setLoadingStatus(const std::string& status)
+{
+    mLoadingStatus = status;
+    logInfo("PBRT viewer loading: {}", status);
+    if (auto pWindow = getWindow())
+    {
+        const std::string title = mIsLoadingScene
+            ? fmt::format("Falcor Scene Viewer - Loading: {}", status)
+            : "Falcor Scene Viewer";
+        pWindow->setWindowTitle(title);
     }
 }
 
@@ -401,6 +438,33 @@ void PBRTOfflineRenderer::ensureShadowMapResources()
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
         mpShadowFbo = Fbo::create(getDevice(), {mpShadowMapMoments}, mpShadowMapDepth);
         mpShadowMomentsSample = nullptr;
+    }
+}
+
+void PBRTOfflineRenderer::ensureShadowPassResources()
+{
+    if (!mpScene)
+        return;
+
+    ensureShadowMapResources();
+
+    if (!mpShadowRasterPass)
+    {
+        logInfo("Creating shadow raster pass.");
+        ProgramDesc sd;
+        sd.addCompilerArguments({"-Wno-30081"});
+        sd.addShaderModules(mpScene->getShaderModules());
+        sd.addShaderLibrary("Samples/PBRTOfflineRenderer/ShadowDepth.3d.slang").vsEntry("vsMain").psEntry("psMain");
+        sd.addTypeConformances(mpScene->getTypeConformances());
+        mpShadowRasterPass = RasterPass::create(getDevice(), sd, mpScene->getSceneDefines());
+    }
+
+    if (!mpShadowPointSampler)
+    {
+        Sampler::Desc shadowSamplerDesc;
+        shadowSamplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point);
+        shadowSamplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+        mpShadowPointSampler = getDevice()->createSampler(shadowSamplerDesc);
     }
 }
 
@@ -705,8 +769,9 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     }
 
     // --- Stage 0: Render shadow map ---
-    if (mFilamentSettings.enableShadows && mpShadowRasterPass)
+    if (mFilamentSettings.enableShadows)
     {
+        ensureShadowPassResources();
         renderShadowMap(pCtx);
     }
 
@@ -765,8 +830,14 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     }
 
     // --- Stage 3: Deferred AO (UE-style standalone pass) ---
-    if (mDeferredAOSettings.enabled && mpDeferredAOPass)
+    if (mDeferredAOSettings.enabled)
     {
+        if (!mpDeferredAOPass)
+        {
+            logInfo("Creating Deferred AO pass.");
+            mpDeferredAOPass = DeferredAOPass::create(getDevice(), Properties{});
+        }
+
         if (!mpDeferredAOTexture || mpDeferredAOTexture->getWidth() != frameDim.x || mpDeferredAOTexture->getHeight() != frameDim.y)
         {
             mpDeferredAOTexture = getDevice()->createTexture2D(
@@ -833,8 +904,14 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
 
     // --- Stage 5: Auto Exposure (UE-style histogram + eye adaptation) ---
     float exposureScale = 1.0f;
-    if (mAutoExposureSettings.enabled && mpAutoExposurePass)
+    if (mAutoExposureSettings.enabled)
     {
+        if (!mpAutoExposurePass)
+        {
+            logInfo("Creating Auto Exposure pass.");
+            mpAutoExposurePass = AutoExposurePass::create(getDevice(), Properties{});
+        }
+
         Properties aeProps;
         aeProps["minEV100"] = mAutoExposureSettings.minEV100;
         aeProps["maxEV100"] = mAutoExposureSettings.maxEV100;
@@ -855,7 +932,10 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
     if (mpFilamentPostProcess && mFilamentSettings.postProcessingEnabled && mDebugView == 0)
     {
         const ref<Texture> pMotionVec = (mFilamentSettings.antiAliasing == 2) ? mpVelocityTexture : nullptr;
-        mpFilamentPostProcess->executeCustom(pCtx, mpIntermediateTexture, mpIntermediateDepth, mpPostProcessOutput, mFilamentSettings,
+        auto postSettings = mFilamentSettings;
+        if (mAutoExposureSettings.enabled && exposureScale > 0.0f && std::isfinite(exposureScale))
+            postSettings.exposure += std::log2(exposureScale);
+        mpFilamentPostProcess->executeCustom(pCtx, mpIntermediateTexture, mpIntermediateDepth, mpPostProcessOutput, postSettings,
             mFilamentSettings.enableShadows ? mpShadowMapDepth : nullptr, pMotionVec,
             mFilamentSettings.enableShadows ? mpShadowMomentsSample : nullptr);
         pCtx->blit(mpPostProcessOutput->getSRV(), pTarget->getRTV());
@@ -919,6 +999,8 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
     const uint32_t sidebarHeight = (uint32_t)std::max(1.0f, ImGui::GetIO().DisplaySize.y);
     const Gui::WindowFlags kFilamentSidebarFlags = Gui::WindowFlags::AllowMove | Gui::WindowFlags::SetFocus;
     Gui::Window w(pGui, "Filament", {380, sidebarHeight}, {0, 0}, kFilamentSidebarFlags);
+    if (!mLoadingStatus.empty())
+        w.text(fmt::format("Status: {}", mLoadingStatus));
     if (mpScene)
     {
         w.text(fmt::format("Loaded: {}", mLoadedScenePath.filename().string()));
@@ -1251,6 +1333,8 @@ void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
         auto& a = mAutoExposureSettings;
 
         aeW.checkbox("Enable Auto Exposure", a.enabled);
+        if (mpAutoExposurePass)
+            aeW.text(fmt::format("Current Exposure: {:.4f}", mpAutoExposurePass->getExposure()));
 
         if (auto aeGroup = aeW.group("Exposure Options"))
         {

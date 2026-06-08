@@ -47,6 +47,8 @@ private:
     ref<Texture> mpLuminanceTexture;         // downsampled luminance
     ref<Buffer> mpHistogramBuffer;           // 256-bin histogram (uint)
     ref<Buffer> mpExposureBuffer;            // float4: (current exposure, target exposure, delta, pad)
+    ref<Buffer> mpExposureReadbackBuffer;    // CPU readback for adapted exposure
+    ref<Fence> mpReadbackFence;
     ref<Sampler> mpPointSampler;
     ref<Sampler> mpLinearSampler;
 
