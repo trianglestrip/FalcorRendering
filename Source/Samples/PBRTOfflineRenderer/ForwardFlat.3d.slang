@@ -3,7 +3,7 @@
  **************************************************************************/
 
 import Scene.Raster;
-#include "RenderPasses/FilamentFX/FilamentAO.slangh"
+#include "RenderPasses/FilamentFX/AO/FilamentAO.slangh"
 
 #define MIN_PERCEPTUAL_ROUGHNESS 0.045f
 
@@ -38,7 +38,7 @@ float3 filamentSHIrradiance(float3 n)
     return max(irradiance, 0.0f);
 }
 
-float3 evaluateStableFilamentIBL(float3 diffuseColor, float3 f0, float perceptualRoughness, float3 N, float3 V, float ao)
+float3 evaluateStableFilamentIBL(float3 diffuseColor, float3 f0, float perceptualRoughness, float3 N, float3 V, float ao, float3 bentNormal)
 {
     float3 Nibl = rotateY(N, gIblRotation);
     float NoV = saturate(abs(dot(N, V)) + 1e-4f);
@@ -49,7 +49,7 @@ float3 evaluateStableFilamentIBL(float3 diffuseColor, float3 f0, float perceptua
     float3 R = rotateY(reflect(-V, N), gIblRotation);
     float3 specIrradiance = filamentSHIrradiance(normalize(lerp(R, Nibl, perceptualRoughness * perceptualRoughness)));
     float3 fresnel = f0 + (1.0f - f0) * pow(1.0f - NoV, 5.0f);
-    float specAO = saturate(pow(NoV + ao, exp2(-16.0f * perceptualRoughness - 1.0f)) - 1.0f + ao);
+    float specAO = specularAO(NoV, ao, perceptualRoughness, N, V, bentNormal);
     float clearCoatWeight = lerp(0.12f, 0.65f, 1.0f - perceptualRoughness);
     float3 specular = specIrradiance * fresnel * clearCoatWeight * specAO;
 
@@ -90,6 +90,7 @@ float4 psMain(VSOut vsOut, uint triangleIndex: SV_PrimitiveID) : SV_TARGET0
 
     float2 uv = (vsOut.posH.xy + 0.5f) / float2(gFrameDim);
     float ao = (gSSAOEnabled != 0u) ? evaluateSSAO(uv) : 1.0f;
+    float3 bentNormal = (gSSAOEnabled != 0u) ? evaluateSSAOBentNormal(uv) : N;
 
     if (gDebugView == 1u) return float4(saturate(albedo), 1.0f);
     if (gDebugView == 2u) return float4(N * 0.5f + 0.5f, 1.0f);
@@ -108,7 +109,7 @@ float4 psMain(VSOut vsOut, uint triangleIndex: SV_PrimitiveID) : SV_TARGET0
     float perceptualRoughness = max(saturate(rough), MIN_PERCEPTUAL_ROUGHNESS);
     float3 f0 = max(props.specularReflectance, specularAlbedo * 0.04f);
 
-    float3 color = props.emission + evaluateStableFilamentIBL(albedo, f0, perceptualRoughness, N, viewDir, ao);
+    float3 color = props.emission + evaluateStableFilamentIBL(albedo, f0, perceptualRoughness, N, viewDir, ao, bentNormal);
 
     float3 indirectColor = color;
 

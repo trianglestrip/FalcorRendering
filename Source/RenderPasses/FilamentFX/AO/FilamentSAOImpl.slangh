@@ -1,0 +1,150 @@
+#ifndef FILAMENT_SAO_IMPL_SLANGH
+#define FILAMENT_SAO_IMPL_SLANGH
+
+// Requires PerFrameCB: gResolution, gInvRadiusSquared, gMinHorizonAngleSineSquared, gBias, gPeak2,
+//   gSampleCount, gAngleIncCosSin, gMaxLevel
+// Requires: gStructureDepth, gPointSampler, gInvProj (CameraCB)
+// Optional define: COMPUTE_BENT_NORMAL
+
+#include "RenderPasses/FilamentFX/Utils/FilamentDepth.slangh"
+#include "RenderPasses/FilamentFX/Utils/FilamentGeometry.slangh"
+
+static const float kFilamentSAOLog2LodRate = 3.0;
+
+float2 FilamentSAOStartPosition(float noise)
+{
+    float angle = ((2.0 * 3.14159265) * 2.4) * noise;
+    return float2(cos(angle), sin(angle));
+}
+
+float2x2 FilamentSAOTapAngleStep(float2 angleIncCosSin)
+{
+    return float2x2(angleIncCosSin.x, angleIncCosSin.y, -angleIncCosSin.y, angleIncCosSin.x);
+}
+
+float3 FilamentSAOTapLocationFast(float i, float2 p, float noise, float sampleCountInv)
+{
+    float radius = (i + noise + 0.5) * sampleCountInv;
+    return float3(p, radius * radius);
+}
+
+void FilamentSAOComputeSampleView(
+    inout float occlusion,
+#if COMPUTE_BENT_NORMAL
+    inout float3 bentNormal,
+#endif
+    float i,
+    float ssDiskRadius,
+    float2 uv,
+    float3 origin,
+    float3 normal,
+    float biasDepth,
+    float2 tapPosition,
+    float noise,
+    float sampleCountInv,
+    float invRadiusSquared,
+    float minHorizonAngleSineSquared,
+    float bias,
+    float peak2,
+    int maxLevel,
+    float4 resolution,
+    float4x4 invProj)
+{
+    float3 tap = FilamentSAOTapLocationFast(i, tapPosition, noise, sampleCountInv);
+    float ssRadius = max(1.0, tap.z * ssDiskRadius);
+    float level = clamp(floor(log2(ssRadius)) - kFilamentSAOLog2LodRate, 0.0, float(maxLevel));
+    float2 uvSample = uv + float2(ssRadius * tap.xy) * resolution.zw;
+
+    float occlusionDepth = gStructureDepth.SampleLevel(gPointSampler, uvSample, level).r;
+    float3 p = FilamentComputeViewPosition(uvSample, occlusionDepth, invProj);
+
+    float3 v = p - origin;
+    float vv = dot(v, v);
+    float vn = dot(v, normal);
+
+    float w = max(0.0, 1.0 - vv * invRadiusSquared);
+    w *= w;
+    w *= step(vv * minHorizonAngleSineSquared, vn * vn);
+
+    float sampleOcclusion = max(0.0, vn - (biasDepth * bias)) / (vv + peak2);
+    occlusion += w * sampleOcclusion;
+
+#if COMPUTE_BENT_NORMAL
+    if (!FilamentIsSkyDepth(occlusionDepth))
+    {
+        float rr = 1.0 / invRadiusSquared;
+        float cc = vv - vn * vn;
+        float s = sqrt(max(0.0, rr - cc));
+        float3 n = normalize(v + normal * (s - vn));
+        bentNormal += n * (sampleOcclusion <= 0.0 ? 1.0 : 0.0);
+    }
+#endif
+}
+
+void FilamentSAOComputeSampleWorld(
+    inout float occlusion,
+#if COMPUTE_BENT_NORMAL
+    inout float3 bentNormal,
+#endif
+    float i,
+    float ssDiskRadius,
+    float2 uv,
+    float3 originW,
+    float3 normalW,
+    float viewDepth,
+    float2 tapPosition,
+    float noise,
+    float sampleCountInv,
+    float invRadiusSquared,
+    float minHorizonAngleSineSquared,
+    float bias,
+    float peak2,
+    int maxLevel,
+    float4 resolution,
+    float4x4 invProj,
+    float4x4 invView)
+{
+    float3 tap = FilamentSAOTapLocationFast(i, tapPosition, noise, sampleCountInv);
+    float ssRadius = max(1.0, tap.z * ssDiskRadius);
+    float level = clamp(floor(log2(ssRadius)) - kFilamentSAOLog2LodRate, 0.0, float(maxLevel));
+    float2 uvSample = uv + float2(ssRadius * tap.xy) * resolution.zw;
+
+    float occlusionDepth = gStructureDepth.SampleLevel(gPointSampler, uvSample, level).r;
+    float3 p = FilamentComputeWorldPositionFromView(
+        FilamentComputeViewPosition(uvSample, occlusionDepth, invProj), invView);
+
+    float3 v = p - originW;
+    float vv = dot(v, v);
+    float vn = dot(v, normalW);
+
+    float w = max(0.0, 1.0 - vv * invRadiusSquared);
+    w *= w;
+    w *= step(vv * minHorizonAngleSineSquared, vn * vn);
+
+    float sampleOcclusion = max(0.0, vn - (viewDepth * bias)) / (vv + peak2);
+    occlusion += w * sampleOcclusion;
+
+#if COMPUTE_BENT_NORMAL
+    if (!FilamentIsSkyDepth(occlusionDepth))
+    {
+        float rr = 1.0 / invRadiusSquared;
+        float cc = vv - vn * vn;
+        float s = sqrt(max(0.0, rr - cc));
+        float3 n = normalize(v + normalW * (s - vn));
+        bentNormal += n * (sampleOcclusion <= 0.0 ? 1.0 : 0.0);
+    }
+#endif
+}
+
+float3 FilamentSAOComputeViewSpaceNormalMediumQ(float2 uv, float3 position, float2 texel, float4x4 invProj)
+{
+    float2 uvdx = uv + float2(texel.x, 0.0);
+    float2 uvdy = uv + float2(0.0, texel.y);
+    float depthX = gStructureDepth.SampleLevel(gPointSampler, uvdx, 0).r;
+    float depthY = gStructureDepth.SampleLevel(gPointSampler, uvdy, 0).r;
+    float3 px = FilamentComputeViewPosition(uvdx, depthX, invProj);
+    float3 py = FilamentComputeViewPosition(uvdy, depthY, invProj);
+    return normalize(cross(px - position, py - position));
+}
+
+#endif // FILAMENT_SAO_IMPL_SLANGH

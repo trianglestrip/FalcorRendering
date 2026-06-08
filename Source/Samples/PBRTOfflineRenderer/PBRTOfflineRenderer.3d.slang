@@ -7,10 +7,10 @@ import Scene.Raster;
 import Utils.Sampling.TinyUniformSampleGenerator;
 import Utils.Math.MathHelpers;
 import Rendering.Lights.LightHelpers;
-#include "RenderPasses/FilamentFX/FilamentShadow.slangh"
-#include "RenderPasses/FilamentFX/FilamentIBLData.slang"
-#include "RenderPasses/FilamentFX/FilamentIBL.slangh"
-#include "RenderPasses/FilamentFX/FilamentAO.slangh"
+#include "RenderPasses/FilamentFX/Shadow/FilamentShadow.slangh"
+#include "RenderPasses/FilamentFX/Lighting/FilamentIBLData.slang"
+#include "RenderPasses/FilamentFX/Lighting/FilamentIBL.slangh"
+#include "RenderPasses/FilamentFX/AO/FilamentAO.slangh"
 
 cbuffer PerFrameCB
 {
@@ -79,8 +79,9 @@ PSOut psMain(VSOut vsOut, uint triangleIndex: SV_PrimitiveID)
 
     float2 uv = (float2(pixelPos) + 0.5f) / float2(gFrameDim);
     float ssao = (gSSAOEnabled != 0u) ? evaluateSSAO(uv) : 1.0f;
+    float3 bentNormal = (gSSAOEnabled != 0u) ? evaluateSSAOBentNormal(uv) : N;
 
-    float3 indirect = evaluateIBL(pixel, N, viewDir, ssao);
+    float3 indirect = evaluateIBL(pixel, N, viewDir, ssao, bentNormal);
     float3 color = props.emission + indirect;
 
     float3 cameraPos = gScene.camera.getPosition();

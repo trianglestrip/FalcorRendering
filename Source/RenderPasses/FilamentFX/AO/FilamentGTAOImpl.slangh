@@ -1,0 +1,208 @@
+#ifndef FILAMENT_GTAO_IMPL_SLANGH
+#define FILAMENT_GTAO_IMPL_SLANGH
+
+// gtaoImpl.fs — requires PerFrameCB fields and gStructureDepth/gPointSampler/gInvProj
+
+#include "RenderPasses/FilamentFX/Utils/FilamentDepth.slangh"
+#include "RenderPasses/FilamentFX/Utils/FilamentGeometry.slangh"
+
+static const float kFilamentGTAOPi = 3.14159265358979323846;
+static const float kFilamentGTAOHalfPi = 1.57079632679489661923;
+static const float kFilamentGTAOLog2LodRate = 3.0;
+#define FILAMENT_GTAO_SECTOR_COUNT 32u
+
+float FilamentGTAOacosFast(float x)
+{
+    return acos(clamp(x, -1.0, 1.0));
+}
+
+float3 FilamentGTAOGetViewSpacePosition(float2 uv, float level, float4x4 invProj)
+{
+    float depth = gStructureDepth.SampleLevel(gPointSampler, uv, level).r;
+    return FilamentComputeViewPosition(uv, depth, invProj);
+}
+
+float3 FilamentGTAOComputeViewSpaceNormal(float2 uv, float3 position, float4 resolution, float4x4 invProj)
+{
+    float2 texel = resolution.zw;
+    float3 px = FilamentGTAOGetViewSpacePosition(uv + float2(texel.x, 0.0), 0.0, invProj);
+    float3 py = FilamentGTAOGetViewSpacePosition(uv + float2(0.0, texel.y), 0.0, invProj);
+    return normalize(cross(px - position, py - position));
+}
+
+float FilamentGTAOIntegrateArcCosWeight(float h, float n)
+{
+    float arc = -cos(2.0 * h - n) + cos(n) + 2.0 * h * sin(n);
+    return 0.25 * arc;
+}
+
+float FilamentGTAOSpatialDirectionNoise(float2 uv, float2 resolution)
+{
+    int2 position = int2(uv * resolution);
+    return (1.0 / 16.0) * (float(((position.x + position.y) & 3) << 2) + float(position.x & 3));
+}
+
+float FilamentGTAOSpatialOffsetsNoise(float2 uv, float2 resolution)
+{
+    int2 position = int2(uv * resolution);
+    return 0.25 * float((position.y - position.x) & 3);
+}
+
+float FilamentGTAOUpdateHorizon(float sampleHorizonCos, float currentHorizonCos, float fallOff, float thicknessHeuristic)
+{
+    return sampleHorizonCos > currentHorizonCos
+        ? lerp(sampleHorizonCos, currentHorizonCos, fallOff)
+        : lerp(currentHorizonCos, sampleHorizonCos, thicknessHeuristic);
+}
+
+float FilamentGTAOCalculateHorizonCos(float3 sampleDelta, float3 viewDir, float horizonCos, float invRadiusSquared, float thicknessHeuristic)
+{
+    float sqSampleDist = dot(sampleDelta, sampleDelta);
+    float invSampleDist = rsqrt(max(sqSampleDist, 1e-8));
+    float fallOff = saturate(sqSampleDist * invRadiusSquared * 2.0);
+    float sampleHorizonCos = dot(sampleDelta, viewDir) * invSampleDist;
+    return FilamentGTAOUpdateHorizon(sampleHorizonCos, horizonCos, fallOff, thicknessHeuristic);
+}
+
+uint FilamentGTAOUpdateSectors(float minHorizon, float maxHorizon, uint globalOccludedBitfield)
+{
+    uint startHorizonInt = uint(minHorizon * float(FILAMENT_GTAO_SECTOR_COUNT));
+    uint angleHorizonInt = uint(ceil(saturate(maxHorizon - minHorizon) * float(FILAMENT_GTAO_SECTOR_COUNT)));
+    uint angleHorizonBitfield = angleHorizonInt > 0u ? (0xFFFFFFFFu >> (FILAMENT_GTAO_SECTOR_COUNT - angleHorizonInt)) : 0u;
+    return globalOccludedBitfield | (angleHorizonBitfield << startHorizonInt);
+}
+
+uint FilamentGTAOCalculateVisibilityMask(
+    float3 deltaPos,
+    float3 viewDir,
+    float samplingDirection,
+    uint globalOccludedBitfield,
+    float n,
+    float3 origin,
+    float constThickness,
+    float linearThickness,
+    float invFarPlane)
+{
+    float linearThicknessMultiplier = (linearThickness > 0.5)
+        ? saturate(abs(origin.z) * invFarPlane) * 100.0
+        : 1.0;
+    float3 deltaPosBackface = deltaPos - viewDir * constThickness * linearThicknessMultiplier;
+
+    float2 frontBackHorizon;
+    frontBackHorizon.x = dot(normalize(deltaPos), viewDir);
+    frontBackHorizon.y = dot(normalize(deltaPosBackface), viewDir);
+    frontBackHorizon.x = FilamentGTAOacosFast(frontBackHorizon.x);
+    frontBackHorizon.y = FilamentGTAOacosFast(frontBackHorizon.y);
+    frontBackHorizon = clamp(((samplingDirection * -frontBackHorizon) + n + kFilamentGTAOHalfPi) / kFilamentGTAOPi, 0.0, 1.0);
+    frontBackHorizon = samplingDirection >= 0.0 ? frontBackHorizon.yx : frontBackHorizon.xy;
+
+    return FilamentGTAOUpdateSectors(frontBackHorizon.x, frontBackHorizon.y, globalOccludedBitfield);
+}
+
+uint FilamentGTAOBitCount(uint x)
+{
+    x = x - ((x >> 1) & 0x55555555u);
+    x = (x & 0x33333333u) + ((x >> 2) & 0x33333333u);
+    x = (x + (x >> 4)) & 0x0F0F0F0Fu;
+    return (x * 0x01010101u) >> 24;
+}
+
+void FilamentGTAOGroundTruthAmbientOcclusion(
+    float2 uv,
+    float3 origin,
+    float3 normal,
+    float4 resolution,
+    float projectionScaleRadius,
+    float2 sliceCount,
+    float stepsPerSlice,
+    float invRadiusSquared,
+    float thicknessHeuristic,
+    float constThickness,
+    float linearThickness,
+    float invFarPlane,
+    int maxLevel,
+    float4x4 invProj,
+    out float obscurance,
+    out float3 bentNormal)
+{
+    float3 viewDir = normalize(-origin);
+    float ssRadius = -(projectionScaleRadius / origin.z);
+    bentNormal = normal;
+
+    float noiseOffset = FilamentGTAOSpatialOffsetsNoise(uv, resolution.xy);
+    float noiseDirection = FilamentGTAOSpatialDirectionNoise(uv, resolution.xy);
+    float initialRayStep = frac(noiseOffset);
+    float stepRadius = ssRadius / (stepsPerSlice + 1.0);
+
+    float visibility = 0.0;
+    for (float i = 0.0; i < sliceCount.x; i += 1.0)
+    {
+        float slice = (i + noiseDirection) * sliceCount.y;
+        float phi = slice * kFilamentGTAOPi;
+        float cosPhi = cos(phi);
+        float sinPhi = sin(phi);
+        float2 omega = float2(cosPhi, sinPhi);
+
+        float3 direction = float3(cosPhi, sinPhi, 0.0);
+        float3 orthoDirection = normalize(direction - dot(direction, viewDir) * viewDir);
+        float3 axis = cross(orthoDirection, viewDir);
+        float3 projNormal = normal - axis * dot(normal, axis);
+
+        float signNorm = sign(dot(orthoDirection, projNormal));
+        float projNormalLength = length(projNormal);
+        float cosNorm = saturate(dot(projNormal, viewDir) / max(projNormalLength, 1e-5));
+        float n = signNorm * FilamentGTAOacosFast(cosNorm);
+
+        float horizonCos0 = -1.0;
+        float horizonCos1 = -1.0;
+        uint globalOccludedBitfield = 0u;
+
+        for (float j = 0.0; j < stepsPerSlice; j += 1.0)
+        {
+            float2 sampleOffset = max((j + initialRayStep) * stepRadius, 1.0 + j) * omega;
+            float sampleOffsetLength = length(sampleOffset);
+            float level = clamp(floor(log2(max(sampleOffsetLength, 1e-4))) - kFilamentGTAOLog2LodRate, 0.0, float(maxLevel));
+            float2 uvSampleOffset = sampleOffset * resolution.zw;
+
+            float3 samplePos0 = FilamentGTAOGetViewSpacePosition(uv + uvSampleOffset, level, invProj);
+            float3 samplePos1 = FilamentGTAOGetViewSpacePosition(uv - uvSampleOffset, level, invProj);
+            float3 sampleDelta0 = samplePos0 - origin;
+            float3 sampleDelta1 = samplePos1 - origin;
+
+#if USE_VISIBILITY_BITMASKS
+            globalOccludedBitfield = FilamentGTAOCalculateVisibilityMask(
+                sampleDelta0, viewDir, 1.0, globalOccludedBitfield, n, origin,
+                constThickness, linearThickness, invFarPlane);
+            globalOccludedBitfield = FilamentGTAOCalculateVisibilityMask(
+                sampleDelta1, viewDir, -1.0, globalOccludedBitfield, n, origin,
+                constThickness, linearThickness, invFarPlane);
+#else
+            horizonCos0 = FilamentGTAOCalculateHorizonCos(sampleDelta0, viewDir, horizonCos0, invRadiusSquared, thicknessHeuristic);
+            horizonCos1 = FilamentGTAOCalculateHorizonCos(sampleDelta1, viewDir, horizonCos1, invRadiusSquared, thicknessHeuristic);
+#endif
+        }
+
+#if USE_VISIBILITY_BITMASKS
+        visibility += 1.0 - float(FilamentGTAOBitCount(globalOccludedBitfield)) / float(FILAMENT_GTAO_SECTOR_COUNT);
+#else
+        float h0 = -FilamentGTAOacosFast(horizonCos1);
+        float h1 = FilamentGTAOacosFast(horizonCos0);
+        h0 = n + clamp(h0 - n, -kFilamentGTAOHalfPi, kFilamentGTAOHalfPi);
+        h1 = n + clamp(h1 - n, -kFilamentGTAOHalfPi, kFilamentGTAOHalfPi);
+
+#if COMPUTE_BENT_NORMAL
+        float angle = 0.5 * (h0 + h1);
+        bentNormal += viewDir * cos(angle) - orthoDirection * sin(angle);
+#endif
+        visibility += projNormalLength * (FilamentGTAOIntegrateArcCosWeight(h0, n) + FilamentGTAOIntegrateArcCosWeight(h1, n));
+#endif
+    }
+
+    obscurance = 1.0 - saturate(visibility * sliceCount.y);
+
+#if COMPUTE_BENT_NORMAL
+    bentNormal = normalize(bentNormal);
+#endif
+}
+
+#endif // FILAMENT_GTAO_IMPL_SLANGH

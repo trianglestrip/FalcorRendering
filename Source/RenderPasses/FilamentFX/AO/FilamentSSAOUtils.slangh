@@ -1,0 +1,33 @@
+#ifndef FILAMENT_SSAO_UTILS_SLANGH
+#define FILAMENT_SSAO_UTILS_SLANGH
+
+// AO buffer layout (RGBA32F): R=visibility, G=packed depth, BA=bent normal XY (view space, [-1,1])
+
+float4 FilamentPackAOOutput(float aoVisibility, float packedDepth, float3 bentNormal)
+{
+    return float4(aoVisibility, packedDepth, bentNormal.xy);
+}
+
+float4 FilamentSkyAOOutput()
+{
+    return float4(1.0, 1.0, 0.0, 0.0);
+}
+
+float3 FilamentUnpackBentNormalXY(float2 xy)
+{
+    float z2 = 1.0 - dot(xy, xy);
+    float z = (z2 > 0.0) ? sqrt(z2) : 0.0;
+    return normalize(float3(xy, z));
+}
+
+float3 FilamentPackBentNormal(float3 bn)
+{
+    return bn * 0.5 + 0.5;
+}
+
+float3 FilamentUnpackBentNormal(float3 packed)
+{
+    return normalize(packed * 2.0 - 1.0);
+}
+
+#endif // FILAMENT_SSAO_UTILS_SLANGH

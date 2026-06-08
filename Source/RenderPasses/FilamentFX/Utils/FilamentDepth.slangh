@@ -1,0 +1,47 @@
+#ifndef FILAMENT_DEPTH_SLANGH
+#define FILAMENT_DEPTH_SLANGH
+
+// Filament depthUtils.fs — D3D depth in [0,1], sky/clear = 1.0
+
+static const float kFilamentPreventDiv0 = 1.0 / 16777216.0;
+
+float FilamentLinearizeDepth(float depth, float4x4 invProj)
+{
+    float4 p = invProj[2];
+    float4 q = invProj[3];
+    return (depth * p.z + q.z) / max(depth * p.w + q.w, kFilamentPreventDiv0);
+}
+
+bool FilamentIsSkyDepth(float depth)
+{
+    return depth >= 1.0;
+}
+
+float FilamentPackNormalizedDepth(float linearZ, float invFarPlane)
+{
+    // Filament: pack(origin.z * invFarPlane) with invFarPlane = 1/(-cameraFar)
+    return saturate(linearZ * invFarPlane);
+}
+
+float FilamentStoredDepthToViewZ(float storedNormalizedDepth, float cameraFar)
+{
+    // Inverse of pack: normalized = viewZ / (-cameraFar) -> viewZ = -normalized * cameraFar
+    return -storedNormalizedDepth * cameraFar;
+}
+
+// ssaoUtils.fs — 16-bit depth split for RGB8 paths (kept for parity)
+float2 FilamentPackDepthHiLo(float normalizedDepth)
+{
+    float z = clamp(normalizedDepth, 0.0, 1.0);
+    float t = floor(256.0 * z);
+    float hi = t * (1.0 / 256.0);
+    float lo = (256.0 * z) - t;
+    return float2(hi, lo);
+}
+
+float FilamentUnpackDepthHiLo(float2 depth)
+{
+    return depth.x * (256.0 / 257.0) + depth.y * (1.0 / 257.0);
+}
+
+#endif // FILAMENT_DEPTH_SLANGH

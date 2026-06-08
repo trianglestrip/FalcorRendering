@@ -10,7 +10,7 @@
 
 import Scene.Raster;
 
-#include "RenderPasses/FilamentFX/FilamentShadow.slangh"
+#include "RenderPasses/FilamentFX/Shadow/FilamentShadow.slangh"
 
 
 

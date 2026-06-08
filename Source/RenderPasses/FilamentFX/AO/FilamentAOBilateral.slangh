@@ -1,0 +1,63 @@
+#ifndef FILAMENT_AO_BILATERAL_SLANGH
+#define FILAMENT_AO_BILATERAL_SLANGH
+
+#include "RenderPasses/FilamentFX/Utils/FilamentNoise.slangh"
+
+// Separable bilateral blur for RGBA32F AO buffer (R=AO, G=depth, BA=bent normal XY)
+
+float FilamentAOBilateralWeight(float depth, float sampleDepth, float farPlaneOverEdgeDistance)
+{
+    float diff = (sampleDepth - depth) * farPlaneOverEdgeDistance;
+    return max(0.0, 1.0 - diff * diff);
+}
+
+void FilamentAOBilateralTap(
+    inout float4 sum,
+    inout float totalWeight,
+    float weight,
+    float depth,
+    float2 uv,
+    Texture2D<float4> aoBuffer,
+    SamplerState pointSampler,
+    float farPlaneOverEdgeDistance)
+{
+    float4 data = aoBuffer.SampleLevel(pointSampler, uv, 0);
+    float b = weight * FilamentAOBilateralWeight(depth, data.g, farPlaneOverEdgeDistance);
+    sum += data * b;
+    totalWeight += b;
+}
+
+float4 FilamentAOBilateralBlurCenter(
+    float2 uv,
+    float2 coord,
+    Texture2D<float4> aoBuffer,
+    SamplerState pointSampler,
+    float2 blurAxis,
+    int blurSampleCount,
+    float farPlaneOverEdgeDistance,
+    float blurKernel[16])
+{
+    float4 center = aoBuffer.SampleLevel(pointSampler, uv, 0);
+    if (center.g >= 0.9999 && center.r >= 0.9999)
+        return center;
+
+    float depth = center.g;
+    float totalWeight = blurKernel[0];
+    float4 sum = center * totalWeight;
+
+    float2 offset = blurAxis;
+    for (int i = 1; i < blurSampleCount; i++)
+    {
+        float weight = blurKernel[i];
+        FilamentAOBilateralTap(sum, totalWeight, weight, depth, uv + offset, aoBuffer, pointSampler, farPlaneOverEdgeDistance);
+        FilamentAOBilateralTap(sum, totalWeight, weight, depth, uv - offset, aoBuffer, pointSampler, farPlaneOverEdgeDistance);
+        offset += blurAxis;
+    }
+
+    float4 result = sum / max(totalWeight, 1e-5);
+    result.r = saturate(result.r + (FilamentInterleavedGradientNoise(coord) - 0.5) / 255.0);
+    result.g = depth;
+    return result;
+}
+
+#endif // FILAMENT_AO_BILATERAL_SLANGH

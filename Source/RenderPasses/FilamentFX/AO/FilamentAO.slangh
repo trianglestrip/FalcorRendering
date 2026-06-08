@@ -1,0 +1,216 @@
+// Filament ambient occlusion — ported from surface_ambient_occlusion.fs
+// Supports full-res and half-res SSAO with bilateral upscale in forward/deferred pass.
+
+#include "RenderPasses/FilamentFX/Utils/FilamentDepth.slangh"
+#include "RenderPasses/FilamentFX/AO/FilamentSSAOUtils.slangh"
+
+cbuffer AODataCB
+{
+    uint gSSAOHalfResEnabled;
+    float2 gSSAOBufferSize;
+    float gAOBilateralEdgeDist;
+    float gInvFarPlane;
+    float gCameraFar;
+    float4x4 gInvProj;
+    float2 gPositionParams;
+    uint gSSAOHighQualityUpsampling;
+    uint gSSAOBentNormals;
+};
+
+// RGBA32F: R=AO, G=packed depth, BA=bent normal XY (view space)
+Texture2D<float4> gSSAO;
+Texture2D<float> gAODepth;
+SamplerState gSSAOLinearSampler;
+SamplerState gAODepthPointSampler;
+
+struct SSAOInterpolationCache
+{
+    float4 weights;
+    float2 uv;
+    bool valid;
+};
+
+float4 FilamentAOBilinearWeights(float2 uv, float2 size)
+{
+    float2 f = frac(uv * size - 0.5);
+    float4 b;
+    b.x = (1.0 - f.x) * f.y;
+    b.y = f.x * f.y;
+    b.z = f.x * (1.0 - f.y);
+    b.w = (1.0 - f.x) * (1.0 - f.y);
+    return b;
+}
+
+float4 FilamentAOStoredDepthsToViewZ(float4 storedDepths)
+{
+    return -storedDepths * gCameraFar;
+}
+
+// Filament surface_ambient_occlusion.fs: compare view-space Z in meters, not normalized depth.
+float4 FilamentAOBilateralWeights(float4 storedDepths, float pixelViewZ, float4 bilinearWeights)
+{
+    float4 neighborViewZ = FilamentAOStoredDepthsToViewZ(storedDepths);
+    float4 diff = (pixelViewZ - neighborViewZ) * gAOBilateralEdgeDist;
+    float4 w = max(float4(1e-6), 1.0 - diff * diff) * bilinearWeights;
+    return w / (w.x + w.y + w.z + w.w);
+}
+
+float4 FilamentAOSampleHalfResNeighbors(float2 uv, out float4 aoSamples, out float4 depthSamples)
+{
+    float2 size = gSSAOBufferSize;
+    float4 b = FilamentAOBilinearWeights(uv, size);
+    int2 base = int2(floor(uv * size - 0.5));
+    float4 s01 = gSSAO.Load(int3(base + int2(0, 1), 0));
+    float4 s11 = gSSAO.Load(int3(base + int2(1, 1), 0));
+    float4 s10 = gSSAO.Load(int3(base + int2(1, 0), 0));
+    float4 s00 = gSSAO.Load(int3(base + int2(0, 0), 0));
+    aoSamples = float4(s01.r, s11.r, s10.r, s00.r);
+    depthSamples = float4(s01.g, s11.g, s10.g, s00.g);
+    return b;
+}
+
+float evaluateSSAOBilinear(float2 uv)
+{
+    return gSSAO.SampleLevel(gSSAOLinearSampler, uv, 0).r;
+}
+
+float3 evaluateSSAOBentNormalBilinear(float2 uv)
+{
+    float2 xy = gSSAO.SampleLevel(gSSAOLinearSampler, uv, 0).ba;
+    return FilamentUnpackBentNormalXY(xy);
+}
+
+SSAOInterpolationCache evaluateSSAOCache(float2 uv)
+{
+    SSAOInterpolationCache cache;
+    cache.uv = uv;
+    cache.valid = false;
+    cache.weights = float4(0.25, 0.25, 0.25, 0.25);
+
+    if (gSSAOHalfResEnabled == 0u)
+        return cache;
+
+    float4 aoSamples;
+    float4 depthSamples;
+    float4 b = FilamentAOSampleHalfResNeighbors(uv, aoSamples, depthSamples);
+
+    float depth = gAODepth.SampleLevel(gAODepthPointSampler, uv, 0);
+    if (FilamentIsSkyDepth(depth))
+    {
+        cache.valid = true;
+        return cache;
+    }
+
+    float pixelViewZ = FilamentLinearizeDepth(depth, gInvProj);
+    cache.weights = FilamentAOBilateralWeights(depthSamples, pixelViewZ, b);
+    cache.valid = true;
+
+    return cache;
+}
+
+float evaluateSSAOHalfResUpsample(float2 uv)
+{
+    float4 aoSamples;
+    float4 depthSamples;
+    float4 b = FilamentAOSampleHalfResNeighbors(uv, aoSamples, depthSamples);
+
+    float depth = gAODepth.SampleLevel(gAODepthPointSampler, uv, 0);
+    if (FilamentIsSkyDepth(depth))
+        return 1.0;
+
+    float pixelViewZ = FilamentLinearizeDepth(depth, gInvProj);
+    float4 w = FilamentAOBilateralWeights(depthSamples, pixelViewZ, b);
+    float ao = dot(aoSamples, w);
+
+    return ao;
+}
+
+float3 evaluateSSAOBentNormalHalfResUpsample(float2 uv)
+{
+    float4 depthSamples;
+    float4 aoSamples;
+    float4 b = FilamentAOSampleHalfResNeighbors(uv, aoSamples, depthSamples);
+    int2 base = int2(floor(uv * gSSAOBufferSize - 0.5));
+    float4 s01 = gSSAO.Load(int3(base + int2(0, 1), 0));
+    float4 s11 = gSSAO.Load(int3(base + int2(1, 1), 0));
+    float4 s10 = gSSAO.Load(int3(base + int2(1, 0), 0));
+    float4 s00 = gSSAO.Load(int3(base + int2(0, 0), 0));
+
+    float depth = gAODepth.SampleLevel(gAODepthPointSampler, uv, 0);
+    if (FilamentIsSkyDepth(depth))
+        return float3(0.0, 0.0, 1.0);
+
+    float pixelViewZ = FilamentLinearizeDepth(depth, gInvProj);
+    float4 w = FilamentAOBilateralWeights(depthSamples, pixelViewZ, b);
+
+    float2 bn = s01.ba * w.x + s11.ba * w.y + s10.ba * w.z + s00.ba * w.w;
+    return FilamentUnpackBentNormalXY(bn);
+}
+
+float evaluateSSAO(float2 uv)
+{
+    if (gSSAOHalfResEnabled != 0u)
+    {
+        if (gAOBilateralEdgeDist <= 0.0)
+            return gSSAO.SampleLevel(gSSAOLinearSampler, uv, 0).r;
+        return evaluateSSAOHalfResUpsample(uv);
+    }
+    return evaluateSSAOBilinear(uv);
+}
+
+float3 evaluateSSAOBentNormal(float2 uv)
+{
+    if (gSSAOHalfResEnabled != 0u)
+    {
+        if (gAOBilateralEdgeDist <= 0.0)
+            return evaluateSSAOBentNormalBilinear(uv);
+        return evaluateSSAOBentNormalHalfResUpsample(uv);
+    }
+    return evaluateSSAOBentNormalBilinear(uv);
+}
+
+float SpecularAO_Lagarde(float NoV, float visibility, float roughness)
+{
+    return saturate(pow(NoV + visibility, exp2(-16.0 * roughness - 1.0)) - 1.0 + visibility);
+}
+
+float sphericalCapsIntersection(float cosCap1, float cosCap2, float cosDistance)
+{
+    float r1 = acos(clamp(cosCap1, -1.0, 1.0));
+    float r2 = acos(clamp(cosCap2, -1.0, 1.0));
+    float d = acos(clamp(cosDistance, -1.0, 1.0));
+
+    if (min(r1, r2) <= max(r1, r2) - d)
+        return 1.0 - max(cosCap1, cosCap2);
+    if (r1 + r2 <= d)
+        return 0.0;
+
+    float delta = abs(r1 - r2);
+    float x = 1.0 - saturate((d - delta) / max(r1 + r2 - delta, 1e-4));
+    float area = x * x * (-2.0 * x + 3.0);
+    return area * (1.0 - max(cosCap1, cosCap2));
+}
+
+float SpecularAO_Cones(float3 bentNormal, float3 reflected, float visibility, float roughness)
+{
+    float cosAv = sqrt(max(0.0, 1.0 - visibility));
+    float cosAs = exp2(-3.321928 * roughness * roughness);
+    float cosB = dot(bentNormal, reflected);
+    float ao = sphericalCapsIntersection(cosAv, cosAs, cosB) / max(1.0 - cosAs, 1e-4);
+    return lerp(1.0, ao, smoothstep(0.01, 0.09, roughness));
+}
+
+float specularAO(float NoV, float visibility, float roughness, float3 N, float3 V, float3 bentNormal)
+{
+    float3 R = reflect(-V, N);
+    float lagarde = SpecularAO_Lagarde(NoV, visibility, roughness);
+    if (gSSAOBentNormals == 0u)
+        return lagarde;
+    float cones = SpecularAO_Cones(normalize(bentNormal), normalize(R), visibility, roughness);
+    return min(lagarde, cones);
+}
+
+float singleBounceAO(float visibility)
+{
+    return visibility;
+}

@@ -1,3 +1,6 @@
+#include "RenderPasses/FilamentFX/Utils/FilamentNoise.slangh"
+#include "RenderPasses/FilamentFX/AO/FilamentAO.slangh"
+
 cbuffer PerFrameCB
 {
     uint2 gResolution;
@@ -19,15 +22,8 @@ cbuffer PerFrameCB
     float2 gLUTSize;           // x = 0.5/size, y = (size-1)/size (Filament pixel-center remap)
 };
 
-float interleavedGradientNoise(float2 screenPos)
-{
-    float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
-    return frac(magic.z * frac(dot(screenPos.xy, magic.xy)));
-}
-
 Texture2D<float4> gSrc;
 Texture2D<float4> gBloom; // Mip 0 from bloom upsample
-Texture2D<float>  gAO;     // Ambient occlusion (R channel, 0-1)
 Texture2D<float>  gShadow; // Shadow visibility (R channel, 0-1)
 Texture3D<float4> gColorLUT;
 SamplerState gSampler;
@@ -125,7 +121,7 @@ void colorGradingPrep(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     if (gAOEnabled > 0.5f) {
         float2 uv = (float2(coord) + 0.5f) / float2(gResolution);
-        float ao = gAO.SampleLevel(gSampler, uv, 0).r;
+        float ao = evaluateSSAO(uv);
         ao = saturate(ao);
         color *= (1.0 - ambientWeight + ambientWeight * ao);
     }
@@ -200,7 +196,7 @@ void colorGradingMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     // Filament dithering (reduce banding after tone map)
     if (gDithering > 0.5f) {
-        float noise = interleavedGradientNoise(float2(coord)) / 255.0;
+        float noise = FilamentInterleavedGradientNoise(float2(coord)) / 255.0;
         color += noise - 0.5 / 255.0;
     }
 

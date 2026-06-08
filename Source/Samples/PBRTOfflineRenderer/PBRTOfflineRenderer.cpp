@@ -21,7 +21,7 @@ namespace
     constexpr float kDefaultSSAORadius = 1.0f;
     constexpr float kDefaultSSAOIntensity = 1.0f;
     constexpr float kDefaultSSAOPower = 1.0f;
-    constexpr float kDefaultSSAOResolution = 0.5f;
+    constexpr float kDefaultSSAOResolution = 1.0f;
     constexpr float kDefaultSSAOBilateralThreshold = 0.05f;
     constexpr int kDefaultSSAOMode = 0;
     constexpr int kDefaultSSAOQuality = 1;
@@ -723,10 +723,7 @@ void PBRTOfflineRenderer::onFrameRender(RenderContext* pCtx, const ref<Fbo>& pFb
 
     if (mFilamentSettings.postProcessingEnabled && mFilamentSettings.enableSSAO && mpFilamentPostProcess && (mFilamentSettings.forwardSSAO || mDebugView == 5))
     {
-        if (mFilamentSettings.ssaoMode == 0)
-            mpFilamentPostProcess->executePrePassSSAO(pCtx, mpIntermediateDepth, mFilamentSettings);
-        else
-            mpFilamentPostProcess->executeDeferredSSAO(pCtx, mpIntermediateDepth, mpGBufferNormalW, mFilamentSettings);
+        mpFilamentPostProcess->executeDeferredSSAO(pCtx, mpIntermediateDepth, mpGBufferNormalW, mFilamentSettings);
     }
 
     auto pLightingFbo = Fbo::create(getDevice(), {mpIntermediateTexture});
@@ -1188,6 +1185,7 @@ struct PBRTOfflineRendererOptions
     bool preview = false;
     bool enableShadows = false;
     bool disableSSAO = false;
+    float ssaoResolution = 0.0f;
     uint32_t debugView = 0;
     uint32_t width = 1920;
     uint32_t height = 1080;
@@ -1212,6 +1210,10 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
             options.enableShadows = true;
         else if (a == "--disable-ssao")
             options.disableSSAO = true;
+        else if (a == "--ssao-fullres")
+            options.ssaoResolution = 1.0f;
+        else if (a == "--ssao-halfres")
+            options.ssaoResolution = 0.5f;
         else if (a == "--single-frame")
             options.singleFrame = true;
         else if (a == "--width" && i + 1 < argc)
@@ -1280,6 +1282,8 @@ int runMain(int argc, char** argv)
         app.setEnableShadows(true);
     if (options.disableSSAO)
         app.setEnableSSAO(false);
+    if (options.ssaoResolution > 0.0f)
+        app.setSSAOResolution(options.ssaoResolution);
     app.setScenePath(options.scenePath);
     app.setOutputPath(options.outputPath);
     app.setSingleFrame(options.singleFrame || options.headless);

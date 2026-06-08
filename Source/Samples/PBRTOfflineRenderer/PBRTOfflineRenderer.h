@@ -42,6 +42,7 @@ public:
         }
     }
     void setEnableSSAO(bool enabled) { mFilamentSettings.enableSSAO = enabled; }
+    void setSSAOResolution(float resolution) { mFilamentSettings.ssaoResolution = resolution; }
     void setInspectInstanceIDs(std::vector<uint32_t> ids) { mInspectInstanceIDs = std::move(ids); }
     void setHeadlessProbeMode(bool enabled);
     void setPreviewMode(bool enabled);

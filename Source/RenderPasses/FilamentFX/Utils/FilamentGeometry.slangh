@@ -1,0 +1,26 @@
+#ifndef FILAMENT_GEOMETRY_SLANGH
+#define FILAMENT_GEOMETRY_SLANGH
+
+#include "RenderPasses/FilamentFX/Utils/FilamentDepth.slangh"
+
+float3 FilamentComputeViewPosition(float2 uv, float depth, float4x4 invProj)
+{
+    float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    float4 view = mul(invProj, clip);
+    return view.xyz / view.w;
+}
+
+float3 FilamentComputeWorldPositionFromView(float3 viewPos, float4x4 invView)
+{
+    float4 world = mul(invView, float4(viewPos, 1.0));
+    return world.xyz / world.w;
+}
+
+float3 FilamentComputeWorldPosition(float2 uv, float depth, float4x4 invViewProj)
+{
+    float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    float4 world = mul(invViewProj, clip);
+    return world.xyz / world.w;
+}
+
+#endif // FILAMENT_GEOMETRY_SLANGH

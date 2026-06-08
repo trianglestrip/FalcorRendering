@@ -22,22 +22,60 @@ namespace
     const char kAntiAliasing[] = "antiAliasing";
     const char kPostProcessingEnabled[] = "postProcessingEnabled";
 
-    const char kColorGradingShader[] = "RenderPasses/FilamentFX/ColorGrading.cs.slang";
-    const char kBloomShader[] = "RenderPasses/FilamentFX/Bloom.cs.slang";
-    const char kFXAAShader[] = "RenderPasses/FilamentFX/FXAA.cs.slang";
-    const char kStructureShader[] = "RenderPasses/FilamentFX/StructurePass.cs.slang";
-    const char kSSAOShader[] = "RenderPasses/FilamentFX/SSAO.cs.slang";
-    const char kDeferredSSAOShader[] = "RenderPasses/FilamentFX/DeferredSSAO.cs.slang";
-    const char kShadowMapShader[] = "RenderPasses/FilamentFX/ShadowMap.cs.slang";
-    const char kShadowEVSMShader[] = "RenderPasses/FilamentFX/ShadowEVSM.cs.slang";
-    const char kDoFShader[] = "RenderPasses/FilamentFX/DoF.cs.slang";
-    const char kFogShader[] = "RenderPasses/FilamentFX/Fog.cs.slang";
-    const char kFSRShader[] = "RenderPasses/FilamentFX/FSR.cs.slang";
-    const char kGTAOShader[] = "RenderPasses/FilamentFX/GTAO.cs.slang";
-    const char kTAAShader[] = "RenderPasses/FilamentFX/TAA.cs.slang";
+    const char kColorGradingShader[] = "RenderPasses/FilamentFX/PostProcess/ColorGrading.cs.slang";
+    const char kBloomShader[] = "RenderPasses/FilamentFX/PostProcess/Bloom.cs.slang";
+    const char kFXAAShader[] = "RenderPasses/FilamentFX/PostProcess/FXAA.cs.slang";
+    const char kStructureShader[] = "RenderPasses/FilamentFX/AO/StructurePass.cs.slang";
+    const char kSSAOShader[] = "RenderPasses/FilamentFX/AO/SSAO.cs.slang";
+    const char kDeferredSSAOShader[] = "RenderPasses/FilamentFX/AO/DeferredSSAO.cs.slang";
+    const char kShadowMapShader[] = "RenderPasses/FilamentFX/Shadow/ShadowMap.cs.slang";
+    const char kShadowEVSMShader[] = "RenderPasses/FilamentFX/Shadow/ShadowEVSM.cs.slang";
+    const char kDoFShader[] = "RenderPasses/FilamentFX/PostProcess/DoF.cs.slang";
+    const char kFogShader[] = "RenderPasses/FilamentFX/PostProcess/Fog.cs.slang";
+    const char kFSRShader[] = "RenderPasses/FilamentFX/PostProcess/FSR.cs.slang";
+    const char kGTAOShader[] = "RenderPasses/FilamentFX/AO/GTAO.cs.slang";
+    const char kTAAShader[] = "RenderPasses/FilamentFX/PostProcess/TAA.cs.slang";
 
     const uint32_t kNoiseTextureSize = 4; // 4x4 noise texture for SSAO
     const uint32_t kMaxStructureLevels = 8;
+
+    const ResourceBindFlags kShaderResourceUav =
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess;
+    const ResourceBindFlags kShaderResourceUavRt =
+        kShaderResourceUav | ResourceBindFlags::RenderTarget;
+
+    ref<Sampler> createClampSampler(ref<Device> pDevice, TextureFilteringMode filter)
+    {
+        Sampler::Desc desc;
+        desc.setFilterMode(filter, filter, filter);
+        desc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+        return pDevice->createSampler(desc);
+    }
+
+    ref<Texture> create1x1Texture2D(ref<Device> pDevice, ResourceFormat format, const void* data)
+    {
+        return pDevice->createTexture2D(1, 1, format, 1, 1, data, ResourceBindFlags::ShaderResource);
+    }
+
+    ref<Texture> create1x1Texture3D(ref<Device> pDevice, ResourceFormat format, const void* data)
+    {
+        return pDevice->createTexture3D(1, 1, 1, format, 1, data, ResourceBindFlags::ShaderResource);
+    }
+
+    void ensureTexture2D(
+        ref<Texture>& texture,
+        ref<Device> pDevice,
+        uint32_t width,
+        uint32_t height,
+        ResourceFormat format,
+        ResourceBindFlags bindFlags,
+        uint32_t mipCount = 1)
+    {
+        if (!texture || texture->getWidth() != width || texture->getHeight() != height || texture->getMipCount() != mipCount)
+        {
+            texture = pDevice->createTexture2D(width, height, format, 1, mipCount, nullptr, bindFlags);
+        }
+    }
 
     struct AOQualityParams
     {
@@ -158,139 +196,74 @@ FilamentPostProcess::FilamentPostProcess(ref<Device> pDevice, const Properties& 
     parseProperties(props);
 
     DefineList defines;
-    
-    // Color Grading prep (AO/shadow before TAA) + composite (bloom/grading after DoF)
-    ProgramDesc cgPrepDesc;
-    cgPrepDesc.addShaderLibrary(kColorGradingShader).csEntry("colorGradingPrep");
-    cgPrepDesc.addCompilerArguments({"-Wno-30081"});
-    mpColorGradingPrepPass = ComputePass::create(mpDevice, cgPrepDesc, defines);
+    DefineList aoDefines;
+    aoDefines.add("COMPUTE_BENT_NORMAL", "0");
+    aoDefines.add("USE_VISIBILITY_BITMASKS", "0");
 
-    ProgramDesc cgDesc;
-    cgDesc.addShaderLibrary(kColorGradingShader).csEntry("colorGradingMain");
-    cgDesc.addCompilerArguments({"-Wno-30081"});
-    mpColorGradingPass = ComputePass::create(mpDevice, cgDesc, defines);
+    auto createComputePass = [&](const char* shaderPath, const char* entryPoint, const DefineList& passDefines) {
+        ProgramDesc desc;
+        desc.addShaderLibrary(shaderPath).csEntry(entryPoint);
+        desc.addCompilerArguments({"-Wno-30081"});
+        return ComputePass::create(mpDevice, desc, passDefines);
+    };
+
+    // Color Grading prep (AO/shadow before TAA) + composite (bloom/grading after DoF)
+    mpColorGradingPrepPass = createComputePass(kColorGradingShader, "colorGradingPrep", defines);
+    mpColorGradingPass = createComputePass(kColorGradingShader, "colorGradingMain", defines);
 
     // Bloom
-    ProgramDesc bloomDownDesc;
-    bloomDownDesc.addShaderLibrary(kBloomShader).csEntry("bloomDownsample");
-    bloomDownDesc.addCompilerArguments({"-Wno-30081"});
-    mpBloomDownsamplePass = ComputePass::create(mpDevice, bloomDownDesc, defines);
-
-    ProgramDesc bloomUpDesc;
-    bloomUpDesc.addShaderLibrary(kBloomShader).csEntry("bloomUpsample");
-    bloomUpDesc.addCompilerArguments({"-Wno-30081"});
-    mpBloomUpsamplePass = ComputePass::create(mpDevice, bloomUpDesc, defines);
+    mpBloomDownsamplePass = createComputePass(kBloomShader, "bloomDownsample", defines);
+    mpBloomUpsamplePass = createComputePass(kBloomShader, "bloomUpsample", defines);
 
     // FXAA
-    ProgramDesc fxaaDesc;
-    fxaaDesc.addShaderLibrary(kFXAAShader).csEntry("fxaaMain");
-    fxaaDesc.addCompilerArguments({"-Wno-30081"});
-    mpFXAAPass = ComputePass::create(mpDevice, fxaaDesc, defines);
+    mpFXAAPass = createComputePass(kFXAAShader, "fxaaMain", defines);
 
     // Structure depth pyramid
-    ProgramDesc structureCopyDesc;
-    structureCopyDesc.addShaderLibrary(kStructureShader).csEntry("structureCopy");
-    structureCopyDesc.addCompilerArguments({"-Wno-30081"});
-    mpStructureCopyPass = ComputePass::create(mpDevice, structureCopyDesc, defines);
-
-    ProgramDesc structureMipmapDesc;
-    structureMipmapDesc.addShaderLibrary(kStructureShader).csEntry("structureMipmap");
-    structureMipmapDesc.addCompilerArguments({"-Wno-30081"});
-    mpStructureMipmapPass = ComputePass::create(mpDevice, structureMipmapDesc, defines);
+    mpStructureCopyPass = createComputePass(kStructureShader, "structureCopy", defines);
+    mpStructureMipmapPass = createComputePass(kStructureShader, "structureMipmap", defines);
 
     // SSAO
-    ProgramDesc ssaoDesc;
-    ssaoDesc.addShaderLibrary(kSSAOShader).csEntry("ssaoMain");
-    ssaoDesc.addCompilerArguments({"-Wno-30081"});
-    mpSSAOPass = ComputePass::create(mpDevice, ssaoDesc, defines);
-
-    ProgramDesc deferredSSAODesc;
-    deferredSSAODesc.addShaderLibrary(kDeferredSSAOShader).csEntry("deferredSSAO");
-    deferredSSAODesc.addCompilerArguments({"-Wno-30081"});
-    mpDeferredSSAOPass = ComputePass::create(mpDevice, deferredSSAODesc, defines);
-
-    ProgramDesc ssaoBlurDesc;
-    ssaoBlurDesc.addShaderLibrary(kSSAOShader).csEntry("ssaoBlur");
-    ssaoBlurDesc.addCompilerArguments({"-Wno-30081"});
-    mpSSAOBlurPass = ComputePass::create(mpDevice, ssaoBlurDesc, defines);
+    mpSSAOPass = createComputePass(kSSAOShader, "ssaoMain", aoDefines);
+    mpDeferredSSAOPass = createComputePass(kDeferredSSAOShader, "deferredSSAO", aoDefines);
+    mpSSAOBlurPass = createComputePass(kSSAOShader, "ssaoBlur", aoDefines);
 
     // Shadow Map
-    ProgramDesc shadowDesc;
-    shadowDesc.addShaderLibrary(kShadowMapShader).csEntry("shadowMapMain");
-    shadowDesc.addCompilerArguments({"-Wno-30081"});
-    mpShadowMapPass = ComputePass::create(mpDevice, shadowDesc, defines);
-
-    ProgramDesc evsmBlurDesc;
-    evsmBlurDesc.addShaderLibrary(kShadowEVSMShader).csEntry("evsmBlur");
-    evsmBlurDesc.addCompilerArguments({"-Wno-30081"});
-    mpShadowEVSMBlurPass = ComputePass::create(mpDevice, evsmBlurDesc, defines);
+    mpShadowMapPass = createComputePass(kShadowMapShader, "shadowMapMain", defines);
+    mpShadowEVSMBlurPass = createComputePass(kShadowEVSMShader, "evsmBlur", defines);
 
     // Depth of Field
-    ProgramDesc dofDesc;
-    dofDesc.addShaderLibrary(kDoFShader).csEntry("dofMain");
-    dofDesc.addCompilerArguments({"-Wno-30081"});
-    mpDoFPass = ComputePass::create(mpDevice, dofDesc, defines);
+    mpDoFPass = createComputePass(kDoFShader, "dofMain", defines);
 
     // Fog
-    ProgramDesc fogDesc;
-    fogDesc.addShaderLibrary(kFogShader).csEntry("fogMain");
-    fogDesc.addCompilerArguments({"-Wno-30081"});
-    mpFogPass = ComputePass::create(mpDevice, fogDesc, defines);
-
-    ProgramDesc fsrDesc;
-    fsrDesc.addShaderLibrary(kFSRShader).csEntry("fsrRcasMain");
-    fsrDesc.addCompilerArguments({"-Wno-30081"});
-    mpFSRPass = ComputePass::create(mpDevice, fsrDesc, defines);
-
-    ProgramDesc gtaoDesc;
-    gtaoDesc.addShaderLibrary(kGTAOShader).csEntry("gtaoMain");
-    gtaoDesc.addCompilerArguments({"-Wno-30081"});
-    mpGTAOPass = ComputePass::create(mpDevice, gtaoDesc, defines);
+    mpFogPass = createComputePass(kFogShader, "fogMain", defines);
+    mpFSRPass = createComputePass(kFSRShader, "fsrRcasMain", defines);
+    mpGTAOPass = createComputePass(kGTAOShader, "gtaoMain", aoDefines);
 
     // TAA
-    ProgramDesc taaDesc;
-    taaDesc.addShaderLibrary(kTAAShader).csEntry("taaMain");
-    taaDesc.addCompilerArguments({"-Wno-30081"});
-    mpTAAPass = ComputePass::create(mpDevice, taaDesc, defines);
+    mpTAAPass = createComputePass(kTAAShader, "taaMain", defines);
 
     // Samplers
-    Sampler::Desc linearSamplerDesc;
-    linearSamplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
-    linearSamplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
-    mpLinearSampler = pDevice->createSampler(linearSamplerDesc);
-
-    Sampler::Desc pointSamplerDesc;
-    pointSamplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point);
-    pointSamplerDesc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
-    mpPointSampler = pDevice->createSampler(pointSamplerDesc);
+    mpLinearSampler = createClampSampler(pDevice, TextureFilteringMode::Linear);
+    mpPointSampler = createClampSampler(pDevice, TextureFilteringMode::Point);
 
     // Create SSAO noise texture
     createNoiseTexture(pDevice);
 
-    // Create 1x1 white fallback texture for AO/Shadow when disabled
-    float whitePixel[4] = {1.f, 1.f, 1.f, 1.f};
-    mpWhiteTexture = pDevice->createTexture2D(1, 1, ResourceFormat::RGBA32Float, 1, 1, whitePixel,
-        ResourceBindFlags::ShaderResource);
+    // Fallback textures when AO/shadow/motion/LUT paths are disabled
+    const float whitePixel[4] = {1.f, 1.f, 1.f, 1.f};
+    mpWhiteTexture = create1x1Texture2D(pDevice, ResourceFormat::RGBA32Float, whitePixel);
 
-    // Create dummy shadow map (1x1, value 1.0 = no geometry in reversed-Z)
-    float onePixel = 1.f;
-    mpDummyShadowMap = pDevice->createTexture2D(1, 1, ResourceFormat::R32Float, 1, 1, &onePixel,
-        ResourceBindFlags::ShaderResource);
+    const float onePixel = 1.f;
+    mpDummyShadowMap = create1x1Texture2D(pDevice, ResourceFormat::R32Float, &onePixel);
 
-    // Dummy EVSM moments (fully lit)
-    float litMoments[2] = {65504.f, 65504.f};
-    mpDummyShadowMoments = pDevice->createTexture2D(1, 1, ResourceFormat::RG32Float, 1, 1, litMoments,
-        ResourceBindFlags::ShaderResource);
+    const float litMoments[2] = {65504.f, 65504.f};
+    mpDummyShadowMoments = create1x1Texture2D(pDevice, ResourceFormat::RG32Float, litMoments);
 
-    // Zero motion vector fallback (RG32Float)
-    float zeroMotion[2] = {0.f, 0.f};
-    mpZeroMotionTexture = pDevice->createTexture2D(1, 1, ResourceFormat::RG32Float, 1, 1, zeroMotion,
-        ResourceBindFlags::ShaderResource);
+    const float zeroMotion[2] = {0.f, 0.f};
+    mpZeroMotionTexture = create1x1Texture2D(pDevice, ResourceFormat::RG32Float, zeroMotion);
 
-    // 1x1x1 fallback when LUT path is disabled
-    float identityLUT[4] = {1.f, 1.f, 1.f, 1.f};
-    mpIdentityLUT = pDevice->createTexture3D(1, 1, 1, ResourceFormat::RGBA16Float, 1, identityLUT,
-        ResourceBindFlags::ShaderResource);
+    const float identityLUT[4] = {1.f, 1.f, 1.f, 1.f};
+    mpIdentityLUT = create1x1Texture3D(pDevice, ResourceFormat::RGBA16Float, identityLUT);
 
     // Procedural 3D color grading LUT (exposure/contrast/saturation/vibrance baked on change)
     FilamentSettings defaultLUTSettings;
@@ -369,8 +342,7 @@ void FilamentPostProcess::updateBloomTextures(ref<Device> pDevice, uint32_t widt
         {
             if (!mpBloomMips[i] || mpBloomMips[i]->getWidth() != mipWidth || mpBloomMips[i]->getHeight() != mipHeight)
             {
-                mpBloomMips[i] = pDevice->createTexture2D(mipWidth, mipHeight, ResourceFormat::RGBA16Float, 1, 1, nullptr,
-                    ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess | ResourceBindFlags::RenderTarget);
+                ensureTexture2D(mpBloomMips[i], pDevice, mipWidth, mipHeight, ResourceFormat::RGBA16Float, kShaderResourceUavRt);
             }
             mipWidth /= 2;
             mipHeight /= 2;
@@ -398,9 +370,7 @@ void FilamentPostProcess::updateStructureTextures(ref<Device> pDevice, uint32_t 
     if (!mpStructureDepth || mpStructureDepth->getWidth() != width || mpStructureDepth->getHeight() != height ||
         mpStructureDepth->getMipCount() != mStructureLevelCount)
     {
-        mpStructureDepth = pDevice->createTexture2D(
-            width, height, ResourceFormat::R32Float, 1, mStructureLevelCount, nullptr,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+        ensureTexture2D(mpStructureDepth, pDevice, width, height, ResourceFormat::R32Float, kShaderResourceUav, mStructureLevelCount);
     }
 }
 
@@ -452,26 +422,14 @@ void FilamentPostProcess::executeStructure(RenderContext* pRenderContext, const 
 void FilamentPostProcess::updateAOTextures(ref<Device> pDevice, uint32_t width, uint32_t height, float resolutionScale)
 {
     const float scale = std::clamp(resolutionScale, 0.25f, 1.0f);
-    const uint32_t aoW = std::max(1u, uint32_t(std::round(float(width) * scale)));
-    const uint32_t aoH = std::max(1u, uint32_t(std::round(float(height) * scale)));
+    const uint32_t aoW = std::max(1u, uint32_t(std::ceil(float(width) * scale)));
+    const uint32_t aoH = std::max(1u, uint32_t(std::ceil(float(height) * scale)));
     mAOBufferWidth = aoW;
     mAOBufferHeight = aoH;
 
-    if (!mpAOBuffer || mpAOBuffer->getWidth() != aoW || mpAOBuffer->getHeight() != aoH)
-    {
-        mpAOBuffer = pDevice->createTexture2D(aoW, aoH, ResourceFormat::RG32Float, 1, 1, nullptr,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
-    }
-    if (!mpAOBlurTarget || mpAOBlurTarget->getWidth() != aoW || mpAOBlurTarget->getHeight() != aoH)
-    {
-        mpAOBlurTarget = pDevice->createTexture2D(aoW, aoH, ResourceFormat::RG32Float, 1, 1, nullptr,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
-    }
-    if (!mpAOBlurTemp || mpAOBlurTemp->getWidth() != aoW || mpAOBlurTemp->getHeight() != aoH)
-    {
-        mpAOBlurTemp = pDevice->createTexture2D(aoW, aoH, ResourceFormat::RG32Float, 1, 1, nullptr,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
-    }
+    ensureTexture2D(mpAOBuffer, pDevice, aoW, aoH, ResourceFormat::RGBA32Float, kShaderResourceUav);
+    ensureTexture2D(mpAOBlurTarget, pDevice, aoW, aoH, ResourceFormat::RGBA32Float, kShaderResourceUav);
+    ensureTexture2D(mpAOBlurTemp, pDevice, aoW, aoH, ResourceFormat::RGBA32Float, kShaderResourceUav);
 }
 
 void FilamentPostProcess::bindAOShaderVars(const ShaderVar& var, const FilamentSettings& settings, const ref<Texture>& pDepthPrepass) const
@@ -482,16 +440,28 @@ void FilamentPostProcess::bindAOShaderVars(const ShaderVar& var, const FilamentS
     auto cb = var["AODataCB"];
     if (cb.isValid())
     {
+        // Filament View.cpp: aoSamplingQualityAndEdgeDistance = highQuality ? 1/threshold : 0
+        const float aoEdgeDistance = (halfRes && settings.ssaoHighQualityUpsampling)
+            ? (1.0f / std::max(settings.ssaoBilateralThreshold, 1e-4f))
+            : 0.0f;
+
         cb["gSSAOHalfResEnabled"] = halfRes ? 1u : 0u;
         cb["gSSAOBufferSize"] = float2(float(mAOBufferWidth), float(mAOBufferHeight));
-        cb["gAOBilateralEdgeDist"] = settings.ssaoBilateralEdgeDistance;
-        cb["gInvFarPlane"] = 1.0f / std::max(settings.farPlane, 1.0f);
+        cb["gAOBilateralEdgeDist"] = aoEdgeDistance;
+        cb["gInvFarPlane"] = -1.0f / std::max(settings.farPlane, 1.0f);
+        cb["gCameraFar"] = settings.farPlane;
         cb["gInvProj"] = settings.invProj;
         cb["gPositionParams"] = settings.positionParams;
         if (cb.findMember("gSSAOHighQualityUpsampling").isValid())
             cb["gSSAOHighQualityUpsampling"] = settings.ssaoHighQualityUpsampling ? 1u : 0u;
+        if (cb.findMember("gSSAOBentNormals").isValid())
+            cb["gSSAOBentNormals"] = settings.ssaoBentNormals ? 1u : 0u;
     }
 
+    if (var["gSSAO"].isValid() && mpAOBlurTarget)
+        var["gSSAO"] = settings.enableSSAO ? mpAOBlurTarget : mpWhiteTexture;
+    if (var["gSSAOLinearSampler"].isValid())
+        var["gSSAOLinearSampler"] = mpLinearSampler;
     if (var["gAODepth"].isValid())
         var["gAODepth"] = pDepthPrepass ? pDepthPrepass : mpWhiteTexture;
     if (var["gAODepthPointSampler"].isValid())
@@ -527,6 +497,8 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
     // power: from Filament = userPower * 2.0 (always square for better look)
     float power = settings.ssaoPower * 2.0f;
 
+    mpSSAOPass->addDefine("COMPUTE_BENT_NORMAL", settings.ssaoBentNormals ? "1" : "0", true);
+
     // SSAO main pass (Filament SAO)
     {
         auto var = mpSSAOPass->getRootVar();
@@ -548,7 +520,7 @@ void FilamentPostProcess::executeSSAO(RenderContext* pRenderContext, const ref<T
             cb["gSampleCount"]  = float2(sampleCount, 1.0f / (sampleCount - 0.5f));
             cb["gAngleIncCosSin"] = float2(cos(angleInc), sin(angleInc));
             // Filament: invFarPlane = 1 / -zf (view-space far is negative in their convention)
-            cb["gInvFarPlane"] = 1.0f / std::max(settings.farPlane, 1.0f);
+            cb["gInvFarPlane"] = -1.0f / std::max(settings.farPlane, 1.0f);
             cb["gMaxLevel"]   = (int)std::max(0u, mStructureLevelCount - 1);
         }
         auto camCB = var["CameraCB"];
@@ -622,6 +594,8 @@ void FilamentPostProcess::executeDeferredSSAOInternal(RenderContext* pRenderCont
     float intensity = (6.283185307f * peak * settings.ssaoIntensity) / sampleCount;
     float power = settings.ssaoPower * 2.0f;
 
+    mpDeferredSSAOPass->addDefine("COMPUTE_BENT_NORMAL", settings.ssaoBentNormals ? "1" : "0", true);
+
     {
         auto var = mpDeferredSSAOPass->getRootVar();
         auto cb = var["PerFrameCB"];
@@ -639,7 +613,7 @@ void FilamentPostProcess::executeDeferredSSAOInternal(RenderContext* pRenderCont
             cb["gSpiralTurns"] = quality.spiralTurns;
             cb["gSampleCount"] = float2(sampleCount, 1.0f / (sampleCount - 0.5f));
             cb["gAngleIncCosSin"] = float2(cos(angleInc), sin(angleInc));
-            cb["gInvFarPlane"] = 1.0f / std::max(settings.farPlane, 1.0f);
+            cb["gInvFarPlane"] = -1.0f / std::max(settings.farPlane, 1.0f);
             cb["gMaxLevel"] = (int)std::max(0u, mStructureLevelCount - 1);
         }
         auto camCB = var["CameraCB"];
@@ -757,11 +731,7 @@ void FilamentPostProcess::executeShadowMap(RenderContext* pRenderContext, const 
 
     const uint2 resolution = uint2(pDepth->getWidth(), pDepth->getHeight());
     
-    if (!mpShadowVisibility || mpShadowVisibility->getWidth() != resolution.x || mpShadowVisibility->getHeight() != resolution.y)
-    {
-        mpShadowVisibility = mpDevice->createTexture2D(resolution.x, resolution.y, ResourceFormat::R32Float, 1, 1, nullptr,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
-    }
+    ensureTexture2D(mpShadowVisibility, mpDevice, resolution.x, resolution.y, ResourceFormat::R32Float, kShaderResourceUav);
 
     auto var = mpShadowMapPass->getRootVar();
     auto cb = var["PerFrameCB"];
@@ -868,10 +838,8 @@ void FilamentPostProcess::updateHistory(RenderContext* pRenderContext, const ref
     if (!pColor || !pDepth) return;
     if (!mpHistoryColor || mHistoryWidth != width || mHistoryHeight != height)
     {
-        mpHistoryColor = mpDevice->createTexture2D(width, height, ResourceFormat::RGBA32Float, 1, 1, nullptr,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess | ResourceBindFlags::RenderTarget);
-        mpHistoryDepth = mpDevice->createTexture2D(width, height, ResourceFormat::R32Float, 1, 1, nullptr,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess | ResourceBindFlags::RenderTarget);
+        ensureTexture2D(mpHistoryColor, mpDevice, width, height, ResourceFormat::RGBA32Float, kShaderResourceUavRt);
+        ensureTexture2D(mpHistoryDepth, mpDevice, width, height, ResourceFormat::R32Float, kShaderResourceUavRt);
         mHistoryWidth = width;
         mHistoryHeight = height;
     }
@@ -929,6 +897,9 @@ void FilamentPostProcess::executeGTAO(RenderContext* pRenderContext, const ref<T
     const float stepsPerSlice = (float)std::clamp(settings.gtaoSteps, 1, 16);
     const float power = settings.ssaoPower;
 
+    mpGTAOPass->addDefine("COMPUTE_BENT_NORMAL", settings.ssaoBentNormals ? "1" : "0", true);
+    mpGTAOPass->addDefine("USE_VISIBILITY_BITMASKS", settings.gtaoUseVisibilityBitmasks ? "1" : "0", true);
+
     {
         auto var = mpGTAOPass->getRootVar();
         auto cb = var["PerFrameCB"];
@@ -936,7 +907,7 @@ void FilamentPostProcess::executeGTAO(RenderContext* pRenderContext, const ref<T
         {
             cb["gResolution"] = float4((float)resolution.x, (float)resolution.y, 1.f / resolution.x, 1.f / resolution.y);
             cb["gPositionParams"] = settings.positionParams;
-            cb["gInvFarPlane"] = 1.0f / std::max(settings.farPlane, 1.0f);
+            cb["gInvFarPlane"] = -1.0f / std::max(settings.farPlane, 1.0f);
             cb["gMaxLevel"] = (int)std::max(0u, mStructureLevelCount - 1);
             cb["gProjectionScaleRadius"] = projectionScaleRadius;
             cb["gIntensity"] = settings.ssaoIntensity;
@@ -946,6 +917,8 @@ void FilamentPostProcess::executeGTAO(RenderContext* pRenderContext, const ref<T
             cb["gInvRadiusSquared"] = invRadiusSquared;
             cb["gPower"] = power;
             cb["gThicknessHeuristic"] = settings.gtaoThicknessHeuristic;
+            cb["gConstThickness"] = settings.gtaoConstThickness;
+            cb["gLinearThickness"] = settings.gtaoLinearThickness ? 1.0f : 0.0f;
         }
         auto camCB = var["CameraCB"];
         if (camCB.isValid())
@@ -1030,7 +1003,7 @@ ref<Texture> FilamentPostProcess::getAOTexture(const FilamentSettings& settings)
     return mpWhiteTexture;
 }
 
-void FilamentPostProcess::executeColorGradingPrep(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings)
+void FilamentPostProcess::executeColorGradingPrep(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pDepth)
 {
     if (!mpColorGradingPrepPass || !pSrc || !pDst) return;
     const uint2 resolution = uint2(pSrc->getWidth(), pSrc->getHeight());
@@ -1044,9 +1017,9 @@ void FilamentPostProcess::executeColorGradingPrep(RenderContext* pRenderContext,
         cb["gAOEnabled"] = postAO ? 1.0f : 0.0f;
         cb["gPostProcessShadow"] = (settings.postProcessShadow && settings.enableShadows && mpShadowVisibility) ? 1.0f : 0.0f;
     }
+    bindAOShaderVars(var, settings, pDepth);
     var["gSrc"] = pSrc;
     var["gDst"] = pDst;
-    var["gAO"] = (settings.enableSSAO && mpAOBlurTarget) ? mpAOBlurTarget : mpWhiteTexture;
     var["gShadow"] = (settings.postProcessShadow && settings.enableShadows && mpShadowVisibility) ? mpShadowVisibility : mpWhiteTexture;
     var["gSampler"] = mpLinearSampler;
     mpColorGradingPrepPass->execute(pRenderContext, uint3(resolution, 1));
@@ -1091,8 +1064,6 @@ void FilamentPostProcess::executeColorGradingComposite(RenderContext* pRenderCon
 
     var["gSrc"] = pSrc;
     var["gDst"] = pDst;
-    var["gAO"] = mpWhiteTexture;
-    var["gShadow"] = mpWhiteTexture;
     var["gLUTSampler"] = mpLinearSampler;
 
     if (settings.enableBloom && mpBloomMips[0])
@@ -1175,12 +1146,8 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     const bool doFXAA = (settings.antiAliasing == 1);
     const bool doTAA = (settings.antiAliasing == 2);
 
-    auto ensureTexture = [&](ref<Texture>& tex) {
-        if (!tex || tex->getWidth() != resolution.x || tex->getHeight() != resolution.y)
-        {
-            tex = mpDevice->createTexture2D(resolution.x, resolution.y, ResourceFormat::RGBA32Float, 1, 1, nullptr,
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
-        }
+    auto ensurePingPongTexture = [&](ref<Texture>& tex) {
+        ensureTexture2D(tex, mpDevice, resolution.x, resolution.y, ResourceFormat::RGBA32Float, kShaderResourceUav);
     };
 
     // --- Stage 0: Shadow visibility (debug only; forward pass applies shadows by default) ---
@@ -1195,14 +1162,14 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     }
 
     // --- Stage 2: Color grading prep (AO + shadow on HDR, before TAA) ---
-    ensureTexture(mpPrepTarget);
-    executeColorGradingPrep(pRenderContext, currentInput, mpPrepTarget, settings);
+    ensurePingPongTexture(mpPrepTarget);
+    executeColorGradingPrep(pRenderContext, currentInput, mpPrepTarget, settings, pDepth);
     currentInput = mpPrepTarget;
 
     // --- Stage 3: TAA (Filament: before DoF) ---
     if (doTAA && mpTAAPass && pDepth)
     {
-        ensureTexture(mpTAATarget);
+        ensurePingPongTexture(mpTAATarget);
         executeTAA(pRenderContext, currentInput, pDepth, mpTAATarget, settings, pMotionVec);
         currentInput = mpTAATarget;
         updateHistory(pRenderContext, mpTAATarget, pDepth, resolution.x, resolution.y);
@@ -1211,7 +1178,7 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     // --- Stage 4: Depth of Field (after TAA) ---
     if (settings.enableDoF && pDepth && mpDoFPass)
     {
-        ensureTexture(mpDoFTarget);
+        ensurePingPongTexture(mpDoFTarget);
         executeDoF(pRenderContext, currentInput, pDepth, mpDoFTarget, settings);
         currentInput = mpDoFTarget;
     }
@@ -1223,7 +1190,7 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     // --- Stage 4c: Fog (HDR, after DoF / before bloom + tone map) ---
     if (settings.enableFog && pDepth && mpFogPass)
     {
-        ensureTexture(mpFogTarget);
+        ensurePingPongTexture(mpFogTarget);
         executeFog(pRenderContext, currentInput, pDepth, mpFogTarget, settings);
         currentInput = mpFogTarget;
     }
@@ -1282,7 +1249,7 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     ref<Texture> cgTarget = pDst;
     if (doFXAA)
     {
-        ensureTexture(mpColorGradingTarget);
+        ensurePingPongTexture(mpColorGradingTarget);
         cgTarget = mpColorGradingTarget;
     }
     executeColorGradingComposite(pRenderContext, currentInput, cgTarget, settings);
@@ -1313,7 +1280,7 @@ void FilamentPostProcess::executeCustom(RenderContext* pRenderContext, const ref
     // --- Stage 8: FSR RCAS sharpen (optional, after FXAA/TAA output) ---
     if (settings.enableFSR && mpFSRPass)
     {
-        ensureTexture(mpFSRTarget);
+        ensurePingPongTexture(mpFSRTarget);
         executeFSR(pRenderContext, finalColor, mpFSRTarget, settings);
         pRenderContext->blit(mpFSRTarget->getSRV(), pDst->getRTV());
         finalColor = pDst;

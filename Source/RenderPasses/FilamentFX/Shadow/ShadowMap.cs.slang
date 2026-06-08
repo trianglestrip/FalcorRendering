@@ -1,5 +1,5 @@
 // Filament-style screen-space shadow visibility (debug / optional post-process path)
-#include "RenderPasses/FilamentFX/FilamentShadow.slangh"
+#include "RenderPasses/FilamentFX/Shadow/FilamentShadow.slangh"
 
 cbuffer PerFrameCB
 {

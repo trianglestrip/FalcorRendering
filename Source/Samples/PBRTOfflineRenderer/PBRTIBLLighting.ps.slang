@@ -2,9 +2,9 @@
  # PBRT preview deferred IBL lighting pass.
  **************************************************************************/
 
-#include "RenderPasses/FilamentFX/FilamentAO.slangh"
-#include "RenderPasses/FilamentFX/FilamentPBR.slangh"
-#include "RenderPasses/FilamentFX/FilamentShadow.slangh"
+#include "RenderPasses/FilamentFX/AO/FilamentAO.slangh"
+#include "RenderPasses/FilamentFX/Lighting/FilamentPBR.slangh"
+#include "RenderPasses/FilamentFX/Shadow/FilamentShadow.slangh"
 
 #define MIN_PERCEPTUAL_ROUGHNESS 0.045f
 
@@ -74,7 +74,7 @@ float3 filamentSHIrradiance(float3 n)
     return max(irradiance, 0.0f);
 }
 
-float3 evaluateStableFilamentIBL(float3 diffuseColor, float3 f0, float perceptualRoughness, float3 N, float3 V, float ao)
+float3 evaluateStableFilamentIBL(float3 diffuseColor, float3 f0, float perceptualRoughness, float3 N, float3 V, float ao, float3 bentNormal)
 {
     f0 = saturate(f0);
     float3 Nibl = rotateY(N, gIblRotation);
@@ -91,10 +91,8 @@ float3 evaluateStableFilamentIBL(float3 diffuseColor, float3 f0, float perceptua
     float3 R = rotateY(reflect(-V, N), gIblRotation);
     float3 dominantR = lerp(R, Nibl, perceptualRoughness * perceptualRoughness);
     dominantR = (dot(dominantR, dominantR) > 1e-6f) ? normalize(dominantR) : Nibl;
-    // Keep the deferred path GPU-stable with the current procedural IBL fallback.
-    // Real DDS cubemap sampling remains bound for the forward Filament IBL path.
     float3 prefiltered = filamentSHIrradiance(dominantR);
-    float3 specular = prefiltered * E * specularAO(NoV, ao, perceptualRoughness);
+    float3 specular = prefiltered * E * specularAO(NoV, ao, perceptualRoughness, N, V, bentNormal);
 
     return (diffuse + specular) * gIblLuminance;
 }
@@ -135,6 +133,7 @@ float4 main(float2 texC : TEXCOORD) : SV_TARGET
     float3 f0 = material.yzw;
     float perceptualRoughness = max(saturate(roughness), MIN_PERCEPTUAL_ROUGHNESS);
     float ao = (gSSAOEnabled != 0u) ? evaluateSSAO(texC) : 1.0f;
+    float3 bentNormal = (gSSAOEnabled != 0u) ? evaluateSSAOBentNormal(texC) : N;
     float3 worldPos = reconstructWorldPosition(texC, depth);
     float shadowVis = evaluateShadowVisibility(
         worldPos,
@@ -194,7 +193,7 @@ float4 main(float2 texC : TEXCOORD) : SV_TARGET
         return float4(saturate(delta * 20.0f + 0.5f), saturate(sampledDepth), saturate(lightNdc.z), 1.0f);
     }
 
-    float3 color = emissive + evaluateStableFilamentIBL(base.rgb, f0, perceptualRoughness, N, V, ao);
+    float3 color = emissive + evaluateStableFilamentIBL(base.rgb, f0, perceptualRoughness, N, V, ao, bentNormal);
     color += base.rgb * gAmbientIntensity;
 
     float3 sunL = normalize(-gSunDirection);

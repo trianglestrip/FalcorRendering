@@ -53,7 +53,6 @@ public:
         bool enableSSAO = true;
         bool forwardSSAO = true; // When true, SSAO is applied in forward pass (not colorGradingPrep)
         float ssaoResolution = 0.5f;      // Filament AmbientOcclusionOptions.resolution (0.5 = half-res, 1.0 = full-res)
-        float ssaoBilateralEdgeDistance = 0.1f; // Forward upscale edge distance (Filament aoSamplingQualityAndEdgeDistance)
         float ssaoRadius = 1.0f;          // PBRT viewer default; Filament engine default is 0.3m.
         float ssaoBias = 0.001f;          // Filament default bias
         float ssaoPower = 1.0f;           // power curve (doubled internally)
@@ -313,7 +312,7 @@ private:
     void executeFog(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings);
     void executeSSR(RenderContext* pRenderContext, const ref<Texture>& pDepth, const FilamentSettings& settings);
     void executeTAA(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDepth, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pMotionVec);
-    void executeColorGradingPrep(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings);
+    void executeColorGradingPrep(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings, const ref<Texture>& pDepth);
     void executeColorGradingComposite(RenderContext* pRenderContext, const ref<Texture>& pSrc, const ref<Texture>& pDst, const FilamentSettings& settings);
     void updateHistory(RenderContext* pRenderContext, const ref<Texture>& pColor, const ref<Texture>& pDepth, uint32_t width, uint32_t height);
     uint32_t mHistoryWidth = 0;
