@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <limits>
 
+#include <imgui.h>
+
 FALCOR_EXPORT_D3D12_AGILITY_SDK
 static const float4 kClear = float4(0.2f, 0.2f, 0.24f, 1.f);
 
@@ -913,7 +915,10 @@ void PBRTOfflineRenderer::buildTaskGraph()
 
 void PBRTOfflineRenderer::onGuiRender(Gui* pGui)
 {
-    Gui::Window w(pGui, "PBRT Renderer", {380, 700});
+    // Filament gltf_viewer-style sidebar: no title bar, left docked, full height.
+    const uint32_t sidebarHeight = (uint32_t)std::max(1.0f, ImGui::GetIO().DisplaySize.y);
+    const Gui::WindowFlags kFilamentSidebarFlags = Gui::WindowFlags::AllowMove | Gui::WindowFlags::SetFocus;
+    Gui::Window w(pGui, "Filament", {380, sidebarHeight}, {0, 0}, kFilamentSidebarFlags);
     if (mpScene)
     {
         w.text(fmt::format("Loaded: {}", mLoadedScenePath.filename().string()));

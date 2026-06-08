@@ -49,6 +49,31 @@
 
 namespace Falcor
 {
+namespace
+{
+// Match Filament gltf_viewer sidebar: flat window, neutral section headers.
+void applyFilamentViewerStyle(ImGuiStyle& style)
+{
+    style.WindowRounding = 0.0f;
+    style.ChildRounding = 0.0f;
+    style.FrameRounding = 2.0f;
+    style.GrabRounding = 2.0f;
+    style.TabRounding = 0.0f;
+
+    ImVec4* colors = style.Colors;
+    // Filament uses ImGuiWindowFlags_NoTitleBar; keep title colors neutral when shown elsewhere.
+    colors[ImGuiCol_TitleBg] = ImVec4(0.06f, 0.06f, 0.06f, 1.00f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.06f, 0.06f, 0.06f, 1.00f);
+    colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.06f, 0.06f, 0.06f, 1.00f);
+
+    // CollapsingHeader section titles: opaque dark gray (no ImGui default blue tint).
+    colors[ImGuiCol_Header] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.24f, 0.24f, 0.24f, 1.00f);
+    colors[ImGuiCol_NavHighlight] = ImVec4(0.35f, 0.35f, 0.35f, 1.00f);
+}
+} // namespace
+
 class GuiImpl
 {
 public:
@@ -331,19 +356,7 @@ GuiImpl::GuiImpl(ref<Device> pDevice, float scaleFactor) : mpDevice(pDevice), mS
     io.IniFilename = nullptr;
 
     ImGui::StyleColorsDark();
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.ScaleAllSizes(scaleFactor);
-
-    // Load default font matching Filament (Roboto-Medium, 16px)
-    {
-        std::filesystem::path fontPath = "external/imgui/misc/fonts/Roboto-Medium.ttf";
-        if (std::filesystem::exists(fontPath))
-        {
-            ImFont* pFont = io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 16.0f);
-            mFontMap["default"] = pFont;
-            mpActiveFont = pFont;
-        }
-    }
+    applyFilamentViewerStyle(ImGui::GetStyle());
 
     // Create the pipeline state cache
     mpPipelineState = GraphicsState::create(mpDevice);
@@ -577,9 +590,16 @@ void GuiImpl::nextColumn()
 
 bool GuiImpl::beginGroup(const char name[], bool beginExpanded)
 {
-    std::string nameString(name);
+    // Force neutral header colors per section (global style can still be overridden by docking).
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.14f, 0.14f, 0.14f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.20f, 0.20f, 0.20f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.24f, 0.24f, 0.24f, 1.00f));
+
     ImGuiTreeNodeFlags flags = beginExpanded ? ImGuiTreeNodeFlags_DefaultOpen : 0;
-    bool visible = mGroupStackSize ? ImGui::TreeNodeEx(name, flags) : ImGui::CollapsingHeader(name, flags);
+    // Filament viewer uses CollapsingHeader for all panel sections (not TreeNode).
+    bool visible = ImGui::CollapsingHeader(name, flags);
+
+    ImGui::PopStyleColor(3);
     if (visible)
         mGroupStackSize++;
     return visible;
@@ -589,8 +609,6 @@ void GuiImpl::endGroup()
 {
     FALCOR_ASSERT(mGroupStackSize >= 1);
     mGroupStackSize--;
-    if (mGroupStackSize)
-        ImGui::TreePop();
 }
 
 void GuiImpl::indent(float i)
@@ -1196,8 +1214,8 @@ Gui::Gui(ref<Device> pDevice, uint32_t width, uint32_t height, float scaleFactor
 {
     mpWrapper = std::make_unique<GuiImpl>(pDevice, scaleFactor);
 
-    // Add the default font
-    addFont("", getRuntimeDirectory() / "data/framework/fonts/trebucbd.ttf");
+    // Default font matches Filament viewer (Roboto-Medium, 16px)
+    addFont("", getRuntimeDirectory() / "data/framework/fonts/Roboto-Medium.ttf");
     addFont("monospace", getRuntimeDirectory() / "data/framework/fonts/consolab.ttf");
     setActiveFont("");
 
@@ -1226,7 +1244,8 @@ float4 Gui::pickUniqueColor(const std::string& key)
 
 void Gui::addFont(const std::string& name, const std::filesystem::path& path)
 {
-    float size = 14.0f * mpWrapper->mScaleFactor;
+    // Filament uses a fixed 16px Roboto; keep other fonts DPI-scaled.
+    float size = name.empty() ? 16.0f : 14.0f * mpWrapper->mScaleFactor;
     ImFont* pFont = ImGui::GetIO().Fonts->AddFontFromFileTTF(path.string().c_str(), size);
     if (!pFont)
         FALCOR_THROW("Failed to load font from '{}'.", path);
