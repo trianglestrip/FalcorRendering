@@ -1784,8 +1784,6 @@ static PBRTOfflineRendererOptions parseArgs(int argc, char** argv)
         else if (options.scenePath.empty() && isSupportedScenePath(a))
             options.scenePath = a;
     }
-    if (options.preview && !options.explicitMaterialMode)
-        options.usePBRTMaterials = false;
     return options;
 }
 
@@ -1810,8 +1808,8 @@ int runMain(int argc, char** argv)
     );
     if (options.warmupCache)
         logInfo("PBRT viewer cache warmup enabled: prewarming scene cache, GBuffer, lighting, shadow, Filament deferred AO, and post-process shaders.");
-    if (options.preview && !options.explicitMaterialMode && !options.usePBRTMaterials)
-        logInfo("Preview mode defaults to fast materials. Pass --pbrt-materials to use PBRT material shaders.");
+    if (options.preview && !options.explicitMaterialMode && options.usePBRTMaterials)
+        logInfo("Preview mode defaults to PBRT material shaders. Pass --fast-materials to use the fast shader path.");
     if (options.headless)
     {
         app.setHeadlessProbeMode(true);
