@@ -1,0 +1,31 @@
+{
+  "source": "data\\framework\\meshes\\cube.gltf",
+  "clusterTriangleTarget": 128,
+  "maxClusterVertices": 256,
+  "workerCount": 0,
+  "dedupVerts": false,
+  "meshCount": 2,
+  "materialCount": 3,
+  "clusterCount": 12,
+  "vertexCount": 36,
+  "indexCount": 36,
+  "triangleCount": 12,
+  "sourceTriangleCount": 12,
+  "degenerateTriangleCount": 0,
+  "partitionStats": { "totalLocalVertices": 36, "boundarySourceVertices": 0, "interClusterEdges": 0 },
+  "bounds": { "min": [-1, -1, -1], "max": [1, 1, 1] },
+  "clusters": [
+    { "id": 0, "mesh": 0, "material": 1, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [0, -1, 0], "sourceMesh": 0, "sourceMaterial": 1, "sourceTriangles": [1], "bounds": { "min": [-1, -1, -1], "max": [1, -1, 1] } },
+    { "id": 1, "mesh": 0, "material": 1, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [0, 0, 1], "sourceMesh": 0, "sourceMaterial": 1, "sourceTriangles": [3], "bounds": { "min": [-1, -1, 1], "max": [1, 1, 1] } },
+    { "id": 2, "mesh": 0, "material": 1, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [0, 0, -1], "sourceMesh": 0, "sourceMaterial": 1, "sourceTriangles": [5], "bounds": { "min": [-1, -1, -1], "max": [1, 1, -1] } },
+    { "id": 3, "mesh": 0, "material": 1, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [0, 0, -1], "sourceMesh": 0, "sourceMaterial": 1, "sourceTriangles": [4], "bounds": { "min": [-1, -1, -1], "max": [1, 1, -1] } },
+    { "id": 4, "mesh": 0, "material": 1, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [0, -1, 0], "sourceMesh": 0, "sourceMaterial": 1, "sourceTriangles": [0], "bounds": { "min": [-1, -1, -1], "max": [1, -1, 1] } },
+    { "id": 5, "mesh": 0, "material": 1, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [0, 0, 1], "sourceMesh": 0, "sourceMaterial": 1, "sourceTriangles": [2], "bounds": { "min": [-1, -1, 1], "max": [1, 1, 1] } },
+    { "id": 6, "mesh": 1, "material": 2, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [-1, 0, 0], "sourceMesh": 1, "sourceMaterial": 2, "sourceTriangles": [4], "bounds": { "min": [-1, -1, -1], "max": [-1, 1, 1] } },
+    { "id": 7, "mesh": 1, "material": 2, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [-1, 0, 0], "sourceMesh": 1, "sourceMaterial": 2, "sourceTriangles": [5], "bounds": { "min": [-1, -1, -1], "max": [-1, 1, 1] } },
+    { "id": 8, "mesh": 1, "material": 2, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [0, -1, 0], "sourceMesh": 1, "sourceMaterial": 2, "sourceTriangles": [0], "bounds": { "min": [-1, 1, -1], "max": [1, 1, 1] } },
+    { "id": 9, "mesh": 1, "material": 2, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [1, 0, 0], "sourceMesh": 1, "sourceMaterial": 2, "sourceTriangles": [3], "bounds": { "min": [1, -1, -1], "max": [1, 1, 1] } },
+    { "id": 10, "mesh": 1, "material": 2, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [0, -1, 0], "sourceMesh": 1, "sourceMaterial": 2, "sourceTriangles": [1], "bounds": { "min": [-1, 1, -1], "max": [1, 1, 1] } },
+    { "id": 11, "mesh": 1, "material": 2, "triangles": 1, "vertices": 3, "surfaceArea": 2, "coneAngle": 0, "coneNormal": [1, 0, 0], "sourceMesh": 1, "sourceMaterial": 2, "sourceTriangles": [2], "bounds": { "min": [1, -1, -1], "max": [1, 1, 1] } }
+  ]
+}

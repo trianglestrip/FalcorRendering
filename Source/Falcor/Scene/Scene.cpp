@@ -26,6 +26,9 @@
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
 #include "Scene.h"
+#include "Nanite/NaniteAsset.h"
+#include "Nanite/NaniteStreaming.h"
+#include "Nanite/NaniteSceneGpu.h"
 #include "SceneDefines.slangh"
 #include "SceneBuilder.h"
 #include "Importer.h"
@@ -206,6 +209,16 @@ namespace Falcor
 
         mCustomPrimitiveDesc = std::move(sceneData.customPrimitiveDesc);
         mCustomPrimitiveAABBs = std::move(sceneData.customPrimitiveAABBs);
+
+        if (!sceneData.naniteAssetPath.empty())
+        {
+            mpNaniteAsset = NaniteAsset::create(mpDevice, sceneData.naniteAssetPath);
+            mpNaniteStreamingManager = NaniteStreamingManager::create(mpNaniteAsset);
+            mNaniteMeshDesc = std::move(sceneData.naniteMeshDesc);
+            mNaniteInstanceData = std::move(sceneData.naniteInstanceData);
+            createNaniteSceneGpuBuffers(
+                mpDevice, mNaniteMeshDesc, mNaniteInstanceData, mpNaniteMeshDescBuffer, mpNaniteInstanceBuffer);
+        }
 
         mMeshIndexData = std::move(sceneData.meshIndexData);
         mMeshStaticData = std::move(sceneData.meshStaticData);
@@ -899,6 +912,11 @@ namespace Falcor
         for (const auto& pGridVolume : mGridVolumes)
         {
             mSceneBB |= pGridVolume->getBounds();
+        }
+
+        for (const auto& desc : mNaniteMeshDesc)
+        {
+            mSceneBB |= desc.bounds;
         }
     }
 
@@ -4375,5 +4393,60 @@ namespace Falcor
         scene.def("get_mesh", &Scene::getMesh, "mesh_id"_a);
         scene.def("get_mesh_vertices_and_indices", getMeshVerticesAndIndicesPython, "mesh_id"_a, "buffers"_a);
         scene.def("set_mesh_vertices", setMeshVerticesPython, "mesh_id"_a, "buffers"_a);
+    }
+
+    void Scene::uploadNaniteAsset(RenderContext* pRenderContext)
+    {
+        if (!mpNaniteAsset) return;
+        mpNaniteAsset->upload(pRenderContext);
+        if (mpNaniteStreamingManager)
+            mpNaniteStreamingManager->uploadInitialResidency(pRenderContext);
+    }
+
+    void Scene::beginNaniteStreamingFrame()
+    {
+        if (mpNaniteStreamingManager)
+            mpNaniteStreamingManager->beginFrame();
+    }
+
+    void Scene::collectNanitePageRequests(RenderContext* pRenderContext, const ref<Buffer>& pGpuRequestBuffer)
+    {
+        if (mpNaniteStreamingManager && pGpuRequestBuffer)
+            mpNaniteStreamingManager->collectGpuPageRequests(pRenderContext, pGpuRequestBuffer);
+    }
+
+    void Scene::processNaniteStreamingRequests(RenderContext* pRenderContext)
+    {
+        if (mpNaniteStreamingManager)
+            mpNaniteStreamingManager->processRequests(pRenderContext);
+    }
+
+    NaniteStreamingStats Scene::getNaniteStreamingStats() const
+    {
+        if (mpNaniteStreamingManager)
+            return mpNaniteStreamingManager->getStats();
+        return {};
+    }
+
+    void Scene::setNaniteVramBudgetBytes(uint64_t budgetBytes)
+    {
+        if (mpNaniteStreamingManager)
+            mpNaniteStreamingManager->setVramBudgetBytes(budgetBytes);
+    }
+
+    const ref<Buffer>& Scene::getNanitePageRequestBuffer() const
+    {
+        static ref<Buffer> spEmpty;
+        if (mpNaniteStreamingManager && mpNaniteStreamingManager->getPageRequestBuffer())
+            return mpNaniteStreamingManager->getPageRequestBuffer();
+        return spEmpty;
+    }
+
+    const ref<Buffer>& Scene::getNanitePageFallbackBuffer() const
+    {
+        static ref<Buffer> spEmpty;
+        if (mpNaniteStreamingManager && mpNaniteStreamingManager->getPageFallbackBuffer())
+            return mpNaniteStreamingManager->getPageFallbackBuffer();
+        return spEmpty;
     }
 }

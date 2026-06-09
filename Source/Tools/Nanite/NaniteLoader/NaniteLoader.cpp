@@ -1,9 +1,10 @@
-#include "NaniteAsset.h"
+#include "NaniteToolAsset.h"
 
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -17,6 +18,10 @@ struct Arguments
     bool listMeshes = false;
     bool listMaterials = false;
     bool listClusters = false;
+    bool listGroups = false;
+    bool listHierarchy = false;
+    bool listPages = false;
+    bool memoryStats = false;
 };
 
 void printUsage()
@@ -29,6 +34,10 @@ void printUsage()
         << "  --list-meshes          Print mesh table.\n"
         << "  --list-materials       Print material table.\n"
         << "  --list-clusters        Print cluster table.\n"
+        << "  --list-groups          Print cluster group table.\n"
+        << "  --list-hierarchy       Print hierarchy node table.\n"
+        << "  --list-pages           Print page table.\n"
+        << "  --memory-stats         Print estimated GPU buffer sizes.\n"
         << "  -h, --help             Show this help.\n";
 }
 
@@ -71,6 +80,22 @@ Arguments parseArguments(int argc, char** argv)
         {
             args.listClusters = true;
         }
+        else if (option == "--list-groups")
+        {
+            args.listGroups = true;
+        }
+        else if (option == "--list-hierarchy")
+        {
+            args.listHierarchy = true;
+        }
+        else if (option == "--list-pages")
+        {
+            args.listPages = true;
+        }
+        else if (option == "--memory-stats")
+        {
+            args.memoryStats = true;
+        }
         else if (args.input.empty() && !isOption(argv[i]))
         {
             args.input = option;
@@ -95,11 +120,17 @@ void printBounds(const Bounds& bounds)
 void printAssetSummary(const Asset& asset)
 {
     std::cout << "Source: " << asset.sourcePath << '\n';
+    std::cout << "Format version: " << asset.version << '\n';
     std::cout << "Meshes: " << asset.meshes.size() << '\n';
     std::cout << "Materials: " << asset.materials.size() << '\n';
     std::cout << "Clusters: " << asset.clusters.size() << '\n';
+    std::cout << "Cluster groups: " << asset.clusterGroups.size() << '\n';
+    std::cout << "Hierarchy nodes: " << asset.hierarchyNodes.size() << '\n';
+    std::cout << "Pages: " << asset.pages.size() << '\n';
     std::cout << "Triangles: " << triangleCount(asset) << '\n';
     std::cout << "Vertices: " << asset.vertices.size() << '\n';
+    std::cout << "Format version: " << asset.version << '\n';
+    std::cout << "Compressed: " << ((asset.flags & kFlagCompressedVertices) ? "yes" : "no") << '\n';
     std::cout << "Indices: " << asset.indices.size() << '\n';
     std::cout << "Bounds: ";
     printBounds(asset.bounds);
@@ -140,6 +171,8 @@ void printClusters(const Asset& asset)
         std::cout << "  [" << i << "]"
             << " mesh=" << cluster.meshIndex
             << " material=" << cluster.materialIndex
+            << " page=" << cluster.pageIndex
+            << " group=" << cluster.groupIndex
             << " tris=" << cluster.triangleCount
             << " verts=" << cluster.vertexCount
             << " vOffset=" << cluster.vertexOffset
@@ -149,6 +182,67 @@ void printClusters(const Asset& asset)
             << " area=" << cluster.surfaceArea
             << '\n';
     }
+}
+
+void printClusterGroups(const Asset& asset)
+{
+    std::cout << "\nCluster group table:\n";
+    for (size_t i = 0; i < asset.clusterGroups.size(); ++i)
+    {
+        const ClusterGroup& group = asset.clusterGroups[i];
+        std::cout << "  [" << i << "]"
+            << " clusters=[" << group.firstCluster << ", " << group.firstCluster + group.clusterCount << ")"
+            << " parent=" << (group.parentGroup == std::numeric_limits<uint32_t>::max() ? "none" : std::to_string(group.parentGroup))
+            << " lod=" << group.lodLevel
+            << " error=" << group.geometricError
+            << '\n';
+    }
+}
+
+void printHierarchy(const Asset& asset)
+{
+    std::cout << "\nHierarchy node table:\n";
+    for (size_t i = 0; i < asset.hierarchyNodes.size(); ++i)
+    {
+        const HierarchyNode& node = asset.hierarchyNodes[i];
+        std::cout << "  [" << i << "]"
+            << " clusters=[" << node.clusterOffset << ", " << node.clusterOffset + node.clusterCount << ")"
+            << " group=" << (node.clusterGroupIndex == std::numeric_limits<uint32_t>::max() ? "none" : std::to_string(node.clusterGroupIndex))
+            << " childOffset=" << node.childNodeOffset
+            << " children=" << node.childNodeCount
+            << " error=[" << node.minError << ", " << node.maxError << "]"
+            << " radius=" << node.sphereRadius
+            << '\n';
+    }
+}
+
+void printPages(const Asset& asset)
+{
+    std::cout << "\nPage table:\n";
+    for (size_t i = 0; i < asset.pages.size(); ++i)
+    {
+        const PageDesc& page = asset.pages[i];
+        std::cout << "  [" << i << "]"
+            << " clusters=[" << page.firstCluster << ", " << page.firstCluster + page.clusterCount << ")"
+            << " byteSize=" << page.byteSize
+            << " flags=0x" << std::hex << page.flags << std::dec;
+        if (page.flags & kPageFlagResident) std::cout << " resident";
+        std::cout << '\n';
+    }
+}
+
+void printMemoryStats(const Asset& asset)
+{
+    const GpuMemoryStats stats = computeGpuMemoryStats(asset);
+    std::cout << "\nEstimated GPU buffer sizes:\n";
+    std::cout << "  clusters:   " << stats.clusterBytes << " bytes (" << stats.clusterCount << " entries)\n";
+    std::cout << "  hierarchy:  " << stats.hierarchyBytes << " bytes\n";
+    std::cout << "  pages:      " << stats.pageBytes << " bytes (" << stats.pageCount << " entries)\n";
+    std::cout << "  vertices:   " << stats.vertexBytes << " bytes\n";
+    std::cout << "  indices:    " << stats.indexBytes << " bytes\n";
+    std::cout << "  materials:  " << stats.materialBytes << " bytes (" << stats.materialCount << " entries)\n";
+    std::cout << "  residency:  " << stats.residencyBytes << " bytes\n";
+    std::cout << "  total:      " << stats.totalGpuBytes << " bytes\n";
 }
 }
 
@@ -166,13 +260,28 @@ int main(int argc, char** argv)
             return 2;
         }
 
+        try
+        {
+            validateRuntimeTables(asset);
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "Runtime validation: " << e.what() << '\n';
+            return 2;
+        }
+
         std::cout << "Loaded: " << args.input << '\n';
         printAssetSummary(asset);
         std::cout << "Validation: OK\n";
 
+        if (args.memoryStats) printMemoryStats(asset);
+
         if (args.listMeshes) printMeshes(asset);
         if (args.listMaterials) printMaterials(asset);
         if (args.listClusters) printClusters(asset);
+        if (args.listGroups) printClusterGroups(asset);
+        if (args.listHierarchy) printHierarchy(asset);
+        if (args.listPages) printPages(asset);
 
         return 0;
     }

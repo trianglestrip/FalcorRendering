@@ -359,6 +359,10 @@ namespace Falcor
         */
         void importFromMemory(const void* buffer, size_t byteSize, std::string_view extension, const pybind11::dict& dict = pybind11::dict());
 
+        /** Import a prebuilt Nanite .fnanite asset.
+        */
+        void importNaniteAsset(const std::filesystem::path& path);
+
         /// Access the current asset resolver (on top of the stack).
         AssetResolver& getAssetResolver() { return mAssetResolver; }
         const AssetResolver& getAssetResolver() const { return mAssetResolver; }

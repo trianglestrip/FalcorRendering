@@ -1,6 +1,7 @@
 #include "NaniteObj.h"
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <fstream>
 #include <sstream>
@@ -137,6 +138,69 @@ void appendTriangle(InputMesh& mesh, InputScene& scene, const Vertex& a, const V
     include(scene.bounds, b.position);
     include(scene.bounds, c.position);
 }
+
+size_t hashFloat(float value)
+{
+    return std::hash<uint32_t>{}(std::bit_cast<uint32_t>(value));
+}
+
+struct VertexHasher
+{
+    size_t operator()(const Vertex& vertex) const
+    {
+        size_t hash = hashFloat(vertex.position.x);
+        hash ^= hashFloat(vertex.position.y) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= hashFloat(vertex.position.z) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= hashFloat(vertex.normal.x) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= hashFloat(vertex.normal.y) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= hashFloat(vertex.normal.z) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= hashFloat(vertex.texCoord.x) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= hashFloat(vertex.texCoord.y) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+};
+
+struct VertexEqual
+{
+    bool operator()(const Vertex& a, const Vertex& b) const
+    {
+        return a.position.x == b.position.x && a.position.y == b.position.y && a.position.z == b.position.z
+            && a.normal.x == b.normal.x && a.normal.y == b.normal.y && a.normal.z == b.normal.z
+            && a.texCoord.x == b.texCoord.x && a.texCoord.y == b.texCoord.y;
+    }
+};
+}
+
+void deduplicateMeshVertices(InputMesh& mesh)
+{
+    if (mesh.vertices.size() <= 1) return;
+
+    std::vector<Vertex> uniqueVertices;
+    uniqueVertices.reserve(mesh.vertices.size());
+    std::vector<uint32_t> remap(mesh.vertices.size());
+    std::unordered_map<Vertex, uint32_t, VertexHasher, VertexEqual> vertexMap;
+
+    for (size_t i = 0; i < mesh.vertices.size(); ++i)
+    {
+        const Vertex& vertex = mesh.vertices[i];
+        auto it = vertexMap.find(vertex);
+        if (it == vertexMap.end())
+        {
+            const uint32_t newIndex = static_cast<uint32_t>(uniqueVertices.size());
+            vertexMap.emplace(vertex, newIndex);
+            uniqueVertices.push_back(vertex);
+            remap[i] = newIndex;
+        }
+        else
+        {
+            remap[i] = it->second;
+        }
+    }
+
+    if (uniqueVertices.size() == mesh.vertices.size()) return;
+
+    for (uint32_t& index : mesh.indices) index = remap[index];
+    mesh.vertices = std::move(uniqueVertices);
 }
 
 InputScene loadObjScene(const std::filesystem::path& path)

@@ -43,6 +43,8 @@
 #include "Volume/GridVolume.h"
 #include "Volume/Grid.h"
 #include "SDFs/SDFGrid.h"
+#include "Nanite/NaniteSceneDesc.h"
+#include "Nanite/NaniteStreaming.h"
 
 #include "Core/Macros.h"
 #include "Core/Object.h"
@@ -71,6 +73,8 @@ namespace Falcor
 {
     struct MouseEvent;
     struct KeyboardEvent;
+    class NaniteAsset;
+    class NaniteStreamingManager;
     struct GamepadEvent;
     struct GamepadState;
 
@@ -298,6 +302,11 @@ namespace Falcor
             // Custom primitive data
             std::vector<CustomPrimitiveDesc> customPrimitiveDesc;   ///< Custom primitive descriptors.
             std::vector<AABB> customPrimitiveAABBs;                 ///< List of AABBs for custom primitives in world space. Each custom primitive consists of one AABB.
+
+            // Nanite data
+            std::filesystem::path naniteAssetPath;                  ///< Path to prebuilt .fnanite asset.
+            std::vector<NaniteMeshDesc> naniteMeshDesc;             ///< Nanite mesh descriptors.
+            std::vector<GeometryInstanceData> naniteInstanceData;   ///< Nanite mesh instances.
         };
 
         /** Statistics.
@@ -877,6 +886,43 @@ namespace Falcor
         */
         const ref<EnvMap>& getEnvMap() const override { return mpEnvMap; }
 
+        /** Get the Nanite asset or nullptr if not loaded.
+        */
+        const ref<NaniteAsset>& getNaniteAsset() const { return mpNaniteAsset; }
+
+        /** Get the Nanite streaming manager or nullptr if not loaded.
+        */
+        const ref<NaniteStreamingManager>& getNaniteStreamingManager() const { return mpNaniteStreamingManager; }
+
+        void uploadNaniteAsset(RenderContext* pRenderContext);
+        void beginNaniteStreamingFrame();
+        void collectNanitePageRequests(RenderContext* pRenderContext, const ref<Buffer>& pGpuRequestBuffer);
+        void processNaniteStreamingRequests(RenderContext* pRenderContext);
+        NaniteStreamingStats getNaniteStreamingStats() const;
+        void setNaniteVramBudgetBytes(uint64_t budgetBytes);
+        const ref<Buffer>& getNanitePageRequestBuffer() const;
+        const ref<Buffer>& getNanitePageFallbackBuffer() const;
+
+        /** Returns true if the scene contains a Nanite asset.
+        */
+        bool hasNanite() const { return mpNaniteAsset != nullptr; }
+
+        /** Get Nanite mesh descriptors.
+        */
+        const std::vector<NaniteMeshDesc>& getNaniteMeshDesc() const { return mNaniteMeshDesc; }
+
+        /** Get Nanite mesh instances.
+        */
+        const std::vector<GeometryInstanceData>& getNaniteInstanceData() const { return mNaniteInstanceData; }
+
+        /** Get GPU buffer of Nanite mesh descriptors or nullptr.
+        */
+        const ref<Buffer>& getNaniteMeshDescBuffer() const { return mpNaniteMeshDescBuffer; }
+
+        /** Get GPU buffer of Nanite instance data or nullptr.
+        */
+        const ref<Buffer>& getNaniteInstanceBuffer() const { return mpNaniteInstanceBuffer; }
+
         /** Set how the scene's TLASes are updated when raytracing.
             TLASes are REBUILT by default.
         */
@@ -1305,6 +1351,12 @@ namespace Falcor
         std::unordered_map<ref<Grid>, SdfGridID> mGridIDs;          ///< Lookup table for grid IDs.
         ref<LightCollection> mpLightCollection;                     ///< Class for managing emissive geometry. This is created lazily upon first use.
         ref<EnvMap> mpEnvMap;                                       ///< Environment map or nullptr if not loaded.
+        ref<NaniteAsset> mpNaniteAsset;                             ///< Nanite virtualized geometry asset.
+        ref<NaniteStreamingManager> mpNaniteStreamingManager;       ///< Nanite page streaming manager.
+        std::vector<NaniteMeshDesc> mNaniteMeshDesc;                ///< Nanite mesh descriptors.
+        std::vector<GeometryInstanceData> mNaniteInstanceData;      ///< Nanite mesh instances.
+        ref<Buffer> mpNaniteMeshDescBuffer;                         ///< GPU buffer of Nanite mesh descriptors.
+        ref<Buffer> mpNaniteInstanceBuffer;                         ///< GPU buffer of Nanite instance data.
         bool mEnvMapChanged = false;                                ///< Flag indicating that the environment map has changed since last frame.
 
         // Scene metadata (CPU only)

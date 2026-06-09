@@ -4,11 +4,16 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace FalcorRendering::NaniteTool
 {
@@ -31,6 +36,7 @@ struct MeshBuildResult
     std::vector<uint32_t> indices;
     std::vector<Cluster> clusters;
     std::vector<ClusterDebugInfo> clusterDebugInfo;
+    PartitionStats partitionStats;
     uint64_t sourceTriangleCount = 0;
     uint64_t degenerateTriangleCount = 0;
 };
@@ -47,14 +53,230 @@ struct SourceTriangle
 
 constexpr float kDegenerateAreaEpsilon = 1e-20f;
 
-uint32_t countNewVertices(const ClusterWork& work, const uint32_t sourceIndices[3])
+struct PositionEdgeKey
 {
-    uint32_t count = 0;
-    for (uint32_t i = 0; i < 3; ++i)
+    std::array<uint32_t, 6> data{};
+
+    bool operator==(const PositionEdgeKey& other) const { return data == other.data; }
+};
+
+struct PositionEdgeKeyHash
+{
+    size_t operator()(const PositionEdgeKey& key) const
     {
-        if (!work.remap.contains(sourceIndices[i])) ++count;
+        size_t hash = key.data[0];
+        for (size_t i = 1; i < key.data.size(); ++i)
+        {
+            hash ^= key.data[i] + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        }
+        return hash;
     }
-    return count;
+};
+
+PositionEdgeKey makePositionEdgeKey(const Float3& a, const Float3& b)
+{
+    auto encode = [](const Float3& position)
+    {
+        return std::array<uint32_t, 3>{
+            std::bit_cast<uint32_t>(position.x),
+            std::bit_cast<uint32_t>(position.y),
+            std::bit_cast<uint32_t>(position.z),
+        };
+    };
+
+    std::array<uint32_t, 3> left = encode(a);
+    std::array<uint32_t, 3> right = encode(b);
+    if (left > right) std::swap(left, right);
+    return PositionEdgeKey{ { left[0], left[1], left[2], right[0], right[1], right[2] } };
+}
+
+PositionEdgeKey triangleEdgeKey(const InputMesh& mesh, const SourceTriangle& triangle, size_t edgeIndex)
+{
+    const Float3& a = mesh.vertices[triangle.sourceIndices[edgeIndex]].position;
+    const Float3& b = mesh.vertices[triangle.sourceIndices[(edgeIndex + 1) % 3]].position;
+    return makePositionEdgeKey(a, b);
+}
+
+std::vector<std::vector<uint32_t>> buildTriangleAdjacency(
+    const std::vector<SourceTriangle>& triangles,
+    const InputMesh& mesh)
+{
+    std::unordered_map<PositionEdgeKey, std::vector<uint32_t>, PositionEdgeKeyHash> edgeToTriangles;
+    edgeToTriangles.reserve(triangles.size() * 3);
+
+    for (uint32_t triIndex = 0; triIndex < static_cast<uint32_t>(triangles.size()); ++triIndex)
+    {
+        const SourceTriangle& triangle = triangles[triIndex];
+        for (size_t edgeIndex = 0; edgeIndex < 3; ++edgeIndex)
+        {
+            edgeToTriangles[triangleEdgeKey(mesh, triangle, edgeIndex)].push_back(triIndex);
+        }
+    }
+
+    std::vector<std::vector<uint32_t>> adjacency(triangles.size());
+    for (const auto& entry : edgeToTriangles)
+    {
+        const std::vector<uint32_t>& triList = entry.second;
+        for (size_t i = 0; i < triList.size(); ++i)
+        {
+            for (size_t j = i + 1; j < triList.size(); ++j)
+            {
+                adjacency[triList[i]].push_back(triList[j]);
+                adjacency[triList[j]].push_back(triList[i]);
+            }
+        }
+    }
+    return adjacency;
+}
+
+struct ClusterGrowState
+{
+    std::unordered_map<uint32_t, uint32_t> remap;
+    uint32_t vertexCount = 0;
+    uint32_t triangleCount = 0;
+
+    bool canAdd(const SourceTriangle& triangle, uint32_t maxVertices, uint32_t maxTriangles) const
+    {
+        if (triangleCount >= maxTriangles) return false;
+        uint32_t newVertices = 0;
+        for (uint32_t sourceIndex : triangle.sourceIndices)
+        {
+            if (!remap.contains(sourceIndex)) ++newVertices;
+        }
+        return vertexCount + newVertices <= maxVertices;
+    }
+
+    void add(const SourceTriangle& triangle)
+    {
+        for (uint32_t sourceIndex : triangle.sourceIndices)
+        {
+            if (!remap.contains(sourceIndex))
+            {
+                remap.emplace(sourceIndex, vertexCount++);
+            }
+        }
+        ++triangleCount;
+    }
+};
+
+bool compareTriangleOrder(uint32_t lhs, uint32_t rhs, const std::vector<SourceTriangle>& triangles)
+{
+    const SourceTriangle& a = triangles[lhs];
+    const SourceTriangle& b = triangles[rhs];
+    if (a.mortonCode != b.mortonCode) return a.mortonCode < b.mortonCode;
+    return a.sourceTriangleIndex < b.sourceTriangleIndex;
+}
+
+void removeFrontierTriangle(std::vector<uint32_t>& frontier, std::vector<uint8_t>& inFrontier, uint32_t triIndex)
+{
+    inFrontier[triIndex] = 0;
+    auto it = std::find(frontier.begin(), frontier.end(), triIndex);
+    if (it != frontier.end()) frontier.erase(it);
+}
+
+void pushFrontierTriangle(
+    std::vector<uint32_t>& frontier,
+    std::vector<uint8_t>& inFrontier,
+    uint32_t triIndex,
+    const std::vector<uint8_t>& assigned)
+{
+    if (assigned[triIndex] || inFrontier[triIndex]) return;
+    inFrontier[triIndex] = 1;
+    frontier.push_back(triIndex);
+}
+
+void computePartitionStats(
+    MeshBuildResult& result,
+    const std::vector<SourceTriangle>& triangles,
+    const std::vector<std::vector<uint32_t>>& adjacency,
+    const InputMesh& mesh)
+{
+    std::unordered_map<uint32_t, uint32_t> sourceTriangleToLocal;
+    sourceTriangleToLocal.reserve(triangles.size());
+    for (uint32_t localIndex = 0; localIndex < static_cast<uint32_t>(triangles.size()); ++localIndex)
+    {
+        sourceTriangleToLocal.emplace(triangles[localIndex].sourceTriangleIndex, localIndex);
+    }
+
+    std::unordered_map<uint32_t, uint32_t> sourceTriangleToCluster;
+    sourceTriangleToCluster.reserve(triangles.size());
+    for (size_t clusterIndex = 0; clusterIndex < result.clusterDebugInfo.size(); ++clusterIndex)
+    {
+        for (uint32_t sourceTriangleIndex : result.clusterDebugInfo[clusterIndex].sourceTriangleIndices)
+        {
+            sourceTriangleToCluster.emplace(sourceTriangleIndex, static_cast<uint32_t>(clusterIndex));
+        }
+    }
+
+    std::unordered_map<uint32_t, uint32_t> sourceVertexClusterRefs;
+    std::unordered_set<PositionEdgeKey, PositionEdgeKeyHash> interClusterEdgeKeys;
+
+    for (size_t clusterIndex = 0; clusterIndex < result.clusters.size(); ++clusterIndex)
+    {
+        const Cluster& cluster = result.clusters[clusterIndex];
+        result.partitionStats.totalLocalVertices += cluster.vertexCount;
+
+        std::unordered_map<uint32_t, bool> boundaryVertices;
+        for (uint32_t tri = 0; tri < cluster.triangleCount; ++tri)
+        {
+            const uint32_t sourceTriangleIndex = result.clusterDebugInfo[clusterIndex].sourceTriangleIndices[tri];
+            const uint32_t localTriIndex = sourceTriangleToLocal.at(sourceTriangleIndex);
+            const SourceTriangle& sourceTriangle = triangles[localTriIndex];
+            const std::array<uint32_t, 3> localIndices = {
+                result.indices[cluster.indexOffset + tri * 3 + 0],
+                result.indices[cluster.indexOffset + tri * 3 + 1],
+                result.indices[cluster.indexOffset + tri * 3 + 2],
+            };
+
+            for (size_t edgeIndex = 0; edgeIndex < 3; ++edgeIndex)
+            {
+                const PositionEdgeKey edgeKey = triangleEdgeKey(mesh, sourceTriangle, edgeIndex);
+
+                bool sharesClusterEdge = false;
+                for (uint32_t neighborLocal : adjacency[localTriIndex])
+                {
+                    const uint32_t neighborSource = triangles[neighborLocal].sourceTriangleIndex;
+                    const auto neighborClusterIt = sourceTriangleToCluster.find(neighborSource);
+                    if (neighborClusterIt != sourceTriangleToCluster.end()
+                        && neighborClusterIt->second == static_cast<uint32_t>(clusterIndex))
+                    {
+                        sharesClusterEdge = true;
+                        break;
+                    }
+                }
+
+                if (!sharesClusterEdge)
+                {
+                    boundaryVertices[localIndices[edgeIndex]] = true;
+                    boundaryVertices[localIndices[(edgeIndex + 1) % 3]] = true;
+
+                    for (uint32_t neighborLocal : adjacency[localTriIndex])
+                    {
+                        const uint32_t neighborSource = triangles[neighborLocal].sourceTriangleIndex;
+                        const auto neighborClusterIt = sourceTriangleToCluster.find(neighborSource);
+                        if (neighborClusterIt != sourceTriangleToCluster.end()
+                            && neighborClusterIt->second != static_cast<uint32_t>(clusterIndex))
+                        {
+                            interClusterEdgeKeys.insert(edgeKey);
+                        }
+                    }
+                }
+            }
+
+            for (uint32_t sourceIndex : sourceTriangle.sourceIndices)
+            {
+                ++sourceVertexClusterRefs[sourceIndex];
+            }
+        }
+
+        result.clusterDebugInfo[clusterIndex].boundaryVertexCount = static_cast<uint32_t>(boundaryVertices.size());
+    }
+
+    result.partitionStats.interClusterEdges = interClusterEdgeKeys.size();
+    for (const auto& entry : sourceVertexClusterRefs)
+    {
+        if (entry.second > 1) ++result.partitionStats.boundarySourceVertices;
+    }
 }
 
 Float3 triangleNormal(const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices, size_t triangleIndex)
@@ -234,23 +456,90 @@ MeshBuildResult buildMesh(const InputMesh& inputMesh, uint32_t meshIndex, uint32
         return a.sourceTriangleIndex < b.sourceTriangleIndex;
     });
 
-    ClusterWork work;
-    for (const SourceTriangle& triangle : triangles)
+    const std::vector<std::vector<uint32_t>> adjacency = buildTriangleAdjacency(triangles, inputMesh);
+    std::vector<uint32_t> seedOrder(triangles.size());
+    std::iota(seedOrder.begin(), seedOrder.end(), 0);
+    std::stable_sort(seedOrder.begin(), seedOrder.end(), [&](uint32_t lhs, uint32_t rhs)
     {
-        const uint32_t currentTriangles = static_cast<uint32_t>(work.indices.size() / 3);
-        const uint32_t sourceIndices[3] = { triangle.sourceIndices[0], triangle.sourceIndices[1], triangle.sourceIndices[2] };
-        const uint32_t newVertices = countNewVertices(work, sourceIndices);
-        const bool fullByTriangles = currentTriangles >= options.clusterTriangleTarget;
-        const bool fullByVertices = !work.indices.empty() && work.vertices.size() + newVertices > options.maxClusterVertices;
-        if (fullByTriangles || fullByVertices)
+        return compareTriangleOrder(lhs, rhs, triangles);
+    });
+
+    std::vector<uint8_t> assigned(triangles.size(), 0);
+    std::vector<uint8_t> inFrontier(triangles.size(), 0);
+    ClusterWork work;
+
+    for (uint32_t seedLocalIndex : seedOrder)
+    {
+        if (assigned[seedLocalIndex]) continue;
+
+        ClusterGrowState growState;
+        growState.add(triangles[seedLocalIndex]);
+        assigned[seedLocalIndex] = 1;
+
+        std::vector<uint32_t> clusterTriangles;
+        clusterTriangles.push_back(seedLocalIndex);
+
+        std::vector<uint32_t> frontier;
+        for (uint32_t neighbor : adjacency[seedLocalIndex])
         {
-            finalizeCluster(result, meshIndex, materialIndex, work);
+            pushFrontierTriangle(frontier, inFrontier, neighbor, assigned);
         }
 
-        appendTriangle(work, inputMesh, triangle);
+        while (growState.triangleCount < options.clusterTriangleTarget)
+        {
+            uint32_t selectedLocalIndex = std::numeric_limits<uint32_t>::max();
+
+            if (!frontier.empty())
+            {
+                std::stable_sort(frontier.begin(), frontier.end(), [&](uint32_t lhs, uint32_t rhs)
+                {
+                    return compareTriangleOrder(lhs, rhs, triangles);
+                });
+
+                for (uint32_t candidate : frontier)
+                {
+                    if (growState.canAdd(triangles[candidate], options.maxClusterVertices, options.clusterTriangleTarget))
+                    {
+                        selectedLocalIndex = candidate;
+                        break;
+                    }
+                }
+            }
+
+            if (selectedLocalIndex == std::numeric_limits<uint32_t>::max())
+            {
+                for (uint32_t candidate : seedOrder)
+                {
+                    if (assigned[candidate]) continue;
+                    if (growState.canAdd(triangles[candidate], options.maxClusterVertices, options.clusterTriangleTarget))
+                    {
+                        selectedLocalIndex = candidate;
+                        break;
+                    }
+                }
+            }
+
+            if (selectedLocalIndex == std::numeric_limits<uint32_t>::max()) break;
+
+            growState.add(triangles[selectedLocalIndex]);
+            assigned[selectedLocalIndex] = 1;
+            clusterTriangles.push_back(selectedLocalIndex);
+            removeFrontierTriangle(frontier, inFrontier, selectedLocalIndex);
+
+            for (uint32_t neighbor : adjacency[selectedLocalIndex])
+            {
+                pushFrontierTriangle(frontier, inFrontier, neighbor, assigned);
+            }
+        }
+
+        for (uint32_t localIndex : clusterTriangles)
+        {
+            appendTriangle(work, inputMesh, triangles[localIndex]);
+        }
+        finalizeCluster(result, meshIndex, materialIndex, work);
     }
 
-    finalizeCluster(result, meshIndex, materialIndex, work);
+    computePartitionStats(result, triangles, adjacency, inputMesh);
     result.mesh.clusterCount = static_cast<uint32_t>(result.clusters.size());
     return result;
 }
@@ -261,19 +550,25 @@ Asset buildNaniteAsset(const InputScene& scene, const BuildOptions& options)
     if (options.clusterTriangleTarget == 0) throw std::runtime_error("clusterTriangleTarget must be greater than zero.");
     if (options.maxClusterVertices < 3) throw std::runtime_error("maxClusterVertices must be at least 3.");
 
+    InputScene buildScene = scene;
+    if (options.dedupVerts)
+    {
+        for (InputMesh& mesh : buildScene.meshes) deduplicateMeshVertices(mesh);
+    }
+
     Asset asset;
-    asset.sourcePath = scene.sourcePath.string();
+    asset.sourcePath = buildScene.sourcePath.string();
     asset.bounds = emptyBounds();
 
-    asset.materials.reserve(scene.materialNames.size());
-    for (const std::string& name : scene.materialNames) asset.materials.push_back({ name });
+    asset.materials.reserve(buildScene.materialNames.size());
+    for (const std::string& name : buildScene.materialNames) asset.materials.push_back({ name });
     if (asset.materials.empty()) asset.materials.push_back({ "default" });
 
     std::vector<size_t> meshIndices;
-    meshIndices.reserve(scene.meshes.size());
-    for (size_t i = 0; i < scene.meshes.size(); ++i)
+    meshIndices.reserve(buildScene.meshes.size());
+    for (size_t i = 0; i < buildScene.meshes.size(); ++i)
     {
-        if (!scene.meshes[i].indices.empty()) meshIndices.push_back(i);
+        if (!buildScene.meshes[i].indices.empty()) meshIndices.push_back(i);
     }
     if (meshIndices.empty()) throw std::runtime_error("No meshes were converted into Nanite clusters.");
 
@@ -292,7 +587,7 @@ Asset buildNaniteAsset(const InputScene& scene, const BuildOptions& options)
         const size_t inputMeshIndex = meshIndices[taskIndex];
         tf::Task task = taskflow.emplace([&, taskIndex, inputMeshIndex]()
         {
-            const InputMesh& inputMesh = scene.meshes[inputMeshIndex];
+            const InputMesh& inputMesh = buildScene.meshes[inputMeshIndex];
             const uint32_t meshIndex = static_cast<uint32_t>(taskIndex);
             const uint32_t materialIndex = std::min(inputMesh.materialIndex, static_cast<uint32_t>(asset.materials.size() - 1));
             results[taskIndex] = buildMesh(inputMesh, meshIndex, materialIndex, options);
@@ -331,6 +626,9 @@ Asset buildNaniteAsset(const InputScene& scene, const BuildOptions& options)
         }
 
         include(asset.bounds, result.mesh.bounds);
+        asset.partitionStats.totalLocalVertices += result.partitionStats.totalLocalVertices;
+        asset.partitionStats.boundarySourceVertices += result.partitionStats.boundarySourceVertices;
+        asset.partitionStats.interClusterEdges += result.partitionStats.interClusterEdges;
         asset.meshes.push_back(result.mesh);
         asset.vertices.insert(asset.vertices.end(), result.vertices.begin(), result.vertices.end());
         asset.indices.insert(asset.indices.end(), result.indices.begin(), result.indices.end());

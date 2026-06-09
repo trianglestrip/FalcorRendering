@@ -28,6 +28,7 @@
 #include "SceneBuilder.h"
 #include "SceneCache.h"
 #include "Importer.h"
+#include "Nanite/NaniteAssetData.h"
 #include "Curves/CurveConfig.h"
 #include "Material/StandardMaterial.h"
 #include "Utils/Logger.h"
@@ -339,6 +340,12 @@ namespace Falcor
         mSceneData.importPaths.push_back(resolvedPath);
         mSceneData.importDicts.push_back(materialToShortName);
 
+        if (resolvedPath.extension() == ".fnanite")
+        {
+            importNaniteAsset(resolvedPath);
+            return;
+        }
+
         if (auto importer = Importer::create(getExtensionFromPath(resolvedPath)))
         {
             importer->importScene(resolvedPath, *this, materialToShortName);
@@ -367,6 +374,55 @@ namespace Falcor
         }
     }
 
+    void SceneBuilder::importNaniteAsset(const std::filesystem::path& path)
+    {
+        logInfo("Importing Nanite asset: {}", path);
+        if (!mSceneData.naniteAssetPath.empty())
+        {
+            logWarning("Scene already contains a Nanite asset. Replacing with {}", path);
+            mSceneData.naniteMeshDesc.clear();
+            mSceneData.naniteInstanceData.clear();
+        }
+        mSceneData.naniteAssetPath = path;
+
+        const Nanite::Asset asset = Nanite::readAsset(path);
+        const Nanite::Bounds& bounds = asset.bounds;
+
+        if (mSceneData.cameras.empty())
+        {
+            ref<Camera> pCamera = Camera::create();
+            const float3 center = float3(
+                (bounds.min.x + bounds.max.x) * 0.5f,
+                (bounds.min.y + bounds.max.y) * 0.5f,
+                (bounds.min.z + bounds.max.z) * 0.5f);
+            const float radius = std::max({ bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y, bounds.max.z - bounds.min.z }) * 0.5f;
+            pCamera->setPosition(center + float3(0.f, 0.f, radius * 2.5f + 1.f));
+            pCamera->setTarget(center);
+            pCamera->setUpVector(float3(0.f, 1.f, 0.f));
+            pCamera->setFocalLength(18.f);
+            mSceneData.cameras.push_back(pCamera);
+            mSceneData.selectedCamera = 0;
+        }
+
+        for (size_t meshIndex = 0; meshIndex < asset.meshes.size(); ++meshIndex)
+        {
+            const Nanite::Mesh& mesh = asset.meshes[meshIndex];
+            NaniteMeshDesc desc{};
+            desc.meshIndex = static_cast<uint32_t>(meshIndex);
+            desc.firstCluster = mesh.firstCluster;
+            desc.clusterCount = mesh.clusterCount;
+            desc.materialIndex = mesh.firstMaterial;
+            desc.bounds = AABB(float3(mesh.bounds.min.x, mesh.bounds.min.y, mesh.bounds.min.z),
+                               float3(mesh.bounds.max.x, mesh.bounds.max.y, mesh.bounds.max.z));
+            mSceneData.naniteMeshDesc.push_back(desc);
+
+            GeometryInstanceData instance(GeometryType::TriangleMesh);
+            instance.materialID = MaterialID(static_cast<uint32_t>(mesh.firstMaterial)).getSlang();
+            instance.geometryID = static_cast<uint32_t>(meshIndex);
+            mSceneData.naniteInstanceData.push_back(instance);
+        }
+    }
+
     void SceneBuilder::pushAssetResolver()
     {
         mAssetResolverStack.push_back(AssetResolver(mAssetResolver));
@@ -388,7 +444,8 @@ namespace Falcor
 
         // If no meshes were added, we create a dummy mesh to keep the scene generation working.
         // Scenes with no meshes can be useful for example when using volumes in isolation.
-        if (mMeshes.empty())
+        // Nanite-only scenes skip the dummy mesh.
+        if (mMeshes.empty() && mSceneData.naniteAssetPath.empty())
         {
             logWarning("Scene contains no meshes. Creating a dummy mesh.");
             // Add a dummy (degenerate) mesh.

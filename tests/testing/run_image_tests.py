@@ -167,7 +167,58 @@ class Test:
         files = filter(lambda f: f.suffix.lower() in config.IMAGE_EXTENSIONS, files)
         return list(files)
 
-    def generate_images(self, output_dir: Path, mogwai_exe: Path, run_only: bool, temp_dir: Path):
+    def _resolve_executable_args(self, args, output_dir: Path):
+        '''
+        Rewrite --screenshot and --csv paths in executable test args to output_dir.
+        '''
+        resolved = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg in ('--screenshot', '--csv') and i + 1 < len(args):
+                resolved.append(arg)
+                resolved.append(str(output_dir / Path(args[i + 1]).name))
+                i += 2
+            else:
+                resolved.append(arg)
+                i += 1
+        return resolved
+
+    def generate_executable_images(self, output_dir: Path, build_dir: Path, project_dir: Path, run_only: bool):
+        '''
+        Run a standalone sample executable to generate images in output_dir.
+        Returns a tuple containing the result code, messages, and rerun env.
+        '''
+        executable = self.header.get('executable')
+        exe_suffix = '.exe' if os.name == 'nt' else ''
+        exe_path = build_dir / f'{executable}{exe_suffix}'
+        if not exe_path.exists():
+            return Test.Result.FAILED, [f'Executable "{exe_path}" does not exist.'], {}
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        exe_args = self._resolve_executable_args(self.header.get('args', []), output_dir)
+        cmd = [str(exe_path)] + exe_args
+        rerun_env = {'cwd': str(project_dir), 'args': exe_args}
+
+        p = subprocess.Popen(cmd, cwd=str(project_dir), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if not self.process_controller.add_process(self.name + ':run', p):
+            return Test.Result.FAILED, ['Process killed due to global exit'], rerun_env
+        try:
+            outs, errs = p.communicate(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            return Test.Result.FAILED, ['Process killed due to timeout'], rerun_env
+
+        if p.returncode != 0:
+            errors = list(map(lambda l: l.rstrip(), errs.decode('utf-8').splitlines()))
+            return Test.Result.FAILED, errors + [f'{exe_path} exited with return code {p.returncode}'], rerun_env
+
+        if not run_only and len(self.collect_images(output_dir)) == 0:
+            return Test.Result.FAILED, ['Test did not generate any images.'], rerun_env
+
+        return Test.Result.PASSED, [], rerun_env
+
+    def generate_images(self, output_dir: Path, mogwai_exe: Path, run_only: bool, temp_dir: Path, build_dir: Path = None, project_dir: Path = None):
         '''
         Run Mogwai to generate a set of images and store them in output_dir.
         Returns a tuple containing the result code and a list of messages.
@@ -180,6 +231,11 @@ class Test:
         output_dir = output_dir / self.test_dir
         output_dir.mkdir(parents=True, exist_ok=True)
         temp_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.header.get('executable'):
+            if build_dir is None or project_dir is None:
+                return Test.Result.FAILED, ['Executable test requires build_dir and project_dir.'], {}
+            return self.generate_executable_images(output_dir, build_dir, project_dir, run_only)
 
         # In order to simplify module imports in test scripts, we run Mogwai with
         # a working directory set to the directory the test script resides in.
@@ -314,7 +370,7 @@ class Test:
 
         return result, messages, image_reports
 
-    def run(self, run_only: bool, compare_only: bool, ref_dir: Path, result_dir: Path, mogwai_exe: Path, image_compare_exe: Path, temp_dir: Path):
+    def run(self, run_only: bool, compare_only: bool, ref_dir: Path, result_dir: Path, mogwai_exe: Path, image_compare_exe: Path, temp_dir: Path, build_dir: Path = None, project_dir: Path = None):
         '''
         Run the image test.
         First, result images are generated (unless compare_only is True).
@@ -336,7 +392,7 @@ class Test:
 
         # Generate results images.
         if not compare_only:
-            result, messages, rerun_env = self.generate_images(result_dir, mogwai_exe, run_only, temp_dir)
+            result, messages, rerun_env = self.generate_images(result_dir, mogwai_exe, run_only, temp_dir, build_dir, project_dir)
 
         # Compare to references.
         if not run_only and result == Test.Result.PASSED:
@@ -364,7 +420,7 @@ def generate_ref(env: Environment, test: Test, ref_dir: Path, process_controller
         print(f'  {test.name:<60} : STARTED')
     test.process_controller = process_controller
     start_time = time.time()
-    result, messages, rerun_env = test.generate_images(ref_dir, env.mogwai_exe, False, env.temp_dir)
+    result, messages, rerun_env = test.generate_images(ref_dir, env.mogwai_exe, False, env.temp_dir, env.build_dir, env.project_dir)
     elapsed_time = time.time() - start_time
     return {"name": test.name, "elapsed_time": elapsed_time, "result": result, "messages": messages, "rerun_env": rerun_env}
 
@@ -428,7 +484,7 @@ def run_test(env: Environment, test: Test, run_only: bool, compare_only: bool, r
     test.tolerance = max(test.tolerance, min_tolerance)
     test.process_controller = process_controller
     start_time = time.time()
-    result, messages = test.run(run_only, compare_only, ref_dir, result_dir, env.mogwai_exe, env.image_compare_exe, env.temp_dir)
+    result, messages = test.run(run_only, compare_only, ref_dir, result_dir, env.mogwai_exe, env.image_compare_exe, env.temp_dir, env.build_dir, env.project_dir)
     elapsed_time = time.time() - start_time
 
     if result != Test.Result.SKIPPED:

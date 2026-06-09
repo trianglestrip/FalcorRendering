@@ -1,0 +1,20 @@
+{
+  "source": "D:\\gitProject\\FalcorRendering\\data\\framework\\meshes\\cube.obj",
+  "clusterTriangleTarget": 128,
+  "maxClusterVertices": 256,
+  "workerCount": 0,
+  "dedupVerts": false,
+  "meshCount": 1,
+  "materialCount": 1,
+  "clusterCount": 1,
+  "vertexCount": 36,
+  "indexCount": 36,
+  "triangleCount": 12,
+  "sourceTriangleCount": 12,
+  "degenerateTriangleCount": 0,
+  "partitionStats": { "totalLocalVertices": 36, "boundarySourceVertices": 0, "interClusterEdges": 0 },
+  "bounds": { "min": [-1, -1, -1], "max": [1, 1, 1] },
+  "clusters": [
+    { "id": 0, "mesh": 0, "material": 0, "triangles": 12, "vertices": 36, "boundaryVertices": 0, "surfaceArea": 24, "coneAngle": 3.14159, "coneNormal": [0, 1, 0], "sourceMesh": 0, "sourceMaterial": 0, "sourceTriangles": [9, 1, 11, 2, 8, 7, 10, 0, 5, 4, 6, 3], "bounds": { "min": [-1, -1, -1], "max": [1, 1, 1] } }
+  ]
+}

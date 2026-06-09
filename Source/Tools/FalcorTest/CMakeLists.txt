@@ -175,10 +175,13 @@ target_sources(FalcorTest PRIVATE
     Tests/Utils/TextureAnalyzerTests.cpp
     Tests/Utils/UnionFindTests.cpp
     Tests/Utils/VectorTests.cpp
+
+    Tests/Nanite/NaniteAssetTests.cpp
+    Tests/Nanite/NaniteStreamingTests.cpp
 )
 
 
-target_link_libraries(FalcorTest PRIVATE args)
+target_link_libraries(FalcorTest PRIVATE args NaniteToolCore)
 
 target_copy_shaders(FalcorTest .)
 

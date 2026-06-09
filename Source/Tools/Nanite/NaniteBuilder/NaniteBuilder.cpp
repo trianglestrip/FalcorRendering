@@ -1,7 +1,11 @@
-#include "NaniteAsset.h"
+#include "NaniteToolAsset.h"
 #include "NaniteBuild.h"
+#include "NaniteGltf.h"
 #include "NaniteObj.h"
+#include "NanitePbrt.h"
 
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -20,6 +24,7 @@ struct Arguments
     std::filesystem::path output;
     std::filesystem::path debugJson;
     BuildOptions build;
+    WriteOptions writeOptions;
     bool writeDebugJson = false;
 };
 
@@ -27,13 +32,17 @@ void printUsage()
 {
     std::cout
         << "Usage:\n"
-        << "  NaniteBuilder --input <model.obj> [--output <asset.fnanite>] [options]\n\n"
+        << "  NaniteBuilder --input <model.obj|model.gltf|model.glb|scene.pbrt> [--output <asset.fnanite>] [options]\n\n"
         << "Options:\n"
-        << "  -i, --input <path>             Input OBJ file.\n"
+        << "  -i, --input <path>             Input mesh file (.obj, .gltf, .glb, or .pbrt).\n"
         << "  -o, --output <path>            Output .fnanite file. Defaults to input path with .fnanite extension.\n"
         << "  --cluster-tris <count>         Target triangles per cluster. Default: 128.\n"
         << "  --max-cluster-verts <count>    Maximum local vertices per cluster. Default: 256.\n"
         << "  --workers <count>              Taskflow worker count. Default: hardware thread count.\n"
+        << "  --dedup-verts                  Merge identical vertices within each source mesh section.\n"
+        << "  --no-compress                  Write uncompressed vertices (debug).\n"
+        << "  --debug-uncompressed           Alias for --no-compress.\n"
+        << "  --group-clusters <count>       Clusters per cluster group. Default: 32.\n"
         << "  --debug-json [path]            Write a debug JSON summary. Default path is output.fnanite.json.\n"
         << "  -h, --help                     Show this help.\n";
 }
@@ -95,6 +104,19 @@ Arguments parseArguments(int argc, char** argv)
         {
             args.build.workerCount = parseUInt(requireValue(option.c_str()), option.c_str());
         }
+        else if (option == "--dedup-verts")
+        {
+            args.build.dedupVerts = true;
+        }
+        else if (option == "--no-compress" || option == "--debug-uncompressed")
+        {
+            args.writeOptions.compressVertices = false;
+            args.writeOptions.debugUncompressed = true;
+        }
+        else if (option == "--group-clusters")
+        {
+            args.writeOptions.groupClusters = parseUInt(requireValue(option.c_str()), option.c_str());
+        }
         else if (option == "--debug-json")
         {
             args.writeDebugJson = true;
@@ -113,7 +135,7 @@ Arguments parseArguments(int argc, char** argv)
         }
     }
 
-    if (args.input.empty()) throw std::runtime_error("Missing input OBJ file.");
+    if (args.input.empty()) throw std::runtime_error("Missing input mesh file.");
     if (args.output.empty())
     {
         args.output = args.input;
@@ -183,6 +205,7 @@ void writeDebugJson(const std::filesystem::path& path, const Asset& asset, const
     stream << "  \"clusterTriangleTarget\": " << options.clusterTriangleTarget << ",\n";
     stream << "  \"maxClusterVertices\": " << options.maxClusterVertices << ",\n";
     stream << "  \"workerCount\": " << options.workerCount << ",\n";
+    stream << "  \"dedupVerts\": " << (options.dedupVerts ? "true" : "false") << ",\n";
     stream << "  \"meshCount\": " << asset.meshes.size() << ",\n";
     stream << "  \"materialCount\": " << asset.materials.size() << ",\n";
     stream << "  \"clusterCount\": " << asset.clusters.size() << ",\n";
@@ -191,6 +214,9 @@ void writeDebugJson(const std::filesystem::path& path, const Asset& asset, const
     stream << "  \"triangleCount\": " << triangleCount(asset) << ",\n";
     stream << "  \"sourceTriangleCount\": " << asset.sourceTriangleCount << ",\n";
     stream << "  \"degenerateTriangleCount\": " << asset.degenerateTriangleCount << ",\n";
+    stream << "  \"partitionStats\": { \"totalLocalVertices\": " << asset.partitionStats.totalLocalVertices
+        << ", \"boundarySourceVertices\": " << asset.partitionStats.boundarySourceVertices
+        << ", \"interClusterEdges\": " << asset.partitionStats.interClusterEdges << " },\n";
     stream << "  \"bounds\": ";
     writeBounds(stream, asset.bounds);
     stream << ",\n";
@@ -204,6 +230,7 @@ void writeDebugJson(const std::filesystem::path& path, const Asset& asset, const
             << ", \"material\": " << cluster.materialIndex
             << ", \"triangles\": " << cluster.triangleCount
             << ", \"vertices\": " << cluster.vertexCount
+            << ", \"boundaryVertices\": " << (debugInfo ? debugInfo->boundaryVertexCount : 0)
             << ", \"surfaceArea\": " << cluster.surfaceArea
             << ", \"coneAngle\": " << cluster.coneAngle
             << ", \"coneNormal\": ";
@@ -220,6 +247,13 @@ void writeDebugJson(const std::filesystem::path& path, const Asset& asset, const
     stream << "  ]\n";
     stream << "}\n";
 }
+bool isGltfInput(const std::filesystem::path& path)
+{
+    const std::string extension = path.extension().string();
+    std::string lower = extension;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return lower == ".gltf" || lower == ".glb";
+}
 }
 
 int main(int argc, char** argv)
@@ -227,13 +261,29 @@ int main(int argc, char** argv)
     try
     {
         Arguments args = parseArguments(argc, argv);
-        if (args.input.extension() != ".obj")
+        const bool gltfInput = isGltfInput(args.input);
+        const bool pbrtInput = args.input.extension() == ".pbrt";
+        if (args.input.extension() != ".obj" && !gltfInput && !pbrtInput)
         {
-            throw std::runtime_error("NaniteBuilder MVP currently supports OBJ input only.");
+            throw std::runtime_error("NaniteBuilder supports OBJ, glTF, GLB, and PBRT input.");
         }
 
-        std::cout << "Loading OBJ: " << args.input << '\n';
-        InputScene scene = loadObjScene(args.input);
+        InputScene scene;
+        if (gltfInput)
+        {
+            std::cout << "Loading glTF: " << args.input << '\n';
+            scene = loadGltfScene(args.input);
+        }
+        else if (pbrtInput)
+        {
+            std::cout << "Loading PBRT: " << args.input << '\n';
+            scene = loadPbrtScene(args.input, args.build.workerCount);
+        }
+        else
+        {
+            std::cout << "Loading OBJ: " << args.input << '\n';
+            scene = loadObjScene(args.input);
+        }
 
         std::cout << "Building clusters...\n";
         Asset asset = buildNaniteAsset(scene, args.build);
@@ -245,7 +295,7 @@ int main(int argc, char** argv)
             throw std::runtime_error("Generated Nanite asset failed validation.");
         }
 
-        writeAsset(args.output, asset);
+        writeAsset(args.output, asset, args.writeOptions);
         if (args.writeDebugJson) writeDebugJson(args.debugJson, asset, args.build);
 
         std::cout << "Wrote: " << args.output << '\n';

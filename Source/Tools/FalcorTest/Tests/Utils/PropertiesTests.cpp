@@ -82,7 +82,7 @@ struct fmt::formatter<Falcor::PropertiesTest::TestStruct> : formatter<std::strin
     template<typename FormatContext>
     auto format(const Falcor::PropertiesTest::TestStruct& t, FormatContext& ctx)
     {
-        return format_to(ctx.out(), "TestStruct{{a={}, b={}, c={}}}", t.a, t.b, t.c);
+        return fmt::format_to(ctx.out(), "TestStruct{{a={}, b={}, c={}}}", t.a, t.b, t.c);
     }
 };
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "NaniteAsset.h"
+#include "NaniteToolAsset.h"
 
 #include <filesystem>
 #include <string>
@@ -26,4 +26,7 @@ struct InputScene
 };
 
 InputScene loadObjScene(const std::filesystem::path& path);
+
+/// Merges vertices with matching position, normal, and texcoord within one mesh section.
+void deduplicateMeshVertices(InputMesh& mesh);
 }

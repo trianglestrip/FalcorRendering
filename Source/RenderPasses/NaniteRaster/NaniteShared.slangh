@@ -1,0 +1,87 @@
+#pragma once
+
+// Shared Nanite GPU types for Slang shaders.
+
+struct NaniteGpuCluster
+{
+    uint meshIndex;
+    uint materialIndex;
+    uint vertexOffset;
+    uint vertexCount;
+    uint indexOffset;
+    uint indexCount;
+    uint triangleCount;
+    uint lodLevel;
+    uint flags;
+    uint groupIndex;
+    uint pageIndex;
+    float3 boundsMin;
+    float3 boundsMax;
+    float3 sphereCenter;
+    float sphereRadius;
+    float3 coneNormal;
+    float coneAngle;
+    float geometricError;
+    float surfaceArea;
+};
+
+struct NaniteGpuHierarchyNode
+{
+    uint childNodeOffset;
+    uint childNodeCount;
+    uint clusterGroupIndex;
+    uint clusterOffset;
+    uint clusterCount;
+    float3 sphereCenter;
+    float sphereRadius;
+    float minError;
+    float maxError;
+};
+
+struct NaniteGpuPageDesc
+{
+    uint firstCluster;
+    uint clusterCount;
+    uint flags;
+    uint byteSize;
+};
+
+struct NaniteGpuVertex
+{
+    float3 position;
+    float3 normal;
+    float2 texCoord;
+};
+
+struct NaniteCameraData
+{
+    float4x4 viewProj;
+    float4x4 invViewProj;
+    float3 cameraPos;
+    float lodErrorThreshold;
+    float2 screenSize;
+    float nearPlane;
+    float farPlane;
+    uint clusterCount;
+    uint hierarchyNodeCount;
+    uint debugMode;
+    uint enableHZB;
+    uint enableOcclusion;
+    uint rootNodeCount;
+};
+
+static const uint NANITE_DEBUG_SHADED = 0;
+static const uint NANITE_DEBUG_CLUSTER_ID = 1;
+static const uint NANITE_DEBUG_DEPTH = 2;
+static const uint NANITE_DEBUG_CULL_REASON = 3;
+static const uint NANITE_DEBUG_LOD = 4;
+static const uint NANITE_DEBUG_OCCLUSION = 5;
+
+static const uint CULL_VISIBLE = 0;
+static const uint CULL_FRUSTUM = 1;
+static const uint CULL_BACKFACE = 2;
+static const uint CULL_SCREEN_SIZE = 3;
+static const uint CULL_LOD = 4;
+static const uint CULL_OCCLUDED = 5;
+static const uint CULL_PAGE_MISS = 6;
+static const uint CULL_TESTED = 7;

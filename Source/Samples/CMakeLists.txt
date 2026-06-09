@@ -1,6 +1,7 @@
 add_subdirectory(CudaInterop)
 add_subdirectory(HelloDXR)
 add_subdirectory(MultiSampling)
+add_subdirectory(NaniteViewer)
 add_subdirectory(PBRTOfflineRenderer)
 add_subdirectory(PBRTRealtimeGI)
 add_subdirectory(PBRTRTGI)

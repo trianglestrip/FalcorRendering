@@ -1,5 +1,7 @@
 add_library(Falcor SHARED)
 
+add_subdirectory(Scene/Nanite)
+
 target_sources(Falcor PRIVATE
     Falcor.natvis
     Falcor.manifest
@@ -342,6 +344,12 @@ target_sources(Falcor PRIVATE
     Scene/SceneBuilder.h
     Scene/SceneBuilderDump.cpp
     Scene/SceneBuilderDump.h
+    Scene/Nanite/NaniteAsset.cpp
+    Scene/Nanite/NaniteAsset.h
+    Scene/Nanite/NaniteStreaming.cpp
+    Scene/Nanite/NaniteStreaming.h
+    Scene/Nanite/NaniteSceneGpu.cpp
+    Scene/Nanite/NaniteSceneGpu.h
     Scene/SceneCache.cpp
     Scene/SceneCache.h
     Scene/SceneDefines.slangh
@@ -977,6 +985,7 @@ endif()
 target_link_libraries(Falcor
     PUBLIC
         fmt pybind11::embed Vulkan::Headers
+        NaniteCore
         slang slang-gfx
         imgui imgui_addons
         nanovdb
