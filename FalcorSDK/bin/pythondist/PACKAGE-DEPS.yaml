@@ -1,0 +1,44 @@
+libffi:
+  licenseFile: libffi-LICENSE.txt
+  packageName: libffi
+  packageType: packman
+  source:
+    branch: merge-request
+    change: 674dacf685767330a9d0e9c32c5814cd3e651862
+    path: https://gitlab/omniverse/externals/libffi-build.git
+    scm: git
+  swipat: http://nvbugs/3217408
+  version: 3.4.2+nv1-windows-x86_64
+openssl:
+  licenseFile: openssl-LICENSE.txt
+  packageName: openssl
+  packageType: packman
+  source:
+    branch: merge-request
+    change: b371420e70f6b2bfc49e520c1155b87667f0e8e6
+    path: https://gitlab/omniverse/externals/openssl-build.git
+    scm: git
+  swipat: '2820294'
+  version: 1.1.1t+nv1-windows-x86_64
+pip:
+  licenseFile: pip-LICENSE.txt
+  packageName: pip
+  packageType: packman
+  source:
+    branch: merge-request
+    change: 7a3e732b7b7d997ea5ffd10491368c8dd133452a
+    path: https://gitlab/omniverse/externals/pip-build.git
+    scm: git
+  swipat: https://nvbugs/3354358
+  version: 21.2.1+nv1
+xz:
+  licenseFile: xz-LICENSE.txt
+  packageName: xz
+  packageType: packman
+  source:
+    branch: merge-request
+    change: 3c7be287fa2d91690bcc2abd2886a8127a2ac2a0
+    path: https://gitlab/omniverse/externals/xz-build.git
+    scm: git
+  swipat: '3381177'
+  version: 5.2.6+nv1-windows-x86_64

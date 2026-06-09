@@ -470,3 +470,6 @@ endif()
 
 # Make Mogwai the default startup project in VS.
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT Mogwai)
+
+# Optional SDK install/export support for using Falcor from external projects.
+include(falcor_sdk)

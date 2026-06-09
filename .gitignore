@@ -1,6 +1,9 @@
 # Build folder.
 /build/
 
+# Local SDK export folder.
+/sdk/
+
 # Test output folder.
 /tests/data/
 
