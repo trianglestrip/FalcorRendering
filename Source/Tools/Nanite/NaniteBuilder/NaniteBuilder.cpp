@@ -33,6 +33,7 @@ void printUsage()
         << "  -o, --output <path>            Output .fnanite file. Defaults to input path with .fnanite extension.\n"
         << "  --cluster-tris <count>         Target triangles per cluster. Default: 128.\n"
         << "  --max-cluster-verts <count>    Maximum local vertices per cluster. Default: 256.\n"
+        << "  --workers <count>              Taskflow worker count. Default: hardware thread count.\n"
         << "  --debug-json [path]            Write a debug JSON summary. Default path is output.fnanite.json.\n"
         << "  -h, --help                     Show this help.\n";
 }
@@ -89,6 +90,10 @@ Arguments parseArguments(int argc, char** argv)
         else if (option == "--max-cluster-verts")
         {
             args.build.maxClusterVertices = parseUInt(requireValue(option.c_str()), option.c_str());
+        }
+        else if (option == "--workers")
+        {
+            args.build.workerCount = parseUInt(requireValue(option.c_str()), option.c_str());
         }
         else if (option == "--debug-json")
         {
@@ -158,6 +163,7 @@ void writeDebugJson(const std::filesystem::path& path, const Asset& asset, const
     stream << "  \"source\": \"" << jsonEscape(asset.sourcePath) << "\",\n";
     stream << "  \"clusterTriangleTarget\": " << options.clusterTriangleTarget << ",\n";
     stream << "  \"maxClusterVertices\": " << options.maxClusterVertices << ",\n";
+    stream << "  \"workerCount\": " << options.workerCount << ",\n";
     stream << "  \"meshCount\": " << asset.meshes.size() << ",\n";
     stream << "  \"materialCount\": " << asset.materials.size() << ",\n";
     stream << "  \"clusterCount\": " << asset.clusters.size() << ",\n";

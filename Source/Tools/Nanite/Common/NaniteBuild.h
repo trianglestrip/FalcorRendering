@@ -11,6 +11,7 @@ struct BuildOptions
 {
     uint32_t clusterTriangleTarget = 128;
     uint32_t maxClusterVertices = 256;
+    uint32_t workerCount = 0; ///< 0 selects the hardware thread count.
 };
 
 Asset buildNaniteAsset(const InputScene& scene, const BuildOptions& options);

@@ -1,8 +1,11 @@
 #include "NaniteBuild.h"
 
+#include <taskflow.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 namespace FalcorRendering::NaniteTool
@@ -15,6 +18,14 @@ struct ClusterWork
     std::vector<uint32_t> indices;
     std::unordered_map<uint32_t, uint32_t> remap;
     Bounds bounds = emptyBounds();
+};
+
+struct MeshBuildResult
+{
+    Mesh mesh;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    std::vector<Cluster> clusters;
 };
 
 uint32_t countNewVertices(const ClusterWork& work, const uint32_t sourceIndices[3])
@@ -35,16 +46,16 @@ Float3 triangleNormal(const std::vector<Vertex>& vertices, const std::vector<uin
     return normalize(cross(b.position - a.position, c.position - a.position));
 }
 
-void finalizeCluster(Asset& asset, uint32_t meshIndex, uint32_t materialIndex, ClusterWork& work)
+void finalizeCluster(MeshBuildResult& result, uint32_t meshIndex, uint32_t materialIndex, ClusterWork& work)
 {
     if (work.indices.empty()) return;
 
     Cluster cluster;
     cluster.meshIndex = meshIndex;
     cluster.materialIndex = materialIndex;
-    cluster.vertexOffset = static_cast<uint32_t>(asset.vertices.size());
+    cluster.vertexOffset = static_cast<uint32_t>(result.vertices.size());
     cluster.vertexCount = static_cast<uint32_t>(work.vertices.size());
-    cluster.indexOffset = static_cast<uint32_t>(asset.indices.size());
+    cluster.indexOffset = static_cast<uint32_t>(result.indices.size());
     cluster.indexCount = static_cast<uint32_t>(work.indices.size());
     cluster.triangleCount = cluster.indexCount / 3;
     cluster.lodLevel = 0;
@@ -68,9 +79,9 @@ void finalizeCluster(Asset& asset, uint32_t meshIndex, uint32_t materialIndex, C
     minDot = std::clamp(minDot, -1.f, 1.f);
     cluster.coneAngle = std::acos(minDot);
 
-    asset.vertices.insert(asset.vertices.end(), work.vertices.begin(), work.vertices.end());
-    asset.indices.insert(asset.indices.end(), work.indices.begin(), work.indices.end());
-    asset.clusters.push_back(cluster);
+    result.vertices.insert(result.vertices.end(), work.vertices.begin(), work.vertices.end());
+    result.indices.insert(result.indices.end(), work.indices.begin(), work.indices.end());
+    result.clusters.push_back(cluster);
 
     work.vertices.clear();
     work.indices.clear();
@@ -98,6 +109,50 @@ void appendTriangle(ClusterWork& work, const InputMesh& mesh, const uint32_t sou
         }
     }
 }
+
+MeshBuildResult buildMesh(const InputMesh& inputMesh, uint32_t meshIndex, uint32_t materialIndex, const BuildOptions& options)
+{
+    if (inputMesh.indices.empty()) return {};
+    if (inputMesh.indices.size() % 3 != 0) throw std::runtime_error("Input mesh has a non-triangle index count.");
+
+    MeshBuildResult result;
+    result.mesh.name = inputMesh.name;
+    result.mesh.firstCluster = 0;
+    result.mesh.firstMaterial = materialIndex;
+    result.mesh.materialCount = 1;
+    result.mesh.bounds = inputMesh.bounds;
+
+    ClusterWork work;
+    const uint32_t triangleCount = static_cast<uint32_t>(inputMesh.indices.size() / 3);
+    for (uint32_t tri = 0; tri < triangleCount; ++tri)
+    {
+        const uint32_t sourceIndices[3] = {
+            inputMesh.indices[tri * 3 + 0],
+            inputMesh.indices[tri * 3 + 1],
+            inputMesh.indices[tri * 3 + 2],
+        };
+
+        for (uint32_t sourceIndex : sourceIndices)
+        {
+            if (sourceIndex >= inputMesh.vertices.size()) throw std::runtime_error("Input mesh index is out of range.");
+        }
+
+        const uint32_t currentTriangles = static_cast<uint32_t>(work.indices.size() / 3);
+        const uint32_t newVertices = countNewVertices(work, sourceIndices);
+        const bool fullByTriangles = currentTriangles >= options.clusterTriangleTarget;
+        const bool fullByVertices = !work.indices.empty() && work.vertices.size() + newVertices > options.maxClusterVertices;
+        if (fullByTriangles || fullByVertices)
+        {
+            finalizeCluster(result, meshIndex, materialIndex, work);
+        }
+
+        appendTriangle(work, inputMesh, sourceIndices);
+    }
+
+    finalizeCluster(result, meshIndex, materialIndex, work);
+    result.mesh.clusterCount = static_cast<uint32_t>(result.clusters.size());
+    return result;
+}
 }
 
 Asset buildNaniteAsset(const InputScene& scene, const BuildOptions& options)
@@ -113,51 +168,66 @@ Asset buildNaniteAsset(const InputScene& scene, const BuildOptions& options)
     for (const std::string& name : scene.materialNames) asset.materials.push_back({ name });
     if (asset.materials.empty()) asset.materials.push_back({ "default" });
 
-    asset.meshes.reserve(scene.meshes.size());
-    for (const InputMesh& inputMesh : scene.meshes)
+    std::vector<size_t> meshIndices;
+    meshIndices.reserve(scene.meshes.size());
+    for (size_t i = 0; i < scene.meshes.size(); ++i)
     {
-        if (inputMesh.indices.empty()) continue;
-        if (inputMesh.indices.size() % 3 != 0) throw std::runtime_error("Input mesh has a non-triangle index count.");
+        if (!scene.meshes[i].indices.empty()) meshIndices.push_back(i);
+    }
+    if (meshIndices.empty()) throw std::runtime_error("No meshes were converted into Nanite clusters.");
+
+    std::vector<MeshBuildResult> results(meshIndices.size());
+
+    const uint32_t hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t requestedWorkers = options.workerCount == 0 ? hardwareThreads : options.workerCount;
+    const uint32_t workerCount = std::max(1u, requestedWorkers);
+
+    tf::Taskflow taskflow("NaniteBuildAsset");
+    tf::Task start = taskflow.emplace([]() {}).name("start");
+    tf::Task finish = taskflow.emplace([]() {}).name("finish");
+
+    for (size_t taskIndex = 0; taskIndex < meshIndices.size(); ++taskIndex)
+    {
+        const size_t inputMeshIndex = meshIndices[taskIndex];
+        tf::Task task = taskflow.emplace([&, taskIndex, inputMeshIndex]()
+        {
+            const InputMesh& inputMesh = scene.meshes[inputMeshIndex];
+            const uint32_t meshIndex = static_cast<uint32_t>(taskIndex);
+            const uint32_t materialIndex = std::min(inputMesh.materialIndex, static_cast<uint32_t>(asset.materials.size() - 1));
+            results[taskIndex] = buildMesh(inputMesh, meshIndex, materialIndex, options);
+        }).name("build mesh");
+        start.precede(task);
+        task.precede(finish);
+    }
+
+    tf::Executor executor(workerCount);
+    executor.run(taskflow).get();
+
+    asset.meshes.reserve(results.size());
+    for (MeshBuildResult& result : results)
+    {
+        if (result.clusters.empty()) continue;
 
         const uint32_t meshIndex = static_cast<uint32_t>(asset.meshes.size());
-        Mesh mesh;
-        mesh.name = inputMesh.name;
-        mesh.firstCluster = static_cast<uint32_t>(asset.clusters.size());
-        mesh.firstMaterial = std::min(inputMesh.materialIndex, static_cast<uint32_t>(asset.materials.size() - 1));
-        mesh.materialCount = 1;
-        mesh.bounds = inputMesh.bounds;
+        const uint32_t clusterBase = static_cast<uint32_t>(asset.clusters.size());
+        const uint32_t vertexBase = static_cast<uint32_t>(asset.vertices.size());
+        const uint32_t indexBase = static_cast<uint32_t>(asset.indices.size());
 
-        ClusterWork work;
-        const uint32_t triangleCount = static_cast<uint32_t>(inputMesh.indices.size() / 3);
-        for (uint32_t tri = 0; tri < triangleCount; ++tri)
+        result.mesh.firstCluster = clusterBase;
+        result.mesh.clusterCount = static_cast<uint32_t>(result.clusters.size());
+
+        for (Cluster& cluster : result.clusters)
         {
-            const uint32_t sourceIndices[3] = {
-                inputMesh.indices[tri * 3 + 0],
-                inputMesh.indices[tri * 3 + 1],
-                inputMesh.indices[tri * 3 + 2],
-            };
-
-            for (uint32_t sourceIndex : sourceIndices)
-            {
-                if (sourceIndex >= inputMesh.vertices.size()) throw std::runtime_error("Input mesh index is out of range.");
-            }
-
-            const uint32_t currentTriangles = static_cast<uint32_t>(work.indices.size() / 3);
-            const uint32_t newVertices = countNewVertices(work, sourceIndices);
-            const bool fullByTriangles = currentTriangles >= options.clusterTriangleTarget;
-            const bool fullByVertices = !work.indices.empty() && work.vertices.size() + newVertices > options.maxClusterVertices;
-            if (fullByTriangles || fullByVertices)
-            {
-                finalizeCluster(asset, meshIndex, mesh.firstMaterial, work);
-            }
-
-            appendTriangle(work, inputMesh, sourceIndices);
+            cluster.meshIndex = meshIndex;
+            cluster.vertexOffset += vertexBase;
+            cluster.indexOffset += indexBase;
         }
 
-        finalizeCluster(asset, meshIndex, mesh.firstMaterial, work);
-        mesh.clusterCount = static_cast<uint32_t>(asset.clusters.size()) - mesh.firstCluster;
-        include(asset.bounds, mesh.bounds);
-        asset.meshes.push_back(mesh);
+        include(asset.bounds, result.mesh.bounds);
+        asset.meshes.push_back(result.mesh);
+        asset.vertices.insert(asset.vertices.end(), result.vertices.begin(), result.vertices.end());
+        asset.indices.insert(asset.indices.end(), result.indices.begin(), result.indices.end());
+        asset.clusters.insert(asset.clusters.end(), result.clusters.begin(), result.clusters.end());
     }
 
     if (asset.meshes.empty()) throw std::runtime_error("No meshes were converted into Nanite clusters.");

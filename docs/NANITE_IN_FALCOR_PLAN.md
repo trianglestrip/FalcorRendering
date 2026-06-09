@@ -28,7 +28,7 @@ Nanite 风格系统要解决的问题是: 输入高面数模型，离线切分�
 
 | 模块 | 目录 | 职责 |
 |---|---|---|
-| NaniteBuilder 工具 | `Source/Tools/NaniteBuilder` | 离线生成 `.fnanite` 资产 |
+| Nanite 工具集 | `Source/Tools/Nanite` | 离线生成、加载、校验 `.fnanite` 资产 |
 | Nanite 核心数据 | `Source/Falcor/Scene/Nanite` | 资产格式、加载器、运行时资源对象 |
 | Nanite Scene 集成 | `Source/Falcor/Scene` | `SceneData` 增加 Nanite 几何描述和实例数据 |
 | Nanite RenderPass | `Source/RenderPasses/NaniteRaster` | GPU 筛选、光栅化和 Visibility Buffer |
@@ -515,24 +515,25 @@ Compute pass: `NaniteMaterialResolve.cs.slang`
 在 `Source/Tools/CMakeLists.txt` 增加:
 
 ```cmake
-add_subdirectory(NaniteBuilder)
+add_subdirectory(Nanite)
 ```
 
 工具目录建议:
 
 ```text
-Source/Tools/NaniteBuilder/
+Source/Tools/Nanite/
   CMakeLists.txt
-  NaniteBuilder.cpp
-  NaniteBuildOptions.h
-  NaniteBuildPipeline.h
-  NaniteBuildPipeline.cpp
-  NaniteClusterBuilder.h
-  NaniteClusterBuilder.cpp
-  NaniteHierarchyBuilder.h
-  NaniteHierarchyBuilder.cpp
-  NaniteAssetWriter.h
-  NaniteAssetWriter.cpp
+  Common/
+    NaniteAsset.h
+    NaniteAsset.cpp
+    NaniteBuild.h
+    NaniteBuild.cpp
+    NaniteObj.h
+    NaniteObj.cpp
+  NaniteBuilder/
+    NaniteBuilder.cpp
+  NaniteLoader/
+    NaniteLoader.cpp
 ```
 
 ### 7.2 Builder 数据流
@@ -551,7 +552,28 @@ Input Scene
   -> Write debug .json
 ```
 
-### 7.3 Builder 参数
+### 7.3 taskflow 并行与 DAG
+
+`NaniteBuilder` 的 CPU 侧构建应优先使用 `third_party/taskflow` 表达工作流。当前 MVP 采用 mesh 级并行:
+
+```text
+start
+  -> build mesh 0 clusters
+  -> build mesh 1 clusters
+  -> build mesh N clusters
+  -> finish
+  -> merge results in source order
+```
+
+设计要求:
+
+- 每个 mesh section 独立构建局部 Cluster、顶点表和索引表。
+- taskflow DAG 负责并行执行 mesh 级 Cluster 构建。
+- 归并阶段按输入顺序合并结果，保证 `.fnanite` 输出稳定。
+- `NaniteBuilder --workers <count>` 控制 taskflow worker 数；默认使用硬件线程数。
+- 后续 ClusterGroup、LOD 简化、page packing 也应拆成 taskflow node，而不是在单线程里串行追加。
+
+### 7.4 Builder 参数
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
@@ -560,6 +582,7 @@ Input Scene
 | `--group-clusters` | 32 | 每个 cluster group 目标 cluster 数 |
 | `--target-error` | 1.0 | 屏幕误差阈值基准 |
 | `--page-size-kb` | 128 | page 目标大小 |
+| `--workers` | 0 | taskflow worker 数，0 表示硬件线程数 |
 | `--no-compress` | false | 使用未压缩顶点便于调试 |
 | `--debug-json` | true | 输出构建统计 |
 
@@ -731,4 +754,3 @@ struct NaniteStats
 - 完整虚拟纹理。
 - 完整 DXR BLAS 同步。
 - Nanite 与所有现有 RenderPass 的无缝兼容。
-

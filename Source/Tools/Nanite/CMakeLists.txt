@@ -10,7 +10,10 @@ target_sources(NaniteToolCore PRIVATE
 )
 
 target_compile_features(NaniteToolCore PUBLIC cxx_std_20)
-target_include_directories(NaniteToolCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/Common)
+target_include_directories(NaniteToolCore PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/Common
+    ${CMAKE_SOURCE_DIR}/third_party/taskflow
+)
 target_source_group(NaniteToolCore "Tools/Nanite")
 
 add_falcor_executable(NaniteBuilder)
