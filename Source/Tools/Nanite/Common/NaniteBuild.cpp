@@ -3,10 +3,12 @@
 #include <taskflow.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 namespace FalcorRendering::NaniteTool
 {
@@ -17,7 +19,9 @@ struct ClusterWork
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
     std::unordered_map<uint32_t, uint32_t> remap;
+    std::vector<uint32_t> sourceTriangleIndices;
     Bounds bounds = emptyBounds();
+    float surfaceArea = 0.f;
 };
 
 struct MeshBuildResult
@@ -26,7 +30,22 @@ struct MeshBuildResult
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<Cluster> clusters;
+    std::vector<ClusterDebugInfo> clusterDebugInfo;
+    uint64_t sourceTriangleCount = 0;
+    uint64_t degenerateTriangleCount = 0;
 };
+
+struct SourceTriangle
+{
+    uint32_t sourceTriangleIndex = 0;
+    std::array<uint32_t, 3> sourceIndices{};
+    Float3 centroid;
+    Float3 normal;
+    float surfaceArea = 0.f;
+    uint32_t mortonCode = 0;
+};
+
+constexpr float kDegenerateAreaEpsilon = 1e-20f;
 
 uint32_t countNewVertices(const ClusterWork& work, const uint32_t sourceIndices[3])
 {
@@ -46,6 +65,65 @@ Float3 triangleNormal(const std::vector<Vertex>& vertices, const std::vector<uin
     return normalize(cross(b.position - a.position, c.position - a.position));
 }
 
+uint32_t expandMortonBits(uint32_t value)
+{
+    value = (value * 0x00010001u) & 0xFF0000FFu;
+    value = (value * 0x00000101u) & 0x0F00F00Fu;
+    value = (value * 0x00000011u) & 0xC30C30C3u;
+    value = (value * 0x00000005u) & 0x49249249u;
+    return value;
+}
+
+uint32_t quantizeMortonAxis(float value, float minValue, float maxValue)
+{
+    const float extent = maxValue - minValue;
+    float normalized = extent > 0.f ? (value - minValue) / extent : 0.5f;
+    if (!std::isfinite(normalized)) normalized = 0.5f;
+    normalized = std::clamp(normalized, 0.f, 1.f);
+    return static_cast<uint32_t>(normalized * 1023.f + 0.5f);
+}
+
+uint32_t calculateMortonCode(Float3 centroid, const Bounds& bounds)
+{
+    const uint32_t x = quantizeMortonAxis(centroid.x, bounds.min.x, bounds.max.x);
+    const uint32_t y = quantizeMortonAxis(centroid.y, bounds.min.y, bounds.max.y);
+    const uint32_t z = quantizeMortonAxis(centroid.z, bounds.min.z, bounds.max.z);
+    return (expandMortonBits(x) << 2) | (expandMortonBits(y) << 1) | expandMortonBits(z);
+}
+
+SourceTriangle makeSourceTriangle(const InputMesh& inputMesh, uint32_t triangleIndex, const Bounds& bounds)
+{
+    SourceTriangle triangle;
+    triangle.sourceTriangleIndex = triangleIndex;
+    triangle.sourceIndices = {
+        inputMesh.indices[triangleIndex * 3 + 0],
+        inputMesh.indices[triangleIndex * 3 + 1],
+        inputMesh.indices[triangleIndex * 3 + 2],
+    };
+
+    for (uint32_t sourceIndex : triangle.sourceIndices)
+    {
+        if (sourceIndex >= inputMesh.vertices.size()) throw std::runtime_error("Input mesh index is out of range.");
+    }
+
+    const Float3 p0 = inputMesh.vertices[triangle.sourceIndices[0]].position;
+    const Float3 p1 = inputMesh.vertices[triangle.sourceIndices[1]].position;
+    const Float3 p2 = inputMesh.vertices[triangle.sourceIndices[2]].position;
+    const Float3 normalArea = cross(p1 - p0, p2 - p0);
+    const float doubleArea = length(normalArea);
+
+    triangle.surfaceArea = doubleArea * 0.5f;
+    triangle.normal = normalize(normalArea);
+    triangle.centroid = (p0 + p1 + p2) / 3.f;
+    triangle.mortonCode = calculateMortonCode(triangle.centroid, bounds);
+    return triangle;
+}
+
+bool isDegenerate(const SourceTriangle& triangle)
+{
+    return !std::isfinite(triangle.surfaceArea) || triangle.surfaceArea <= kDegenerateAreaEpsilon;
+}
+
 void finalizeCluster(MeshBuildResult& result, uint32_t meshIndex, uint32_t materialIndex, ClusterWork& work)
 {
     if (work.indices.empty()) return;
@@ -63,6 +141,7 @@ void finalizeCluster(MeshBuildResult& result, uint32_t meshIndex, uint32_t mater
     cluster.sphereCenter = center(work.bounds);
     cluster.sphereRadius = radius(work.bounds);
     cluster.geometricError = cluster.sphereRadius * 0.001f;
+    cluster.surfaceArea = work.surfaceArea;
 
     Float3 normalSum{};
     for (uint32_t tri = 0; tri < cluster.triangleCount; ++tri)
@@ -83,17 +162,24 @@ void finalizeCluster(MeshBuildResult& result, uint32_t meshIndex, uint32_t mater
     result.indices.insert(result.indices.end(), work.indices.begin(), work.indices.end());
     result.clusters.push_back(cluster);
 
+    ClusterDebugInfo debugInfo;
+    debugInfo.sourceMaterialIndex = materialIndex;
+    debugInfo.sourceTriangleIndices = work.sourceTriangleIndices;
+    result.clusterDebugInfo.push_back(std::move(debugInfo));
+
     work.vertices.clear();
     work.indices.clear();
     work.remap.clear();
+    work.sourceTriangleIndices.clear();
     work.bounds = emptyBounds();
+    work.surfaceArea = 0.f;
 }
 
-void appendTriangle(ClusterWork& work, const InputMesh& mesh, const uint32_t sourceIndices[3])
+void appendTriangle(ClusterWork& work, const InputMesh& mesh, const SourceTriangle& triangle)
 {
     for (uint32_t i = 0; i < 3; ++i)
     {
-        const uint32_t sourceIndex = sourceIndices[i];
+        const uint32_t sourceIndex = triangle.sourceIndices[i];
         auto it = work.remap.find(sourceIndex);
         if (it == work.remap.end())
         {
@@ -108,6 +194,9 @@ void appendTriangle(ClusterWork& work, const InputMesh& mesh, const uint32_t sou
             work.indices.push_back(it->second);
         }
     }
+
+    work.sourceTriangleIndices.push_back(triangle.sourceTriangleIndex);
+    work.surfaceArea += triangle.surfaceArea;
 }
 
 MeshBuildResult buildMesh(const InputMesh& inputMesh, uint32_t meshIndex, uint32_t materialIndex, const BuildOptions& options)
@@ -122,22 +211,34 @@ MeshBuildResult buildMesh(const InputMesh& inputMesh, uint32_t meshIndex, uint32
     result.mesh.materialCount = 1;
     result.mesh.bounds = inputMesh.bounds;
 
-    ClusterWork work;
-    const uint32_t triangleCount = static_cast<uint32_t>(inputMesh.indices.size() / 3);
-    for (uint32_t tri = 0; tri < triangleCount; ++tri)
-    {
-        const uint32_t sourceIndices[3] = {
-            inputMesh.indices[tri * 3 + 0],
-            inputMesh.indices[tri * 3 + 1],
-            inputMesh.indices[tri * 3 + 2],
-        };
+    std::vector<SourceTriangle> triangles;
+    triangles.reserve(inputMesh.indices.size() / 3);
 
-        for (uint32_t sourceIndex : sourceIndices)
+    const uint32_t originalTriangleCount = static_cast<uint32_t>(inputMesh.indices.size() / 3);
+    result.sourceTriangleCount = originalTriangleCount;
+    for (uint32_t tri = 0; tri < originalTriangleCount; ++tri)
+    {
+        SourceTriangle triangle = makeSourceTriangle(inputMesh, tri, inputMesh.bounds);
+        if (isDegenerate(triangle))
         {
-            if (sourceIndex >= inputMesh.vertices.size()) throw std::runtime_error("Input mesh index is out of range.");
+            ++result.degenerateTriangleCount;
+            continue;
         }
 
+        triangles.push_back(triangle);
+    }
+
+    std::stable_sort(triangles.begin(), triangles.end(), [](const SourceTriangle& a, const SourceTriangle& b)
+    {
+        if (a.mortonCode != b.mortonCode) return a.mortonCode < b.mortonCode;
+        return a.sourceTriangleIndex < b.sourceTriangleIndex;
+    });
+
+    ClusterWork work;
+    for (const SourceTriangle& triangle : triangles)
+    {
         const uint32_t currentTriangles = static_cast<uint32_t>(work.indices.size() / 3);
+        const uint32_t sourceIndices[3] = { triangle.sourceIndices[0], triangle.sourceIndices[1], triangle.sourceIndices[2] };
         const uint32_t newVertices = countNewVertices(work, sourceIndices);
         const bool fullByTriangles = currentTriangles >= options.clusterTriangleTarget;
         const bool fullByVertices = !work.indices.empty() && work.vertices.size() + newVertices > options.maxClusterVertices;
@@ -146,7 +247,7 @@ MeshBuildResult buildMesh(const InputMesh& inputMesh, uint32_t meshIndex, uint32
             finalizeCluster(result, meshIndex, materialIndex, work);
         }
 
-        appendTriangle(work, inputMesh, sourceIndices);
+        appendTriangle(work, inputMesh, triangle);
     }
 
     finalizeCluster(result, meshIndex, materialIndex, work);
@@ -206,6 +307,8 @@ Asset buildNaniteAsset(const InputScene& scene, const BuildOptions& options)
     asset.meshes.reserve(results.size());
     for (MeshBuildResult& result : results)
     {
+        asset.sourceTriangleCount += result.sourceTriangleCount;
+        asset.degenerateTriangleCount += result.degenerateTriangleCount;
         if (result.clusters.empty()) continue;
 
         const uint32_t meshIndex = static_cast<uint32_t>(asset.meshes.size());
@@ -222,12 +325,17 @@ Asset buildNaniteAsset(const InputScene& scene, const BuildOptions& options)
             cluster.vertexOffset += vertexBase;
             cluster.indexOffset += indexBase;
         }
+        for (ClusterDebugInfo& debugInfo : result.clusterDebugInfo)
+        {
+            debugInfo.sourceMeshIndex = meshIndex;
+        }
 
         include(asset.bounds, result.mesh.bounds);
         asset.meshes.push_back(result.mesh);
         asset.vertices.insert(asset.vertices.end(), result.vertices.begin(), result.vertices.end());
         asset.indices.insert(asset.indices.end(), result.indices.begin(), result.indices.end());
         asset.clusters.insert(asset.clusters.end(), result.clusters.begin(), result.clusters.end());
+        asset.clusterDebugInfo.insert(asset.clusterDebugInfo.end(), result.clusterDebugInfo.begin(), result.clusterDebugInfo.end());
     }
 
     if (asset.meshes.empty()) throw std::runtime_error("No meshes were converted into Nanite clusters.");

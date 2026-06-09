@@ -153,6 +153,25 @@ void writeBounds(std::ofstream& stream, const Bounds& bounds)
         << "], \"max\": [" << bounds.max.x << ", " << bounds.max.y << ", " << bounds.max.z << "] }";
 }
 
+void writeFloat3(std::ofstream& stream, const Float3& value)
+{
+    stream << "[" << value.x << ", " << value.y << ", " << value.z << "]";
+}
+
+void writeTriangleRemap(std::ofstream& stream, const ClusterDebugInfo* debugInfo)
+{
+    stream << "[";
+    if (debugInfo)
+    {
+        for (size_t i = 0; i < debugInfo->sourceTriangleIndices.size(); ++i)
+        {
+            if (i > 0) stream << ", ";
+            stream << debugInfo->sourceTriangleIndices[i];
+        }
+    }
+    stream << "]";
+}
+
 void writeDebugJson(const std::filesystem::path& path, const Asset& asset, const BuildOptions& options)
 {
     if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
@@ -170,6 +189,8 @@ void writeDebugJson(const std::filesystem::path& path, const Asset& asset, const
     stream << "  \"vertexCount\": " << asset.vertices.size() << ",\n";
     stream << "  \"indexCount\": " << asset.indices.size() << ",\n";
     stream << "  \"triangleCount\": " << triangleCount(asset) << ",\n";
+    stream << "  \"sourceTriangleCount\": " << asset.sourceTriangleCount << ",\n";
+    stream << "  \"degenerateTriangleCount\": " << asset.degenerateTriangleCount << ",\n";
     stream << "  \"bounds\": ";
     writeBounds(stream, asset.bounds);
     stream << ",\n";
@@ -177,11 +198,21 @@ void writeDebugJson(const std::filesystem::path& path, const Asset& asset, const
     for (size_t i = 0; i < asset.clusters.size(); ++i)
     {
         const Cluster& cluster = asset.clusters[i];
+        const ClusterDebugInfo* debugInfo = i < asset.clusterDebugInfo.size() ? &asset.clusterDebugInfo[i] : nullptr;
         stream << "    { \"id\": " << i
             << ", \"mesh\": " << cluster.meshIndex
             << ", \"material\": " << cluster.materialIndex
             << ", \"triangles\": " << cluster.triangleCount
             << ", \"vertices\": " << cluster.vertexCount
+            << ", \"surfaceArea\": " << cluster.surfaceArea
+            << ", \"coneAngle\": " << cluster.coneAngle
+            << ", \"coneNormal\": ";
+        writeFloat3(stream, cluster.coneNormal);
+        stream << ", \"sourceMesh\": " << (debugInfo ? debugInfo->sourceMeshIndex : 0)
+            << ", \"sourceMaterial\": " << (debugInfo ? debugInfo->sourceMaterialIndex : 0)
+            << ", \"sourceTriangles\": ";
+        writeTriangleRemap(stream, debugInfo);
+        stream
             << ", \"bounds\": ";
         writeBounds(stream, cluster.bounds);
         stream << " }" << (i + 1 == asset.clusters.size() ? "\n" : ",\n");

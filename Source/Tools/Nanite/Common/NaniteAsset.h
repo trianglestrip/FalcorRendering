@@ -66,6 +66,14 @@ struct Cluster
     Float3 coneNormal;
     float coneAngle = 0.f;
     float geometricError = 0.f;
+    float surfaceArea = 0.f;
+};
+
+struct ClusterDebugInfo
+{
+    uint32_t sourceMeshIndex = 0;
+    uint32_t sourceMaterialIndex = 0;
+    std::vector<uint32_t> sourceTriangleIndices;
 };
 
 struct Asset
@@ -77,6 +85,9 @@ struct Asset
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
     Bounds bounds;
+    uint64_t sourceTriangleCount = 0;
+    uint64_t degenerateTriangleCount = 0;
+    std::vector<ClusterDebugInfo> clusterDebugInfo;
 };
 
 constexpr uint32_t kNaniteMagic = ('F') | ('N' << 8) | ('A' << 16) | ('N' << 24);

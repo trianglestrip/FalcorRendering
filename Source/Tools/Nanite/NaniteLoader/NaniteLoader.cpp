@@ -146,6 +146,7 @@ void printClusters(const Asset& asset)
             << " iOffset=" << cluster.indexOffset
             << " radius=" << cluster.sphereRadius
             << " error=" << cluster.geometricError
+            << " area=" << cluster.surfaceArea
             << '\n';
     }
 }

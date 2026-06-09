@@ -71,7 +71,8 @@ struct DiskCluster
     Float3 coneNormal{};
     float coneAngle = 0.f;
     float geometricError = 0.f;
-    float reservedError[3] = {};
+    float surfaceArea = 0.f;
+    float reservedError[2] = {};
 };
 
 static_assert(sizeof(Vertex) == 32);
@@ -265,6 +266,7 @@ void writeAsset(const std::filesystem::path& path, const Asset& asset)
         disk.coneNormal = cluster.coneNormal;
         disk.coneAngle = cluster.coneAngle;
         disk.geometricError = cluster.geometricError;
+        disk.surfaceArea = cluster.surfaceArea;
         clusters.push_back(disk);
     }
 
@@ -385,6 +387,7 @@ Asset readAsset(const std::filesystem::path& path)
         cluster.coneNormal = disk.coneNormal;
         cluster.coneAngle = disk.coneAngle;
         cluster.geometricError = disk.geometricError;
+        cluster.surfaceArea = disk.surfaceArea;
         asset.clusters.push_back(cluster);
     }
 

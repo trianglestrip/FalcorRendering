@@ -19,12 +19,12 @@
 
 ## Phase 1：Builder 质量提升
 
-- [ ] 将当前顺序打包 Cluster 改为空间排序，第一步使用三角形质心 Morton 排序。
+- [x] 将当前顺序打包 Cluster 改为空间排序，第一步使用三角形质心 Morton 排序。
 - [ ] 增加基于邻接关系的 Cluster 划分，提升边界质量。
-- [ ] 增加退化三角形过滤，并在 debug JSON 中输出剔除数量。
-- [ ] 增加每个 Cluster 的 surface area 和 normal cone 统计。
+- [x] 增加退化三角形过滤，并在 debug JSON 中输出剔除数量。
+- [x] 增加每个 Cluster 的 surface area 和 normal cone 统计。
 - [ ] 增加 source mesh section 内的可选顶点去重。
-- [ ] 增加稳定的 source triangle remap 数据，便于调试和回归测试。
+- [x] 增加稳定的 source triangle remap 数据，便于调试和回归测试。
 - [ ] 增加 glTF 输入路径，优先复用 Falcor importer 或使用小型专用导入器。
 - [ ] 增加 PBRT 输入路径，或支持从 PBRT importer 生成的 mesh section 构建。
 
@@ -115,4 +115,3 @@
 - [ ] 增加性能 CSV dump。
 - [ ] 增加 `NaniteBuilder` 和 `NaniteLoader` 使用文档。
 - [ ] 增加示例资产生成脚本。
-
