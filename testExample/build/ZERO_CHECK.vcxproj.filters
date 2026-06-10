@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\gitProject\FalcorSDKBuild\testExample\build\CMakeFiles\804a0153bf50de0d0d1278848723217e\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{8E15AB1B-F863-342B-8593-9ACAB911CDA7}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

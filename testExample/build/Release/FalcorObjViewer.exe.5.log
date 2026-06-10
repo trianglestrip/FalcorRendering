@@ -1,0 +1,139 @@
+(Info) Falcor 8.0 (commit: eb540f67, branch: sdk)
+(Info) Created CUDA device 'NVIDIA GeForce MX550' (architecture 7.5).
+(Info) Created GPU device 'NVIDIA GeForce MX550' using 'Direct3D 12' API (SM6.7).
+(Warning) Warnings in program:
+Utils/UI/TextRenderer.3d.slang (vsMain, psMain)
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils\UI\TextRenderer.3d.slang(48): warning 30081: implicit conversion from 'vector<float,2>' to 'vector<int,2>' is not recommended
+    float4 color = gFontTex.Load(int3(texC, 0));
+                                      ^~~~
+
+(Info) Loaded 26 plugin(s) in 0.866s
+(Info) Importing scene: D:\gitProject\FalcorRendering\data\framework\meshes\cube.obj
+(Warning) The mesh 'Cube' is missing the element texture coordinates. This is not an error, the element will be filled with zeros which may result in incorrect rendering.
+(Warning) Can't generate tangent space. The mesh 'Cube' doesn't have positions/normals/texCrd/indices.
+(Warning) The mesh 'Cube' has zero-length normals/tangents at 8 vertices. Please fix the asset.
+(Info) Loading asset file:       0.033819 s
+(Info) Verifying scene:          0.000251 s
+(Info) Creating materials:       0.001332 s
+(Info) Creating scene graph:     0.000907 s
+(Info) Creating meshes:          0.078804 s
+(Info) Creating animations:      0.000003 s
+(Info) Creating cameras:         0.000001 s
+(Info) Creating lights:          0.000002 s
+(Info) Optimized scene graph by removing 1 internal static nodes.
+(Info) Found 1 static non-instanced meshes, arranged in 1 mesh group.
+(Info) Found 0 displaced non-instanced meshes, arranged in 1 mesh group.
+(Info) Found 0 dynamic non-instanced meshes, arranged in 0 mesh groups.
+(Info) Found 0 instanced meshes, arranged in 0 mesh groups.
+(Info) HitInfo: Total size is 128 bits (type: 3 bits, instanceID: 0 bits, primitiveIndex: 4 bits)
+(Warning) Warnings in program:
+Scene/Material/MaterialSystem.slang (main)
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils/Math/FormatConversion.slang(393): warning 30081: implicit conversion from 'uint64_t' to 'uint' is not recommended
+    return uint2(v & 0xffffffff, v >> 32);
+                   ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils/Math/FormatConversion.slang(393): warning 30081: implicit conversion from 'uint64_t' to 'uint' is not recommended
+    return uint2(v & 0xffffffff, v >> 32);
+                                   ^~
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(140): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isDoubleSided() CONST_FUNCTION { return packedData.x & (1u << kDoubleSidedFlagOffset); }
+                                                              ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(148): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isThinSurface() CONST_FUNCTION { return packedData.x & (1u << kThinSurfaceFlagOffset); }
+                                                              ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(156): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isEmissive() CONST_FUNCTION { return packedData.x & (1u << kEmissiveFlagOffset); }
+                                                           ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(164): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isBasicMaterial() CONST_FUNCTION { return packedData.x & (1u << kIsBasicMaterialFlagOffset); }
+                                                                ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(172): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isLightProfileEnabled() CONST_FUNCTION { return packedData.y & (1u << kEnableLightProfileOffset); }
+                                                                      ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(180): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isDeltaSpecular() CONST_FUNCTION { return packedData.y & (1u << kDeltaSpecularFlagOffset); }
+                                                                ^
+command line(1): warning 30081: implicit conversion from 'int' to 'bool' is not recommended
+0
+^
+
+(Warning) Warnings in program:
+Scene/SceneBlock.slang (main)
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils/Math/FormatConversion.slang(393): warning 30081: implicit conversion from 'uint64_t' to 'uint' is not recommended
+    return uint2(v & 0xffffffff, v >> 32);
+                   ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils/Math/FormatConversion.slang(393): warning 30081: implicit conversion from 'uint64_t' to 'uint' is not recommended
+    return uint2(v & 0xffffffff, v >> 32);
+                                   ^~
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(140): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isDoubleSided() CONST_FUNCTION { return packedData.x & (1u << kDoubleSidedFlagOffset); }
+                                                              ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(148): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isThinSurface() CONST_FUNCTION { return packedData.x & (1u << kThinSurfaceFlagOffset); }
+                                                              ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(156): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isEmissive() CONST_FUNCTION { return packedData.x & (1u << kEmissiveFlagOffset); }
+                                                           ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(164): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isBasicMaterial() CONST_FUNCTION { return packedData.x & (1u << kIsBasicMaterialFlagOffset); }
+                                                                ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(172): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isLightProfileEnabled() CONST_FUNCTION { return packedData.y & (1u << kEnableLightProfileOffset); }
+                                                                      ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Material/MaterialData.slang(180): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+    bool isDeltaSpecular() CONST_FUNCTION { return packedData.y & (1u << kDeltaSpecularFlagOffset); }
+                                                                ^
+command line(1): warning 30081: implicit conversion from 'int' to 'bool' is not recommended
+0
+^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Volume\Grid.slang(170): warning 30081: implicit conversion from 'vector<float,3>' to 'vector<int,3>' is not recommended
+        return lookupIndex(worldToIndexPos(pos), accessor);
+                                          ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Volume\Grid.slang(224): warning 30081: implicit conversion from 'vector<float,3>' to 'vector<int,3>' is not recommended
+        const int3 i = floor(indexOffset);
+                            ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Volume\Grid.slang(242): warning 30081: implicit conversion from 'vector<float,3>' to 'vector<int,3>' is not recommended
+        const int3 i = floor(indexOffset);
+                            ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Volume\Grid.slang(272): warning 30081: implicit conversion from 'vector<float,3>' to 'vector<int,3>' is not recommended
+        return lookupIndex(floor(index + (u - 0.5f)), accessor);
+                                ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Volume\Grid.slang(282): warning 30081: implicit conversion from 'vector<float,3>' to 'vector<int,3>' is not recommended
+        return lookupIndexTex(index + (u - 0.5f));
+                                    ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils/Geometry/GeometryHelpers.slang(195): warning 30081: implicit conversion from 'int' to 'bool' is not recommended
+        const float3 corner = float3((i & 1) ? aabbMin.x : aabbMax.x, (i & 2) ? aabbMin.y : aabbMax.y, (i & 4) ? aabbMin.z : aabbMax.z);
+                                     ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils/Geometry/GeometryHelpers.slang(195): warning 30081: implicit conversion from 'int' to 'bool' is not recommended
+        const float3 corner = float3((i & 1) ? aabbMin.x : aabbMax.x, (i & 2) ? aabbMin.y : aabbMax.y, (i & 4) ? aabbMin.z : aabbMax.z);
+                                                                      ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils/Geometry/GeometryHelpers.slang(195): warning 30081: implicit conversion from 'int' to 'bool' is not recommended
+        const float3 corner = float3((i & 1) ? aabbMin.x : aabbMax.x, (i & 2) ? aabbMin.y : aabbMax.y, (i & 4) ? aabbMin.z : aabbMax.z);
+                                                                                                       ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils/Geometry/GeometryHelpers.slang(206): warning 30081: implicit conversion from 'int' to 'bool' is not recommended
+        const float3 corner = float3((i & 1) ? aabbMin.x : aabbMax.x, (i & 2) ? aabbMin.y : aabbMax.y, (i & 4) ? aabbMin.z : aabbMax.z);
+                                     ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils/Geometry/GeometryHelpers.slang(206): warning 30081: implicit conversion from 'int' to 'bool' is not recommended
+        const float3 corner = float3((i & 1) ? aabbMin.x : aabbMax.x, (i & 2) ? aabbMin.y : aabbMax.y, (i & 4) ? aabbMin.z : aabbMax.z);
+                                                                      ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils/Geometry/GeometryHelpers.slang(206): warning 30081: implicit conversion from 'int' to 'bool' is not recommended
+        const float3 corner = float3((i & 1) ? aabbMin.x : aabbMax.x, (i & 2) ? aabbMin.y : aabbMax.y, (i & 4) ? aabbMin.z : aabbMax.z);
+                                                                                                       ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Displacement/DisplacementMapping.slang(432): warning 30081: implicit conversion from 'float' to 'int' is not recommended
+    int maxCount = ceil(abs(viewDirection.x)) + ceil(abs(viewDirection.y)) + 2;
+                                                                           ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Scene.slang(316): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+        uint3 vtxIndices = getLocalIndices(mesh.ibOffset, triangleIndex, mesh.flags & uint(MeshFlags::Use16BitIndices));
+                                                                                    ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Scene.slang(329): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+        uint3 vtxIndices = getLocalIndices(instance.ibOffset, triangleIndex, instance.flags & uint(GeometryInstanceFlags::Use16BitIndices));
+                                                                                            ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Scene.slang(613): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+        uint3 vtxIndices = getLocalIndices(instance.ibOffset, triangleIndex, instance.flags & uint(GeometryInstanceFlags::Use16BitIndices));
+                                                                                            ^
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Scene/Scene.slang(658): warning 30081: implicit conversion from 'uint' to 'bool' is not recommended
+        uint3 vtxIndices = getLocalIndices(instance.ibOffset, hit.primitiveIndex, instance.flags & uint(GeometryInstanceFlags::Use16BitIndices));
+                                                                                                 ^
+
+(Info) Post processing geometry: 0.051247 s
+(Info) Optimizing materials:     0.000021 s
+(Info) Creating resources:       3.978566 s

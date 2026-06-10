@@ -1,0 +1,3 @@
+D:/gitProject/FalcorSDKBuild/testExample/build/CMakeFiles/FalcorObjViewer.dir
+D:/gitProject/FalcorSDKBuild/testExample/build/CMakeFiles/ALL_BUILD.dir
+D:/gitProject/FalcorSDKBuild/testExample/build/CMakeFiles/ZERO_CHECK.dir

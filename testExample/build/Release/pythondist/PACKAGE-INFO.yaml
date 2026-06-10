@@ -1,0 +1,17 @@
+Package: python
+Version: 3.10.11+nv1-windows-x86_64
+Maintainers:
+- Jason Gorski
+Description: Python distribution
+Repository: https://gitlab-master.nvidia.com/omniverse/externals/python-build.git
+SWIPAT NvBug:
+- '3156615'
+- '3600671'
+Branch: Merge-Request
+Commit: 34d3b3727739a137394e27f2980820fb1f4fc67d
+Time: Wed Apr 12 17:06:54 2023
+Builder Name: tor-build-win03
+Packman Version: '6.46'
+Packagemaker Version: 1.15.0
+Platform: windows-x86_64
+CI Build Number: 3.10.11+nv1

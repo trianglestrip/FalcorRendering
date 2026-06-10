@@ -1,0 +1,29 @@
+(Info) Falcor 8.0 (commit: eb540f67, branch: sdk)
+(Info) Created CUDA device 'NVIDIA GeForce MX550' (architecture 7.5).
+(Info) Created GPU device 'NVIDIA GeForce MX550' using 'Direct3D 12' API (SM6.7).
+(Warning) Warnings in program:
+Utils/UI/TextRenderer.3d.slang (vsMain, psMain)
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils\UI\TextRenderer.3d.slang(48): warning 30081: implicit conversion from 'vector<float,2>' to 'vector<int,2>' is not recommended
+    float4 color = gFontTex.Load(int3(texC, 0));
+                                      ^~~~
+
+(Error) Caught an exception:
+
+Failed to load plugin library from D:\gitProject\FalcorSDKBuild\testExample\build\Release\plugins\NaniteRaster.dll. File not found.
+
+D:\gitProject\FalcorSDKBuild\Source\Falcor\Core\Plugin.cpp:66 (loadPlugin)
+
+Stacktrace:
+ 0# 0x00007ffd6ecc44b2 (Falcor::getStackTrace)
+ 1# 0x00007ffd6ec0a551 (Falcor::throwException)
+ 2# 0x00007ffd6ec11495 (Falcor::Object::incRef)
+ 3# 0x00007ffd6ec15f64 (Falcor::PluginManager::loadPlugin)
+ 4# 0x00007ffd6ec161db (Falcor::PluginManager::loadPluginByName)
+ 5# 0x00007ffd6ec155f7 (Falcor::PluginManager::loadAllPlugins)
+ 6# 0x00007ffd6ec1da07 (Falcor::SampleApp::SampleApp)
+ 7# 0x00007ff6e5d08950 (pybind11::error_already_set::restore)
+ 8# 0x00007ff6e5cf58ae ( ?? )
+ 9# 0x00007ff6e5d08fb0 (pybind11::error_already_set::value)
+ 10# 0x00007ff6e5d0a8dc (pybind11::error_already_set::value)
+ 11# 0x00007ffe71a1e957 (BaseThreadInitThunk)
+

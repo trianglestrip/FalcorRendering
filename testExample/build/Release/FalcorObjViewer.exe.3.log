@@ -1,0 +1,32 @@
+(Error) Caught an exception:
+
+Failed to start the Python interpreter: ModuleNotFoundError: No module named 'falcor.falcor_ext'
+
+At:
+  D:\gitProject/FalcorSDKBuild/testExample/build/Release/python\falcor\__init__.py(11): <module>
+  <frozen importlib._bootstrap>(241): _call_with_frames_removed
+  <frozen importlib._bootstrap_external>(883): exec_module
+  <frozen importlib._bootstrap>(703): _load_unlocked
+  <frozen importlib._bootstrap>(1006): _find_and_load_unlocked
+  <frozen importlib._bootstrap>(1027): _find_and_load
+  <string>(2): <module>
+
+
+D:\gitProject\FalcorSDKBuild\Source\Falcor\Utils\Scripting\Scripting.cpp:73 (start)
+
+Stacktrace:
+ 0# Falcor::getStackTrace at D:\gitProject\FalcorSDKBuild\Source\Falcor\Core\Platform\OS.cpp:334
+ 1# Falcor::throwException at D:\gitProject\FalcorSDKBuild\Source\Falcor\Core\Error.cpp:45
+ 2# Falcor::detail::throwException<char const *> at D:\gitProject\FalcorSDKBuild\Source\Falcor\Core\Error.h:116
+ 3# `Falcor::Scripting::start'::`1'::catch$31 at D:\gitProject\FalcorSDKBuild\Source\Falcor\Utils\Scripting\Scripting.cpp:73
+ 4# 0x00007ffe40a641d0 (_CxxFrameHandler4)
+ 5# 0x00007ffe40a6258f ( ?? )
+ 6# 0x00007ffe73b9f3e6 (RtlCaptureContext2)
+ 7# Falcor::Scripting::start at D:\gitProject\FalcorSDKBuild\Source\Falcor\Utils\Scripting\Scripting.cpp:69
+ 8# Falcor::SampleApp::run at D:\gitProject\FalcorSDKBuild\Source\Falcor\Core\SampleApp.cpp:163
+ 9# 0x00007ff7c95089e2 (pybind11::error_already_set::restore)
+ 10# 0x00007ff7c94f58ae ( ?? )
+ 11# 0x00007ff7c9508fb0 (pybind11::error_already_set::value)
+ 12# 0x00007ff7c950a8dc (pybind11::error_already_set::value)
+ 13# 0x00007ffe71a1e957 (BaseThreadInitThunk)
+

@@ -1,0 +1,21 @@
+# CMake generation dependency list for this directory.
+D:/gitProject/FalcorSDKBuild/FalcorSDK/cmake/FalcorConfig.cmake
+D:/gitProject/FalcorSDKBuild/testExample/CMakeLists.txt
+D:/gitProject/FalcorSDKBuild/testExample/build/CMakeFiles/3.24.1/CMakeCXXCompiler.cmake
+D:/gitProject/FalcorSDKBuild/testExample/build/CMakeFiles/3.24.1/CMakeRCCompiler.cmake
+D:/gitProject/FalcorSDKBuild/testExample/build/CMakeFiles/3.24.1/CMakeSystem.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/CMakeCXXInformation.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/CMakeCommonLanguageInclude.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/CMakeGenericSystem.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/CMakeInitializeConfigs.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/CMakeLanguageInformation.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/CMakeRCInformation.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/CMakeSystemSpecificInformation.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/CMakeSystemSpecificInitialize.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/Compiler/CMakeCommonCompilerMacros.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/Compiler/MSVC-CXX.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/Compiler/MSVC.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/Platform/Windows-MSVC-CXX.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/Platform/Windows-MSVC.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/Platform/Windows.cmake
+D:/packman-repo/chk/cmake/3.24.1+nv3-windows-x86_64/share/cmake-3.24/Modules/Platform/WindowsPaths.cmake

@@ -50,7 +50,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $SdkDir "lib")  | Out-Null
 Write-Host "Copying Falcor headers..."
 $headerSrc = Join-Path $RepoRoot "Source\Falcor"
 $headerDst = Join-Path $SdkDir "include\Falcor"
-Get-ChildItem -Path $headerSrc -Recurse -Include "*.h", "*.slangh" | ForEach-Object {
+Get-ChildItem -Path $headerSrc -Recurse -Include "*.h", "*.slangh", "*.slang" | ForEach-Object {
     $relPath = $_.FullName.Substring($headerSrc.Length + 1)
     $target = Join-Path $headerDst $relPath
     $targetDir = Split-Path $target -Parent
@@ -62,14 +62,30 @@ Get-ChildItem -Path $headerSrc -Recurse -Include "*.h", "*.slangh" | ForEach-Obj
 Write-Host "Copying external headers (fmt, pybind11, imgui, vulkan-headers, etc.)..."
 
 $externalHeaders = @(
-    @{src="external\fmt\include"; dst="include\external\fmt"}
-    @{src="external\pybind11\include"; dst="include\external\pybind11"}
-    @{src="external\vulkan-headers\include"; dst="include\external\vulkan-headers"}
+    @{src="external\fmt\include"; dst="include\external\fmt\include"}
+    @{src="external\pybind11\include"; dst="include\external\pybind11\include"}
+    @{src="external\vulkan-headers\include"; dst="include\external\vulkan-headers\include"}
     @{src="external\imgui"; dst="include\external\imgui"; filter="*.h"}
     @{src="external\imgui_addons"; dst="include\external\imgui_addons"; filter="*.h"}
     @{src="external\include"; dst="include\external\include"}
     @{src="external\mikktspace"; dst="include\external\mikktspace"; filter="*.h"}
 )
+
+# Special case: nanovdb headers need nested structure
+$nanovdbSrc = Join-Path $RepoRoot "external\packman\nanovdb\include\nanovdb"
+$nanovdbDst = Join-Path $SdkDir "include\external\nanovdb\nanovdb"
+if (Test-Path $nanovdbSrc) {
+    New-Item -ItemType Directory -Force -Path $nanovdbDst | Out-Null
+    Copy-Item -Path "$nanovdbSrc\*" -Destination $nanovdbDst -Recurse -Force
+}
+
+# Special case: Python headers for pybind11
+$pyInclude = Join-Path $RepoRoot "external\packman\python\include"
+$pyDst = Join-Path $SdkDir "include\external\packman\python\include"
+if (Test-Path $pyInclude) {
+    New-Item -ItemType Directory -Force -Path $pyDst | Out-Null
+    robocopy $pyInclude $pyDst /E /NFL /NDL /NJH /NJS /nc /ns /np
+}
 
 foreach ($item in $externalHeaders) {
     $src = Join-Path $RepoRoot $item.src
@@ -95,17 +111,33 @@ foreach ($item in $externalHeaders) {
 # Copy slang headers
 $slangInclude = Join-Path $RepoRoot "external\packman\slang\include"
 if (Test-Path $slangInclude) {
-    $dst = Join-Path $SdkDir "include\external\slang"
+    $dst = Join-Path $SdkDir "include\external\packman\slang\include"
     New-Item -ItemType Directory -Force -Path $dst | Out-Null
     Copy-Item -Path "$slangInclude\*" -Destination $dst -Recurse -Force
 }
 
 # Copy RTXDI headers
-$rtxdiInclude = Join-Path $RepoRoot "external\packman\rtxdi\include"
+$rtxdiInclude = Join-Path $RepoRoot "external\packman\rtxdi\rtxdi-sdk\include"
 if (Test-Path $rtxdiInclude) {
-    $dst = Join-Path $SdkDir "include\external\rtxdi"
+    $dst = Join-Path $SdkDir "include\external\packman\rtxdi\include"
     New-Item -ItemType Directory -Force -Path $dst | Out-Null
     Copy-Item -Path "$rtxdiInclude\*" -Destination $dst -Recurse -Force
+}
+
+# Copy nanovdb headers
+$nanovdbInclude = Join-Path $RepoRoot "external\packman\nanovdb\include"
+if (Test-Path $nanovdbInclude) {
+    $dst = Join-Path $SdkDir "include\external\nanovdb"
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Copy-Item -Path "$nanovdbInclude\*" -Destination $dst -Recurse -Force
+}
+
+# Copy packman deps headers (boost, etc.)
+$depsInclude = Join-Path $RepoRoot "external\packman\deps\include"
+if (Test-Path $depsInclude) {
+    $dst = Join-Path $SdkDir "include\external\packman\deps\include"
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Copy-Item -Path "$depsInclude\*" -Destination $dst -Recurse -Force
 }
 
 # ── Step 3: Copy Falcor.lib ──────────────────────────────────────────
@@ -142,6 +174,16 @@ if (Test-Path $cmakeConfigSrc) {
 }
 if (Test-Path $cmakeTargetsSrc) {
     Copy-Item -LiteralPath $cmakeTargetsSrc -Destination $cmakeDst -Force
+}
+
+# ── Post-process: add nanovdb + Python to FalcorConfig.cmake ─────────
+$configPath = Join-Path $SdkDir "cmake\FalcorConfig.cmake"
+if (Test-Path $configPath) {
+    $content = Get-Content $configPath -Raw
+    $content = $content -replace '(\$\{FALCOR_SDK_ROOT\}/include/external/packman/rtxdi/include)"',
+                                  '${FALCOR_SDK_ROOT}/include/external/packman/rtxdi/include;${FALCOR_SDK_ROOT}/include/external/nanovdb;${FALCOR_SDK_ROOT}/include/external/packman/python/include"'
+    Set-Content -Path $configPath -Value $content -NoNewline
+    Write-Host "Patched FalcorConfig.cmake with nanovdb + Python paths"
 }
 
 # ── Step 7: Remove any stray .pdb/.ilk/.exp files ────────────────────

@@ -1,0 +1,10 @@
+(Info) Falcor 8.0 (commit: 31a650ea, branch: sdk, contains uncommitted changes)
+(Info) Created CUDA device 'NVIDIA GeForce MX550' (architecture 7.5).
+(Info) Created GPU device 'NVIDIA GeForce MX550' using 'Direct3D 12' API (SM6.7).
+(Warning) Warnings in program:
+Utils/UI/TextRenderer.3d.slang (vsMain, psMain)
+D:\gitProject\FalcorSDKBuild\testExample\build\Release\shaders\Utils\UI\TextRenderer.3d.slang(48): warning 30081: implicit conversion from 'vector<float,2>' to 'vector<int,2>' is not recommended
+    float4 color = gFontTex.Load(int3(texC, 0));
+                                      ^~~~
+
+(Info) Loaded 37 plugin(s) in 0.898s
