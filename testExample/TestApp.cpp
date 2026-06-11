@@ -119,14 +119,17 @@ bool ObjViewer::onKeyEvent(const KeyboardEvent& keyEvent)
         }
         if (keyEvent.key == Input::Key::R)
         {
-            // Reset camera
+            // Reset camera to frame the model's bounding box
             if (mpScene)
             {
                 float radius = mpScene->getSceneBounds().radius();
+                float3 center = mpScene->getSceneBounds().center();
                 mpScene->setCameraSpeed(radius * 0.25f);
                 mpCamera->setDepthRange(std::max(0.1f, radius / 750.0f), radius * 10);
-                mpCamera->setPosition(float3(0, 0, radius * 2));
-                mpCamera->setTarget(float3(0, 0, 0));
+                float distance = std::max(radius * 2.5f, 0.1f);
+                float3 camPos = center + float3(distance * 0.2f, distance * 0.35f, distance);
+                mpCamera->setPosition(camPos);
+                mpCamera->setTarget(center);
                 mpCamera->setUpVector(float3(0, 1, 0));
                 mStatusMsg = "Camera reset.";
             }
@@ -159,11 +162,21 @@ void ObjViewer::loadScene(const std::filesystem::path& path, const Fbo* pTargetF
 
         // Update the controllers
         float radius = mpScene->getSceneBounds().radius();
+        float3 center = mpScene->getSceneBounds().center();
         mpScene->setCameraSpeed(radius * 0.25f);
         float nearZ = std::max(0.1f, radius / 750.0f);
         float farZ = radius * 10;
         mpCamera->setDepthRange(nearZ, farZ);
         mpCamera->setAspectRatio((float)pTargetFbo->getWidth() / (float)pTargetFbo->getHeight());
+
+        // Position camera to frame the model's bounding box
+        // Compute a good viewing distance to encompass the bounding sphere with some margin
+        float distance = std::max(radius * 2.5f, 0.1f);
+        // Place camera slightly above and in front of the model center (right-handed: Z is forward)
+        float3 camPos = center + float3(distance * 0.2f, distance * 0.35f, distance);
+        mpCamera->setPosition(camPos);
+        mpCamera->setTarget(center);
+        mpCamera->setUpVector(float3(0, 1, 0));
 
         // Get shader modules and type conformances for the scene's material system
         auto shaderModules = mpScene->getShaderModules();
