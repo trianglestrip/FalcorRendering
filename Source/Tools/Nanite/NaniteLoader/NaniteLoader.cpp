@@ -131,6 +131,20 @@ void printAssetSummary(const Asset& asset)
     std::cout << "Vertices: " << asset.vertices.size() << '\n';
     std::cout << "Format version: " << asset.version << '\n';
     std::cout << "Compressed: " << ((asset.flags & kFlagCompressedVertices) ? "yes" : "no") << '\n';
+    std::cout << "hasSource: " << (hasSourceGeometry(asset) ? "yes" : "no") << '\n';
+    if (hasSourceGeometry(asset))
+    {
+        uint64_t sourceTriangles = 0;
+        uint64_t sourceVertices = 0;
+        for (const SourceMeshSection& section : asset.sourceMeshes)
+        {
+            sourceVertices += section.vertices.size();
+            sourceTriangles += section.indices.size() / 3;
+        }
+        std::cout << "Source sections: " << asset.sourceMeshes.size()
+            << ", source vertices: " << sourceVertices
+            << ", source triangles: " << sourceTriangles << '\n';
+    }
     std::cout << "Indices: " << asset.indices.size() << '\n';
     std::cout << "Bounds: ";
     printBounds(asset.bounds);
@@ -257,6 +271,13 @@ int main(int argc, char** argv)
         if (!errors.empty())
         {
             for (const std::string& error : errors) std::cerr << "Validation: " << error << '\n';
+            return 2;
+        }
+
+        const std::vector<std::string> sourceErrors = validateSourceGeometry(asset);
+        if (!sourceErrors.empty())
+        {
+            for (const std::string& error : sourceErrors) std::cerr << "Source validation: " << error << '\n';
             return 2;
         }
 

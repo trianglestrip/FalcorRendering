@@ -28,6 +28,7 @@
 #include "Testing/UnitTest.h"
 
 #include "NaniteBuild.h"
+#include "NaniteObj.h"
 #include "NaniteToolAsset.h"
 #include "Nanite/NaniteCompress.h"
 
@@ -41,7 +42,9 @@ namespace
 {
 using Falcor::Nanite::computeGpuMemoryStats;
 using Falcor::Nanite::GpuMemoryStats;
+using Falcor::Nanite::hasSourceGeometry;
 using Falcor::Nanite::validateRuntimeTables;
+using Falcor::Nanite::validateSourceGeometry;
 using namespace FalcorRendering::NaniteTool;
 
 constexpr float kBoundsEpsilon = 1e-4f;
@@ -582,6 +585,60 @@ CPU_TEST(NaniteAsset_GpuMemoryStats, TAGS("Nanite"))
         stats.clusterBytes + stats.hierarchyBytes + stats.pageBytes + stats.vertexBytes + stats.indexBytes +
             stats.materialBytes + stats.residencyBytes
     );
+}
+
+CPU_TEST(NaniteAsset_SourceGeometryRoundtrip, TAGS("Nanite"))
+{
+    ASSERT_TRUE(std::filesystem::exists(kCubeObjPath)) << "Missing test mesh: " << kCubeObjPath.string();
+
+    InputScene scene = loadObjScene(kCubeObjPath);
+    BuildOptions options;
+    Asset asset = buildNaniteAsset(scene, options);
+    embedSourceGeometry(asset, scene);
+    ASSERT_TRUE(hasSourceGeometry(asset));
+
+    const WriteOptions writeOptions = debugWriteOptions();
+    const std::filesystem::path tempPath = std::filesystem::absolute("test_nanite_cube_source.fnanite");
+    writeAsset(tempPath, asset, writeOptions);
+
+    Asset loaded = readAsset(tempPath);
+    EXPECT_TRUE(hasSourceGeometry(loaded));
+    EXPECT_EQ(loaded.sourceMeshes.size(), asset.sourceMeshes.size());
+    ASSERT_FALSE(loaded.sourceMeshes.empty());
+    EXPECT_EQ(loaded.sourceMeshes[0].vertices.size(), asset.sourceMeshes[0].vertices.size());
+    EXPECT_TRUE(indicesEqual(loaded.sourceMeshes[0].indices, asset.sourceMeshes[0].indices));
+
+    const std::vector<std::string> sourceErrors = validateSourceGeometry(loaded);
+    EXPECT_TRUE(sourceErrors.empty()) << fmt::format("Unexpected source validation errors: {}", fmt::join(sourceErrors, "; "));
+
+    std::filesystem::remove(tempPath);
+}
+
+CPU_TEST(NaniteAsset_RebuildFromSource, TAGS("Nanite"))
+{
+    ASSERT_TRUE(std::filesystem::exists(kCubeObjPath)) << "Missing test mesh: " << kCubeObjPath.string();
+
+    InputScene scene = loadObjScene(kCubeObjPath);
+    BuildOptions coarseOptions;
+    coarseOptions.clusterTriangleTarget = 64;
+    Asset coarseAsset = buildNaniteAsset(scene, coarseOptions);
+    embedSourceGeometry(coarseAsset, scene);
+
+    const WriteOptions writeOptions = debugWriteOptions();
+    const std::filesystem::path tempPath = std::filesystem::absolute("test_nanite_cube_rebuild_source.fnanite");
+    writeAsset(tempPath, coarseAsset, writeOptions);
+
+    InputScene rebuiltScene = inputSceneFromSource(readAsset(tempPath));
+    BuildOptions fineOptions;
+    fineOptions.clusterTriangleTarget = 8;
+    Asset rebuiltAsset = buildNaniteAsset(rebuiltScene, fineOptions);
+    embedSourceGeometry(rebuiltAsset, rebuiltScene);
+
+    EXPECT_GE(rebuiltAsset.clusters.size(), coarseAsset.clusters.size());
+    EXPECT_TRUE(hasSourceGeometry(rebuiltAsset));
+    EXPECT_TRUE(validateAsset(rebuiltAsset).empty());
+
+    std::filesystem::remove(tempPath);
 }
 
 } // namespace Falcor

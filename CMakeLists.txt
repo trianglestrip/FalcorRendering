@@ -29,6 +29,19 @@ set(FALCOR_USE_SYSTEM_PYTHON OFF CACHE BOOL "Use system Python distribution")
 # Enable/disable USD.
 set(FALCOR_ENABLE_USD ON CACHE BOOL "Enable USD")
 
+# ── Minimal build options (default ON = full build) ──
+option(FALCOR_ENABLE_NANITE       "Enable Nanite virtual geometry" ON)
+option(FALCOR_ENABLE_SDFS         "Enable SDF grids" ON)
+option(FALCOR_ENABLE_DIFFREND     "Enable differentiable rendering" ON)
+option(FALCOR_ENABLE_ANIMATION    "Enable animation/skinning" ON)
+option(FALCOR_ENABLE_CURVES       "Enable curve rendering" ON)
+option(FALCOR_ENABLE_VOLUMES      "Enable volume rendering" ON)
+option(FALCOR_ENABLE_DISPLACEMENT "Enable displacement mapping" ON)
+option(FALCOR_ENABLE_MERL         "Enable MERL measured materials" ON)
+option(FALCOR_ENABLE_RGL          "Enable RGL materials" ON)
+option(FALCOR_ENABLE_HAIRCLOTH    "Enable hair/cloth materials" ON)
+option(FALCOR_ENABLE_PBRT_MAT     "Enable PBRT materials" ON)
+
 
 # Enable/disable Address Sanitizer.
 set(FALCOR_ENABLE_ASAN OFF CACHE BOOL "Enable Address Sanitizer")
@@ -40,6 +53,39 @@ set(FALCOR_VALIDATE_HEADERS OFF CACHE BOOL "Enable header validation")
 # Precompiled headers.
 # If enabled, precompiled headers are used to speed up compilation.
 set(FALCOR_PRECOMPILED_HEADERS ON CACHE BOOL "Enable precompiled headers")
+
+# ---- Minimal build options ----
+# Set FALCOR_BUILD_MINIMAL=ON to strip non-essential modules.
+# Individual modules can be overridden.
+if(FALCOR_BUILD_MINIMAL)
+    set(FALCOR_ENABLE_NANITE      OFF CACHE BOOL "" FORCE)
+    set(FALCOR_ENABLE_SDFS        OFF CACHE BOOL "" FORCE)
+    set(FALCOR_ENABLE_DIFFREND    OFF CACHE BOOL "" FORCE)
+    set(FALCOR_ENABLE_ANIMATION   OFF CACHE BOOL "" FORCE)
+    set(FALCOR_ENABLE_CURVES      OFF CACHE BOOL "" FORCE)
+    set(FALCOR_ENABLE_DISPLACE    OFF CACHE BOOL "" FORCE)
+    set(FALCOR_ENABLE_VOLUMES     OFF CACHE BOOL "" FORCE)
+    set(FALCOR_ENABLE_MERL        OFF CACHE BOOL "" FORCE)
+    set(FALCOR_ENABLE_RGL         OFF CACHE BOOL "" FORCE)
+    set(FALCOR_ENABLE_HAIRCLOTH   OFF CACHE BOOL "" FORCE)
+    set(FALCOR_ENABLE_RTXDI       OFF CACHE BOOL "" FORCE)
+    set(FALCOR_ENABLE_USD         OFF CACHE BOOL "Enable USD" FORCE)
+    set(FALCOR_ENABLE_CUDA        OFF CACHE BOOL "" FORCE)
+    message(STATUS "=== Falcor Minimal Build ===")
+else()
+    set(FALCOR_ENABLE_NANITE      ON  CACHE BOOL "Enable Nanite virtual geometry")
+    set(FALCOR_ENABLE_SDFS        ON  CACHE BOOL "Enable SDF grids")
+    set(FALCOR_ENABLE_DIFFREND    ON  CACHE BOOL "Enable differentiable rendering")
+    set(FALCOR_ENABLE_ANIMATION   ON  CACHE BOOL "Enable animation/skinning")
+    set(FALCOR_ENABLE_CURVES      ON  CACHE BOOL "Enable curve rendering")
+    set(FALCOR_ENABLE_DISPLACE    ON  CACHE BOOL "Enable displacement mapping")
+    set(FALCOR_ENABLE_VOLUMES     ON  CACHE BOOL "Enable volume rendering")
+    set(FALCOR_ENABLE_MERL        ON  CACHE BOOL "Enable MERL measured materials")
+    set(FALCOR_ENABLE_RGL         ON  CACHE BOOL "Enable RGL materials")
+    set(FALCOR_ENABLE_HAIRCLOTH   ON  CACHE BOOL "Enable hair/cloth materials")
+    set(FALCOR_ENABLE_RTXDI       ON  CACHE BOOL "Enable RTXDI direct lighting")
+endif()
+set(FALCOR_BUILD_MINIMAL OFF CACHE BOOL "Build minimal Falcor (strips non-essential modules)")
 
 # -----------------------------------------------------------------------------
 # Check platform

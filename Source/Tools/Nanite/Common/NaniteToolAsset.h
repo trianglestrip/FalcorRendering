@@ -19,6 +19,7 @@ using Falcor::Nanite::Material;
 using Falcor::Nanite::Mesh;
 using Falcor::Nanite::PageDesc;
 using Falcor::Nanite::PartitionStats;
+using Falcor::Nanite::SourceMeshSection;
 using Falcor::Nanite::Vertex;
 using Falcor::Nanite::WriteOptions;
 
@@ -35,6 +36,7 @@ using Falcor::Nanite::triangleCount;
 
 using Falcor::Nanite::kFlagCompressedVertices;
 using Falcor::Nanite::kFlagDebugUncompressed;
+using Falcor::Nanite::kFlagHasSourceGeometry;
 using Falcor::Nanite::kNaniteMagic;
 using Falcor::Nanite::kNaniteVersion;
 using Falcor::Nanite::kNaniteVersionV1;
@@ -42,9 +44,11 @@ using Falcor::Nanite::kPageFlagResident;
 
 using Falcor::Nanite::buildMetadataTables;
 using Falcor::Nanite::computeGpuMemoryStats;
+using Falcor::Nanite::hasSourceGeometry;
 using Falcor::Nanite::readAsset;
 using Falcor::Nanite::validateAsset;
 using Falcor::Nanite::validateRuntimeTables;
+using Falcor::Nanite::validateSourceGeometry;
 using Falcor::Nanite::writeAsset;
 using Falcor::Nanite::writeAssetV1;
 using Falcor::Nanite::GpuMemoryStats;

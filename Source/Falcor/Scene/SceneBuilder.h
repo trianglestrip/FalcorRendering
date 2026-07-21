@@ -363,6 +363,10 @@ namespace Falcor
         */
         void importNaniteAsset(const std::filesystem::path& path);
 
+        /** Import and merge multiple prebuilt Nanite .fnanite assets into one scene.
+        */
+        void importNaniteAssets(const std::vector<std::filesystem::path>& paths);
+
         /// Access the current asset resolver (on top of the stack).
         AssetResolver& getAssetResolver() { return mAssetResolver; }
         const AssetResolver& getAssetResolver() const { return mAssetResolver; }

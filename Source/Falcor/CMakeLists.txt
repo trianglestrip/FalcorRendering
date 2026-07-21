@@ -1,6 +1,8 @@
 add_library(Falcor SHARED)
 
-add_subdirectory(Scene/Nanite)
+if(FALCOR_ENABLE_NANITE)
+    add_subdirectory(Scene/Nanite)
+endif()
 
 target_sources(Falcor PRIVATE
     Falcor.natvis
@@ -155,18 +157,24 @@ target_sources(Falcor PRIVATE
     Core/State/GraphicsState.h
     Core/State/StateGraph.h
 
-    DiffRendering/AggregateGradients.cs.slang
-    DiffRendering/DiffDebugParams.slang
-    DiffRendering/DiffMaterialData.slang
-    DiffRendering/DiffSceneIO.slang
-    DiffRendering/DiffSceneQuery.slang
-    DiffRendering/GradientIOWrapper.slang
-    DiffRendering/InverseOptimizationParams.slang
-    DiffRendering/SceneGradientInfo.slang
-    DiffRendering/SceneGradients.cpp
-    DiffRendering/SceneGradients.h
-    DiffRendering/SceneGradients.slang
-    DiffRendering/SharedTypes.slang
+)
+if(FALCOR_ENABLE_DIFFREND)
+    target_sources(Falcor PRIVATE
+        DiffRendering/AggregateGradients.cs.slang
+        DiffRendering/DiffDebugParams.slang
+        DiffRendering/DiffMaterialData.slang
+        DiffRendering/DiffSceneIO.slang
+        DiffRendering/DiffSceneQuery.slang
+        DiffRendering/GradientIOWrapper.slang
+        DiffRendering/InverseOptimizationParams.slang
+        DiffRendering/SceneGradientInfo.slang
+        DiffRendering/SceneGradients.cpp
+        DiffRendering/SceneGradients.h
+        DiffRendering/SceneGradients.slang
+        DiffRendering/SharedTypes.slang
+    )
+endif()
+target_sources(Falcor PRIVATE
 
     RenderGraph/RenderGraph.cpp
     RenderGraph/RenderGraph.h
@@ -286,18 +294,24 @@ target_sources(Falcor PRIVATE
     Rendering/Materials/BSDFs/SpecularMicrofacet.slang
     Rendering/Materials/BSDFs/StandardBSDF.slang
 
-    Rendering/RTXDI/EnvLightUpdater.cs.slang
-    Rendering/RTXDI/LightUpdater.cs.slang
-    Rendering/RTXDI/PackedTypes.slang
-    Rendering/RTXDI/PolymorphicLight.slang
-    Rendering/RTXDI/ReflectTypes.cs.slang
-    Rendering/RTXDI/RTXDI.cpp
-    Rendering/RTXDI/RTXDI.h
-    Rendering/RTXDI/RTXDI.slang
-    Rendering/RTXDI/RTXDIApplicationBridge.slangh
-    Rendering/RTXDI/RTXDISDK.cpp
-    Rendering/RTXDI/RTXDISetup.cs.slang
-    Rendering/RTXDI/SurfaceData.slang
+)
+if(FALCOR_ENABLE_RTXDI)
+    target_sources(Falcor PRIVATE
+        Rendering/RTXDI/EnvLightUpdater.cs.slang
+        Rendering/RTXDI/LightUpdater.cs.slang
+        Rendering/RTXDI/PackedTypes.slang
+        Rendering/RTXDI/PolymorphicLight.slang
+        Rendering/RTXDI/ReflectTypes.cs.slang
+        Rendering/RTXDI/RTXDI.cpp
+        Rendering/RTXDI/RTXDI.h
+        Rendering/RTXDI/RTXDI.slang
+        Rendering/RTXDI/RTXDIApplicationBridge.slangh
+        Rendering/RTXDI/RTXDISDK.cpp
+        Rendering/RTXDI/RTXDISetup.cs.slang
+        Rendering/RTXDI/SurfaceData.slang
+    )
+endif()
+target_sources(Falcor PRIVATE
 
     Rendering/Utils/PixelStats.cpp
     Rendering/Utils/PixelStats.cs.slang
@@ -305,13 +319,19 @@ target_sources(Falcor PRIVATE
     Rendering/Utils/PixelStats.slang
     Rendering/Utils/PixelStatsShared.slang
 
-    Rendering/Volumes/HomogeneousVolumeSampler.slang
-    Rendering/Volumes/IPhaseFunction.slang
-    Rendering/Volumes/PhaseFunction.slang
-    Rendering/Volumes/GridVolumeSampler.cpp
-    Rendering/Volumes/GridVolumeSampler.h
-    Rendering/Volumes/GridVolumeSampler.slang
-    Rendering/Volumes/GridVolumeSamplerParams.slang
+)
+if(FALCOR_ENABLE_VOLUMES)
+    target_sources(Falcor PRIVATE
+        Rendering/Volumes/HomogeneousVolumeSampler.slang
+        Rendering/Volumes/IPhaseFunction.slang
+        Rendering/Volumes/PhaseFunction.slang
+        Rendering/Volumes/GridVolumeSampler.cpp
+        Rendering/Volumes/GridVolumeSampler.h
+        Rendering/Volumes/GridVolumeSampler.slang
+        Rendering/Volumes/GridVolumeSamplerParams.slang
+    )
+endif()
+target_sources(Falcor PRIVATE
 
     RenderPasses/ResolvePass.cpp
     RenderPasses/ResolvePass.h
@@ -344,12 +364,18 @@ target_sources(Falcor PRIVATE
     Scene/SceneBuilder.h
     Scene/SceneBuilderDump.cpp
     Scene/SceneBuilderDump.h
-    Scene/Nanite/NaniteAsset.cpp
-    Scene/Nanite/NaniteAsset.h
-    Scene/Nanite/NaniteStreaming.cpp
-    Scene/Nanite/NaniteStreaming.h
-    Scene/Nanite/NaniteSceneGpu.cpp
-    Scene/Nanite/NaniteSceneGpu.h
+)
+if(FALCOR_ENABLE_NANITE)
+    target_sources(Falcor PRIVATE
+        Scene/Nanite/NaniteAsset.cpp
+        Scene/Nanite/NaniteAsset.h
+        Scene/Nanite/NaniteStreaming.cpp
+        Scene/Nanite/NaniteStreaming.h
+        Scene/Nanite/NaniteSceneGpu.cpp
+        Scene/Nanite/NaniteSceneGpu.h
+    )
+endif()
+target_sources(Falcor PRIVATE
     Scene/SceneCache.cpp
     Scene/SceneCache.h
     Scene/SceneDefines.slangh
@@ -365,20 +391,26 @@ target_sources(Falcor PRIVATE
     Scene/VertexAttrib.slangh
     Scene/VertexData.slang
 
-    Scene/Animation/Animatable.cpp
-    Scene/Animation/Animatable.h
-    Scene/Animation/AnimatedVertexCache.cpp
-    Scene/Animation/AnimatedVertexCache.h
-    Scene/Animation/Animation.cpp
-    Scene/Animation/Animation.h
-    Scene/Animation/AnimationController.cpp
-    Scene/Animation/AnimationController.h
-    Scene/Animation/SharedTypes.slang
-    Scene/Animation/Skinning.slang
-    Scene/Animation/UpdateCurveAABBs.slang
-    Scene/Animation/UpdateCurvePolyTubeVertices.slang
-    Scene/Animation/UpdateCurveVertices.slang
-    Scene/Animation/UpdateMeshVertices.slang
+)
+if(FALCOR_ENABLE_ANIMATION)
+    target_sources(Falcor PRIVATE
+        Scene/Animation/Animatable.cpp
+        Scene/Animation/Animatable.h
+        Scene/Animation/AnimatedVertexCache.cpp
+        Scene/Animation/AnimatedVertexCache.h
+        Scene/Animation/Animation.cpp
+        Scene/Animation/Animation.h
+        Scene/Animation/AnimationController.cpp
+        Scene/Animation/AnimationController.h
+        Scene/Animation/SharedTypes.slang
+        Scene/Animation/Skinning.slang
+        Scene/Animation/UpdateCurveAABBs.slang
+        Scene/Animation/UpdateCurvePolyTubeVertices.slang
+        Scene/Animation/UpdateCurveVertices.slang
+        Scene/Animation/UpdateMeshVertices.slang
+    )
+endif()
+target_sources(Falcor PRIVATE
 
     Scene/Camera/Camera.cpp
     Scene/Camera/Camera.h
@@ -387,14 +419,26 @@ target_sources(Falcor PRIVATE
     Scene/Camera/Camera.slang
     Scene/Camera/CameraData.slang
 
-    Scene/Curves/CurveConfig.h
-    Scene/Curves/CurveTessellation.cpp
-    Scene/Curves/CurveTessellation.h
+)
+if(FALCOR_ENABLE_CURVES)
+    target_sources(Falcor PRIVATE
+        Scene/Curves/CurveConfig.h
+        Scene/Curves/CurveTessellation.cpp
+        Scene/Curves/CurveTessellation.h
+    )
+endif()
+target_sources(Falcor PRIVATE
 
-    Scene/Displacement/DisplacementData.slang
-    Scene/Displacement/DisplacementMapping.slang
-    Scene/Displacement/DisplacementUpdate.cs.slang
-    Scene/Displacement/DisplacementUpdateTask.slang
+)
+if(FALCOR_ENABLE_DISPLACE)
+    target_sources(Falcor PRIVATE
+        Scene/Displacement/DisplacementData.slang
+        Scene/Displacement/DisplacementMapping.slang
+        Scene/Displacement/DisplacementUpdate.cs.slang
+        Scene/Displacement/DisplacementUpdateTask.slang
+    )
+endif()
+target_sources(Falcor PRIVATE
 
     Scene/Lights/BakeIesProfile.cs.slang
     Scene/Lights/BuildTriangleList.cs.slang
@@ -422,13 +466,16 @@ target_sources(Falcor PRIVATE
     Scene/Material/BasicMaterial.cpp
     Scene/Material/BasicMaterial.h
     Scene/Material/BasicMaterialData.slang
-    Scene/Material/ClothMaterial.cpp
-    Scene/Material/ClothMaterial.h
-    Scene/Material/DiffuseSpecularData.slang
-    Scene/Material/DiffuseSpecularUtils.cpp
-    Scene/Material/DiffuseSpecularUtils.h
-    Scene/Material/HairMaterial.cpp
-    Scene/Material/HairMaterial.h
+)
+if(FALCOR_ENABLE_HAIRCLOTH)
+    target_sources(Falcor PRIVATE
+        Scene/Material/ClothMaterial.cpp
+        Scene/Material/ClothMaterial.h
+        Scene/Material/HairMaterial.cpp
+        Scene/Material/HairMaterial.h
+    )
+endif()
+target_sources(Falcor PRIVATE
     Scene/Material/Material.cpp
     Scene/Material/Material.h
     Scene/Material/MaterialData.slang
@@ -444,21 +491,31 @@ target_sources(Falcor PRIVATE
     Scene/Material/MaterialTypeRegistry.cpp
     Scene/Material/MaterialTypeRegistry.h
     Scene/Material/MaterialTypes.slang
-    Scene/Material/MERLFile.cpp
-    Scene/Material/MERLFile.h
-    Scene/Material/MERLMaterial.cpp
-    Scene/Material/MERLMaterial.h
-    Scene/Material/MERLMaterialData.slang
-    Scene/Material/MERLMixMaterial.cpp
-    Scene/Material/MERLMixMaterial.h
-    Scene/Material/MERLMixMaterialData.slang
-    Scene/Material/RGLCommon.cpp
-    Scene/Material/RGLCommon.h
-    Scene/Material/RGLFile.cpp
-    Scene/Material/RGLFile.h
-    Scene/Material/RGLMaterial.cpp
-    Scene/Material/RGLMaterial.h
-    Scene/Material/RGLMaterialData.slang
+)
+if(FALCOR_ENABLE_MERL)
+    target_sources(Falcor PRIVATE
+        Scene/Material/MERLFile.cpp
+        Scene/Material/MERLFile.h
+        Scene/Material/MERLMaterial.cpp
+        Scene/Material/MERLMaterial.h
+        Scene/Material/MERLMaterialData.slang
+        Scene/Material/MERLMixMaterial.cpp
+        Scene/Material/MERLMixMaterial.h
+        Scene/Material/MERLMixMaterialData.slang
+    )
+endif()
+if(FALCOR_ENABLE_RGL)
+    target_sources(Falcor PRIVATE
+        Scene/Material/RGLCommon.cpp
+        Scene/Material/RGLCommon.h
+        Scene/Material/RGLFile.cpp
+        Scene/Material/RGLFile.h
+        Scene/Material/RGLMaterial.cpp
+        Scene/Material/RGLMaterial.h
+        Scene/Material/RGLMaterialData.slang
+    )
+endif()
+target_sources(Falcor PRIVATE
     Scene/Material/SerializedMaterialParams.h
     Scene/Material/ShadingUtils.slang
     Scene/Material/StandardMaterial.cpp
@@ -483,65 +540,77 @@ target_sources(Falcor PRIVATE
     Scene/Material/PBRT/PBRTDiffuseTransmissionMaterial.cpp
     Scene/Material/PBRT/PBRTDiffuseTransmissionMaterial.h
 
-    Scene/SDFs/NormalizedDenseSDFGrid/NDSDFGrid.cpp
-    Scene/SDFs/NormalizedDenseSDFGrid/NDSDFGrid.h
-    Scene/SDFs/NormalizedDenseSDFGrid/NDSDFGrid.slang
+)
+if(FALCOR_ENABLE_SDFS)
+    target_sources(Falcor PRIVATE
+        Scene/SDFs/NormalizedDenseSDFGrid/NDSDFGrid.cpp
+        Scene/SDFs/NormalizedDenseSDFGrid/NDSDFGrid.h
+        Scene/SDFs/NormalizedDenseSDFGrid/NDSDFGrid.slang
 
-    Scene/SDFs/SparseBrickSet/BC4Encode.slang
-    Scene/SDFs/SparseBrickSet/SDFSBS.cpp
-    Scene/SDFs/SparseBrickSet/SDFSBS.h
-    Scene/SDFs/SparseBrickSet/SDFSBS.slang
-    Scene/SDFs/SparseBrickSet/SDFSBSAssignBrickValidityFromSDFieldPass.cs.slang
-    Scene/SDFs/SparseBrickSet/SDFSBSCompactifyChunks.cs.slang
-    Scene/SDFs/SparseBrickSet/SDFSBSComputeIntervalSDFieldFromGrid.cs.slang
-    Scene/SDFs/SparseBrickSet/SDFSBSCopyIndirectionBuffer.cs.slang
-    Scene/SDFs/SparseBrickSet/SDFSBSCreateBricksFromChunks.cs.slang
-    Scene/SDFs/SparseBrickSet/SDFSBSCreateBricksFromSDField.cs.slang
-    Scene/SDFs/SparseBrickSet/SDFSBSCreateChunksFromPrimitives.cs.slang
-    Scene/SDFs/SparseBrickSet/SDFSBSExpandSDFieldData.cs.slang
-    Scene/SDFs/SparseBrickSet/SDFSBSPruneEmptyBricks.cs.slang
-    Scene/SDFs/SparseBrickSet/SDFSBSResetBrickValidity.cs.slang
+        Scene/SDFs/SparseBrickSet/BC4Encode.slang
+        Scene/SDFs/SparseBrickSet/SDFSBS.cpp
+        Scene/SDFs/SparseBrickSet/SDFSBS.h
+        Scene/SDFs/SparseBrickSet/SDFSBS.slang
+        Scene/SDFs/SparseBrickSet/SDFSBSAssignBrickValidityFromSDFieldPass.cs.slang
+        Scene/SDFs/SparseBrickSet/SDFSBSCompactifyChunks.cs.slang
+        Scene/SDFs/SparseBrickSet/SDFSBSComputeIntervalSDFieldFromGrid.cs.slang
+        Scene/SDFs/SparseBrickSet/SDFSBSCopyIndirectionBuffer.cs.slang
+        Scene/SDFs/SparseBrickSet/SDFSBSCreateBricksFromChunks.cs.slang
+        Scene/SDFs/SparseBrickSet/SDFSBSCreateBricksFromSDField.cs.slang
+        Scene/SDFs/SparseBrickSet/SDFSBSCreateChunksFromPrimitives.cs.slang
+        Scene/SDFs/SparseBrickSet/SDFSBSExpandSDFieldData.cs.slang
+        Scene/SDFs/SparseBrickSet/SDFSBSPruneEmptyBricks.cs.slang
+        Scene/SDFs/SparseBrickSet/SDFSBSResetBrickValidity.cs.slang
 
-    Scene/SDFs/SparseVoxelOctree/SDFSVO.cpp
-    Scene/SDFs/SparseVoxelOctree/SDFSVO.h
-    Scene/SDFs/SparseVoxelOctree/SDFSVO.slang
-    Scene/SDFs/SparseVoxelOctree/SDFSVOBuildLevelFromTexture.cs.slang
-    Scene/SDFs/SparseVoxelOctree/SDFSVOBuildOctree.cs.slang
-    Scene/SDFs/SparseVoxelOctree/SDFSVOHashTable.slang
-    Scene/SDFs/SparseVoxelOctree/SDFSVOLocationCodeSorter.cs.slang
-    Scene/SDFs/SparseVoxelOctree/SDFSVOWriteSVOOffsets.cs.slang
+        Scene/SDFs/SparseVoxelOctree/SDFSVO.cpp
+        Scene/SDFs/SparseVoxelOctree/SDFSVO.h
+        Scene/SDFs/SparseVoxelOctree/SDFSVO.slang
+        Scene/SDFs/SparseVoxelOctree/SDFSVOBuildLevelFromTexture.cs.slang
+        Scene/SDFs/SparseVoxelOctree/SDFSVOBuildOctree.cs.slang
+        Scene/SDFs/SparseVoxelOctree/SDFSVOHashTable.slang
+        Scene/SDFs/SparseVoxelOctree/SDFSVOLocationCodeSorter.cs.slang
+        Scene/SDFs/SparseVoxelOctree/SDFSVOWriteSVOOffsets.cs.slang
 
-    Scene/SDFs/SparseVoxelSet/SDFSVS.cpp
-    Scene/SDFs/SparseVoxelSet/SDFSVS.h
-    Scene/SDFs/SparseVoxelSet/SDFSVS.slang
-    Scene/SDFs/SparseVoxelSet/SDFSVSVoxelizer.cs.slang
+        Scene/SDFs/SparseVoxelSet/SDFSVS.cpp
+        Scene/SDFs/SparseVoxelSet/SDFSVS.h
+        Scene/SDFs/SparseVoxelSet/SDFSVS.slang
+        Scene/SDFs/SparseVoxelSet/SDFSVSVoxelizer.cs.slang
 
-    Scene/SDFs/EvaluateSDFPrimitives.cs.slang
-    Scene/SDFs/SDF3DPrimitive.slang
-    Scene/SDFs/SDF3DPrimitiveCommon.slang
-    Scene/SDFs/SDF3DPrimitiveFactory.cpp
-    Scene/SDFs/SDF3DPrimitiveFactory.h
-    Scene/SDFs/SDFGrid.cpp
-    Scene/SDFs/SDFGrid.h
-    Scene/SDFs/SDFGrid.slang
-    Scene/SDFs/SDFGridBase.slang
-    Scene/SDFs/SDFGridHitData.slang
-    Scene/SDFs/SDFGridNoDefines.slangh
-    Scene/SDFs/SDFSurfaceVoxelCounter.cs.slang
-    Scene/SDFs/SDFVoxelCommon.slang
-    Scene/SDFs/SDFVoxelHitUtils.slang
-    Scene/SDFs/SDFVoxelTypes.slang
+        Scene/SDFs/EvaluateSDFPrimitives.cs.slang
+        Scene/SDFs/SDF3DPrimitive.slang
+        Scene/SDFs/SDF3DPrimitiveCommon.slang
+        Scene/SDFs/SDF3DPrimitiveFactory.cpp
+        Scene/SDFs/SDF3DPrimitiveFactory.h
+        Scene/SDFs/SDFGrid.cpp
+        Scene/SDFs/SDFGrid.h
+        Scene/SDFs/SDFGrid.slang
+        Scene/SDFs/SDFGridBase.slang
+        Scene/SDFs/SDFGridHitData.slang
+        Scene/SDFs/SDFGridNoDefines.slangh
+        Scene/SDFs/SDFSurfaceVoxelCounter.cs.slang
+        Scene/SDFs/SDFVoxelCommon.slang
+        Scene/SDFs/SDFVoxelHitUtils.slang
+        Scene/SDFs/SDFVoxelTypes.slang
+    )
+endif()
+target_sources(Falcor PRIVATE
 
-    Scene/Volume/BC4Encode.h
-    Scene/Volume/BrickedGrid.h
-    Scene/Volume/Grid.cpp
-    Scene/Volume/Grid.h
-    Scene/Volume/Grid.slang
-    Scene/Volume/GridConverter.h
-    Scene/Volume/GridVolume.cpp
-    Scene/Volume/GridVolume.h
-    Scene/Volume/GridVolume.slang
-    Scene/Volume/GridVolumeData.slang
+)
+if(FALCOR_ENABLE_VOLUMES)
+    target_sources(Falcor PRIVATE
+        Scene/Volume/BC4Encode.h
+        Scene/Volume/BrickedGrid.h
+        Scene/Volume/Grid.cpp
+        Scene/Volume/Grid.h
+        Scene/Volume/Grid.slang
+        Scene/Volume/GridConverter.h
+        Scene/Volume/GridVolume.cpp
+        Scene/Volume/GridVolume.h
+        Scene/Volume/GridVolume.slang
+        Scene/Volume/GridVolumeData.slang
+    )
+endif()
+target_sources(Falcor PRIVATE
 
     Testing/UnitTest.cpp
     Testing/UnitTest.cs.slang

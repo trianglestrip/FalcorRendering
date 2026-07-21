@@ -43,6 +43,7 @@
 #include "Volume/GridVolume.h"
 #include "Volume/Grid.h"
 #include "SDFs/SDFGrid.h"
+#include "Nanite/NaniteAssetData.h"
 #include "Nanite/NaniteSceneDesc.h"
 #include "Nanite/NaniteStreaming.h"
 
@@ -304,7 +305,8 @@ namespace Falcor
             std::vector<AABB> customPrimitiveAABBs;                 ///< List of AABBs for custom primitives in world space. Each custom primitive consists of one AABB.
 
             // Nanite data
-            std::filesystem::path naniteAssetPath;                  ///< Path to prebuilt .fnanite asset.
+            std::filesystem::path naniteAssetPath;                  ///< Path to prebuilt .fnanite asset (or display path for merged assets).
+            std::optional<Nanite::Asset> naniteAsset;               ///< Preloaded Nanite asset (multi-file merge or in-memory import).
             std::vector<NaniteMeshDesc> naniteMeshDesc;             ///< Nanite mesh descriptors.
             std::vector<GeometryInstanceData> naniteInstanceData;   ///< Nanite mesh instances.
         };

@@ -26,6 +26,8 @@ struct Arguments
     BuildOptions build;
     WriteOptions writeOptions;
     bool writeDebugJson = false;
+    bool combined = false;
+    bool rebuildFromSource = false;
 };
 
 void printUsage()
@@ -43,6 +45,9 @@ void printUsage()
         << "  --no-compress                  Write uncompressed vertices (debug).\n"
         << "  --debug-uncompressed           Alias for --no-compress.\n"
         << "  --group-clusters <count>       Clusters per cluster group. Default: 32.\n"
+        << "  --combined                     Write one .fnanite for the whole scene (legacy).\n"
+        << "  --rebuild, --rebuild-from-source  Re-cluster from embedded source in an existing .fnanite.\n"
+        << "  --no-embed-source              Do not store pre-cluster source geometry in the output.\n"
         << "  --debug-json [path]            Write a debug JSON summary. Default path is output.fnanite.json.\n"
         << "  -h, --help                     Show this help.\n";
 }
@@ -117,6 +122,18 @@ Arguments parseArguments(int argc, char** argv)
         {
             args.writeOptions.groupClusters = parseUInt(requireValue(option.c_str()), option.c_str());
         }
+        else if (option == "--combined")
+        {
+            args.combined = true;
+        }
+        else if (option == "--rebuild" || option == "--rebuild-from-source")
+        {
+            args.rebuildFromSource = true;
+        }
+        else if (option == "--no-embed-source")
+        {
+            args.writeOptions.embedSource = false;
+        }
         else if (option == "--debug-json")
         {
             args.writeDebugJson = true;
@@ -168,6 +185,129 @@ std::string jsonEscape(const std::string& value)
     return escaped;
 }
 
+std::string sanitizeFileName(const std::string& name)
+{
+    std::string sanitized;
+    sanitized.reserve(name.size());
+    for (char ch : name)
+    {
+        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '-')
+            sanitized += ch;
+        else
+            sanitized += '_';
+    }
+    if (sanitized.empty()) sanitized = "mesh";
+    return sanitized;
+}
+
+
+std::filesystem::path perMeshOutputPath(const std::filesystem::path& baseOutput, const std::string& meshName)
+{
+    const std::string safeName = sanitizeFileName(meshName);
+    std::filesystem::path dir;
+    std::string basename;
+
+    if (baseOutput.has_extension() && baseOutput.extension() == ".fnanite")
+    {
+        dir = baseOutput.parent_path();
+        basename = baseOutput.stem().string();
+    }
+    else if (std::filesystem::exists(baseOutput) && std::filesystem::is_directory(baseOutput))
+    {
+        dir = baseOutput;
+        basename = baseOutput.filename().string();
+    }
+    else
+    {
+        dir = baseOutput.parent_path();
+        basename = baseOutput.filename().string();
+    }
+
+    if (basename.empty()) basename = "mesh";
+    return dir / (basename + "_" + safeName + ".fnanite");
+}
+
+std::filesystem::path perMeshDebugJsonPath(const std::filesystem::path& outputPath)
+{
+    std::filesystem::path debugPath = outputPath;
+    debugPath.replace_extension(".fnanite.json");
+    return debugPath;
+}
+
+void validateBuiltAsset(const Asset& asset)
+{
+    const std::vector<std::string> validationErrors = validateAsset(asset);
+    if (!validationErrors.empty())
+    {
+        for (const std::string& error : validationErrors) std::cerr << "Validation: " << error << '\n';
+        throw std::runtime_error("Generated Nanite asset failed validation.");
+    }
+
+    const std::vector<std::string> sourceErrors = validateSourceGeometry(asset);
+    if (!sourceErrors.empty())
+    {
+        for (const std::string& error : sourceErrors) std::cerr << "Source validation: " << error << '\n';
+        throw std::runtime_error("Embedded source geometry failed validation.");
+    }
+}
+
+void writeDebugJsonFile(const std::filesystem::path& path, const Asset& asset, const BuildOptions& options);
+
+void writeBuiltAsset(
+    const std::filesystem::path& outputPath,
+    const std::filesystem::path& debugJsonPath,
+    const Asset& asset,
+    const BuildOptions& buildOptions,
+    const WriteOptions& writeOptions,
+    bool emitDebugJson
+)
+{
+    writeAsset(outputPath, asset, writeOptions);
+    if (emitDebugJson) writeDebugJsonFile(debugJsonPath, asset, buildOptions);
+
+    std::cout << "Wrote: " << outputPath << '\n';
+    std::cout << "Meshes: " << asset.meshes.size()
+        << ", Materials: " << asset.materials.size()
+        << ", Clusters: " << asset.clusters.size()
+        << ", Triangles: " << triangleCount(asset)
+        << ", Vertices: " << asset.vertices.size();
+    if (hasSourceGeometry(asset))
+    {
+        uint64_t sourceTriangles = 0;
+        for (const SourceMeshSection& section : asset.sourceMeshes)
+        {
+            sourceTriangles += section.indices.size() / 3;
+        }
+        std::cout << ", Source sections: " << asset.sourceMeshes.size()
+            << ", Source triangles: " << sourceTriangles;
+    }
+    std::cout << '\n';
+    if (emitDebugJson) std::cout << "Debug JSON: " << debugJsonPath << '\n';
+}
+
+InputScene singleMeshScene(const InputScene& scene, size_t meshIndex)
+{
+    InputScene subScene;
+    subScene.sourcePath = scene.sourcePath;
+    subScene.materialNames = scene.materialNames;
+    subScene.meshes.push_back(scene.meshes[meshIndex]);
+    subScene.bounds = scene.meshes[meshIndex].bounds;
+    return subScene;
+}
+
+void buildAndWriteScene(
+    const InputScene& scene,
+    const Arguments& args,
+    const std::filesystem::path& outputPath,
+    const std::filesystem::path& debugJsonPath
+)
+{
+    Asset asset = buildNaniteAsset(scene, args.build);
+    if (args.writeOptions.embedSource) embedSourceGeometry(asset, scene);
+    validateBuiltAsset(asset);
+    writeBuiltAsset(outputPath, debugJsonPath, asset, args.build, args.writeOptions, args.writeDebugJson);
+}
+
 void writeBounds(std::ofstream& stream, const Bounds& bounds)
 {
     stream
@@ -194,7 +334,7 @@ void writeTriangleRemap(std::ofstream& stream, const ClusterDebugInfo* debugInfo
     stream << "]";
 }
 
-void writeDebugJson(const std::filesystem::path& path, const Asset& asset, const BuildOptions& options)
+void writeDebugJsonFile(const std::filesystem::path& path, const Asset& asset, const BuildOptions& options)
 {
     if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
     std::ofstream stream(path);
@@ -261,6 +401,23 @@ int main(int argc, char** argv)
     try
     {
         Arguments args = parseArguments(argc, argv);
+
+        if (args.rebuildFromSource)
+        {
+            if (args.input.extension() != ".fnanite")
+            {
+                throw std::runtime_error("--rebuild-from-source requires a .fnanite input file.");
+            }
+
+            std::cout << "Loading source from: " << args.input << '\n';
+            Asset loaded = readAsset(args.input);
+            InputScene scene = inputSceneFromSource(loaded);
+
+            std::cout << "Rebuilding clusters from embedded source...\n";
+            buildAndWriteScene(scene, args, args.output, args.debugJson);
+            return 0;
+        }
+
         const bool gltfInput = isGltfInput(args.input);
         const bool pbrtInput = args.input.extension() == ".pbrt";
         if (args.input.extension() != ".obj" && !gltfInput && !pbrtInput)
@@ -285,27 +442,34 @@ int main(int argc, char** argv)
             scene = loadObjScene(args.input);
         }
 
-        std::cout << "Building clusters...\n";
-        Asset asset = buildNaniteAsset(scene, args.build);
-
-        const std::vector<std::string> validationErrors = validateAsset(asset);
-        if (!validationErrors.empty())
+        size_t nonEmptyMeshCount = 0;
+        for (const InputMesh& mesh : scene.meshes)
         {
-            for (const std::string& error : validationErrors) std::cerr << "Validation: " << error << '\n';
-            throw std::runtime_error("Generated Nanite asset failed validation.");
+            if (!mesh.indices.empty()) ++nonEmptyMeshCount;
         }
 
-        writeAsset(args.output, asset, args.writeOptions);
-        if (args.writeDebugJson) writeDebugJson(args.debugJson, asset, args.build);
+        const bool usePerMesh = !args.combined && nonEmptyMeshCount > 1;
+        if (usePerMesh)
+        {
+            std::cout << "Building " << nonEmptyMeshCount << " per-mesh .fnanite assets...\n";
+            size_t writtenCount = 0;
+            for (size_t meshIndex = 0; meshIndex < scene.meshes.size(); ++meshIndex)
+            {
+                if (scene.meshes[meshIndex].indices.empty()) continue;
 
-        std::cout << "Wrote: " << args.output << '\n';
-        std::cout << "Meshes: " << asset.meshes.size()
-            << ", Materials: " << asset.materials.size()
-            << ", Clusters: " << asset.clusters.size()
-            << ", Triangles: " << triangleCount(asset)
-            << ", Vertices: " << asset.vertices.size() << '\n';
-        if (args.writeDebugJson) std::cout << "Debug JSON: " << args.debugJson << '\n';
+                const InputScene subScene = singleMeshScene(scene, meshIndex);
+                const std::filesystem::path outputPath = perMeshOutputPath(args.output, subScene.meshes[0].name);
+                const std::filesystem::path debugJsonPath = args.writeDebugJson ? perMeshDebugJsonPath(outputPath) : args.debugJson;
+                buildAndWriteScene(subScene, args, outputPath, debugJsonPath);
+                ++writtenCount;
+            }
 
+            std::cout << "Wrote " << writtenCount << " .fnanite files.\n";
+            return 0;
+        }
+
+        std::cout << "Building clusters...\n";
+        buildAndWriteScene(scene, args, args.output, args.debugJson);
         return 0;
     }
     catch (const std::exception& e)

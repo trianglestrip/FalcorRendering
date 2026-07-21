@@ -2,14 +2,22 @@
 #include "Scene/SceneBuilder.h"
 #include "Utils/Settings/Settings.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 
 namespace
 {
+void debugTrace(const char* msg)
+{
+    std::ofstream f("viewer_trace.log", std::ios::app);
+    f << msg << std::endl;
+    f.flush();
+}
 struct Arguments
 {
-    std::filesystem::path fnanitePath = "data/nanite/cube.fnanite";
+    std::vector<std::filesystem::path> fnanitePaths;
+    std::filesystem::path fnaniteDir;
     std::filesystem::path screenshotPath;
     std::filesystem::path csvPath;
     bool headlessCapture = false;
@@ -58,6 +66,30 @@ void appendBoxLines(std::vector<AABBVertex>& vertices, const Nanite::Bounds& bou
     }
 }
 
+std::vector<std::filesystem::path> collectFnaniteFiles(const std::filesystem::path& dir)
+{
+    if (!std::filesystem::is_directory(dir))
+    {
+        throw std::runtime_error("Not a directory: " + dir.string());
+    }
+
+    std::vector<std::filesystem::path> paths;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.is_regular_file() && entry.path().extension() == ".fnanite")
+        {
+            paths.push_back(entry.path());
+        }
+    }
+
+    std::sort(paths.begin(), paths.end());
+    if (paths.empty())
+    {
+        throw std::runtime_error("No .fnanite files found in " + dir.string());
+    }
+    return paths;
+}
+
 Arguments parseArguments(int argc, char** argv)
 {
     Arguments args;
@@ -72,7 +104,11 @@ Arguments parseArguments(int argc, char** argv)
 
         if (option == "--fnanite" || option == "-f")
         {
-            args.fnanitePath = requireValue();
+            args.fnanitePaths.push_back(requireValue());
+        }
+        else if (option == "--fnanite-dir")
+        {
+            args.fnaniteDir = requireValue();
         }
         else if (option == "--screenshot")
         {
@@ -86,10 +122,22 @@ Arguments parseArguments(int argc, char** argv)
         }
         else if (option == "--help" || option == "-h")
         {
-            std::cout << "NaniteViewer --fnanite <path.fnanite> [--screenshot out.png] [--csv perf.csv]\n";
+            std::cout << "NaniteViewer [--fnanite <path.fnanite>]... [--fnanite-dir <dir>] [--screenshot out.png] [--csv perf.csv]\n";
             std::exit(0);
         }
     }
+
+    if (!args.fnaniteDir.empty())
+    {
+        const auto dirPaths = collectFnaniteFiles(args.fnaniteDir);
+        args.fnanitePaths.insert(args.fnanitePaths.end(), dirPaths.begin(), dirPaths.end());
+    }
+
+    if (args.fnanitePaths.empty())
+    {
+        args.fnanitePaths.push_back("data/nanite/cube.fnanite");
+    }
+
     return args;
 }
 } // namespace
@@ -103,9 +151,9 @@ NaniteViewer::~NaniteViewer() {}
 void NaniteViewer::onLoad(RenderContext* pRenderContext)
 {
     prepareAABBDebugPass();
-    if (!mAssetPath.empty())
+    if (!mAssetPaths.empty())
     {
-        loadAsset(mAssetPath);
+        loadAssets(mAssetPaths);
         if (!mHeadlessCapture)
             setupRenderGraph(pRenderContext);
     }
@@ -113,20 +161,31 @@ void NaniteViewer::onLoad(RenderContext* pRenderContext)
 
 void NaniteViewer::setupRenderGraph(RenderContext* pRenderContext)
 {
-    if (!mpScene || !mpNaniteAsset) return;
+    debugTrace("setupRenderGraph enter");
+    if (!mpScene || !mpNaniteAsset)
+    {
+        debugTrace("setupRenderGraph skipped: missing scene or asset");
+        return;
+    }
 
     mpRenderGraph = RenderGraph::create(getDevice(), "NaniteViewer");
+    debugTrace("setupRenderGraph: graph created");
     Properties passProps;
     passProps["lodErrorThreshold"] = mLodErrorThreshold;
     passProps["debugMode"] = std::string("Shaded");
     mpNaniteRasterPass = mpRenderGraph->createPass("NaniteRaster", "NaniteRaster", passProps);
+    debugTrace("setupRenderGraph: pass created");
     mpRenderGraph->markOutput("NaniteRaster.output");
+    debugTrace("setupRenderGraph: output marked");
     mpRenderGraph->setScene(mpScene);
+    debugTrace("setupRenderGraph: scene set");
     mpRenderGraph->onResize(getTargetFbo().get());
+    debugTrace("setupRenderGraph: resized");
     if (!mpRenderGraph->compile(pRenderContext))
     {
         FALCOR_THROW("Failed to compile NaniteViewer render graph.");
     }
+    debugTrace("setupRenderGraph: compiled");
     mRenderGraphReady = true;
 }
 
@@ -144,8 +203,19 @@ void NaniteViewer::prepareAABBDebugPass()
 
 void NaniteViewer::loadAsset(const std::filesystem::path& path)
 {
-    mAssetPath = path;
-    mpScene = SceneBuilder(getDevice(), path, Settings(), SceneBuilder::Flags::Default).getScene();
+    loadAssets({path});
+}
+
+void NaniteViewer::loadAssets(const std::vector<std::filesystem::path>& paths)
+{
+    if (paths.empty()) FALCOR_THROW("No Nanite assets to load.");
+
+    mAssetPaths = paths;
+    mAssetPath = paths.size() == 1 ? paths[0] : paths[0].parent_path();
+
+    SceneBuilder builder(getDevice(), Settings(), SceneBuilder::Flags::Default);
+    builder.importNaniteAssets(paths);
+    mpScene = builder.getScene();
     if (!mpScene)
     {
         FALCOR_THROW("Failed to build scene for Nanite asset.");
@@ -231,6 +301,7 @@ void NaniteViewer::onResize(uint32_t width, uint32_t height)
 
 void NaniteViewer::onFrameRender(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo)
 {
+    debugTrace("onFrameRender start");
     if (!mpNaniteAsset) return;
 
     const float4 clearColor(0.12f, 0.14f, 0.18f, 1.f);
@@ -240,13 +311,16 @@ void NaniteViewer::onFrameRender(RenderContext* pRenderContext, const ref<Fbo>& 
 
     if (mRenderGraphReady && mpRenderGraph)
     {
+        debugTrace("before execute");
         mpRenderGraph->execute(pRenderContext);
+        debugTrace("after execute");
 
         ref<Texture> pNaniteOutput = mpRenderGraph->getOutput("NaniteRaster.output")->asTexture();
         if (pNaniteOutput)
         {
             pRenderContext->blit(pNaniteOutput->getSRV(), pTargetFbo->getRenderTargetView(0));
         }
+        debugTrace("after blit");
     }
 
     mLastFrameTimeMs = getFrameRate().getLastFrameTime();
@@ -282,7 +356,7 @@ void NaniteViewer::maybeCaptureScreenshot(RenderContext* pRenderContext, const r
     mCaptureScreenshot = false;
     logInfo("NaniteViewer screenshot saved to {}", mScreenshotPath.string());
 
-    if (mHeadlessCapture)
+    if (mHeadlessCapture && false)
     {
         shutdown(0);
     }
@@ -306,6 +380,7 @@ void NaniteViewer::dumpPerformanceCsv()
 
 void NaniteViewer::onGuiRender(Gui* pGui)
 {
+    debugTrace("onGuiRender start");
     Gui::Window w(pGui, "Nanite Viewer", {420, 520}, {10, 10});
     renderGlobalUI(pGui);
 
@@ -318,7 +393,9 @@ void NaniteViewer::onGuiRender(Gui* pGui)
     const Nanite::Asset& asset = mpNaniteAsset->getCpuAsset();
     const NaniteMemoryStats mem = mpNaniteAsset->getMemoryStats();
 
-    w.text("Asset: " + mAssetPath.filename().string());
+    w.text("Asset: " + (mAssetPaths.size() > 1
+        ? std::to_string(mAssetPaths.size()) + " files in " + mAssetPath.string()
+        : mAssetPath.filename().string()));
     w.text("Version: " + std::to_string(asset.version));
     w.text("Clusters: " + std::to_string(asset.clusters.size()));
     w.text("Visible clusters: " + std::to_string(mVisibleClusters));
@@ -387,7 +464,7 @@ int runMain(int argc, char** argv)
     }
 
     NaniteViewer app(config);
-    app.setAssetPath(args.fnanitePath);
+    app.setAssetPaths(args.fnanitePaths);
     if (!args.screenshotPath.empty()) app.setScreenshotPath(args.screenshotPath);
     if (!args.csvPath.empty()) app.setCsvPath(args.csvPath);
     app.setHeadlessCapture(args.headlessCapture);

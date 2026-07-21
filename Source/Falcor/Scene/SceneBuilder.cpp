@@ -376,17 +376,29 @@ namespace Falcor
 
     void SceneBuilder::importNaniteAsset(const std::filesystem::path& path)
     {
-        logInfo("Importing Nanite asset: {}", path);
-        if (!mSceneData.naniteAssetPath.empty())
+        importNaniteAssets({path});
+    }
+
+    void SceneBuilder::importNaniteAssets(const std::vector<std::filesystem::path>& paths)
+    {
+        if (paths.empty()) throw ImporterError("", "No Nanite assets to import.");
+
+        logInfo("Importing {} Nanite asset(s)", paths.size());
+
+        if (!mSceneData.naniteAssetPath.empty() || mSceneData.naniteAsset.has_value())
         {
-            logWarning("Scene already contains a Nanite asset. Replacing with {}", path);
+            logWarning("Scene already contains a Nanite asset. Replacing with merged import.");
             mSceneData.naniteMeshDesc.clear();
             mSceneData.naniteInstanceData.clear();
+            mSceneData.naniteAsset.reset();
         }
-        mSceneData.naniteAssetPath = path;
 
-        const Nanite::Asset asset = Nanite::readAsset(path);
-        const Nanite::Bounds& bounds = asset.bounds;
+        Nanite::Asset asset = paths.size() == 1 ? Nanite::readAsset(paths[0]) : Nanite::mergeAssets(paths);
+        mSceneData.naniteAsset = std::move(asset);
+        mSceneData.naniteAssetPath = paths.size() == 1 ? paths[0] : paths[0].parent_path();
+
+        const Nanite::Asset& loadedAsset = mSceneData.naniteAsset.value();
+        const Nanite::Bounds& bounds = loadedAsset.bounds;
 
         if (mSceneData.cameras.empty())
         {
@@ -404,9 +416,9 @@ namespace Falcor
             mSceneData.selectedCamera = 0;
         }
 
-        for (size_t meshIndex = 0; meshIndex < asset.meshes.size(); ++meshIndex)
+        for (size_t meshIndex = 0; meshIndex < loadedAsset.meshes.size(); ++meshIndex)
         {
-            const Nanite::Mesh& mesh = asset.meshes[meshIndex];
+            const Nanite::Mesh& mesh = loadedAsset.meshes[meshIndex];
             NaniteMeshDesc desc{};
             desc.meshIndex = static_cast<uint32_t>(meshIndex);
             desc.firstCluster = mesh.firstCluster;
@@ -445,7 +457,7 @@ namespace Falcor
         // If no meshes were added, we create a dummy mesh to keep the scene generation working.
         // Scenes with no meshes can be useful for example when using volumes in isolation.
         // Nanite-only scenes skip the dummy mesh.
-        if (mMeshes.empty() && mSceneData.naniteAssetPath.empty())
+        if (mMeshes.empty() && mSceneData.naniteAssetPath.empty() && !mSceneData.naniteAsset.has_value())
         {
             logWarning("Scene contains no meshes. Creating a dummy mesh.");
             // Add a dummy (degenerate) mesh.

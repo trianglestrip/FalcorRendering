@@ -30,6 +30,11 @@ uint32_t hashMaterialName(const std::string& name)
 ref<NaniteAsset> NaniteAsset::create(ref<Device> pDevice, const std::filesystem::path& path)
 {
     Nanite::Asset asset = Nanite::readAsset(path);
+    return create(pDevice, std::move(asset));
+}
+
+ref<NaniteAsset> NaniteAsset::create(ref<Device> pDevice, Nanite::Asset asset)
+{
     const std::vector<std::string> errors = Nanite::validateAsset(asset);
     if (!errors.empty())
     {

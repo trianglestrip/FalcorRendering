@@ -117,12 +117,23 @@ struct PartitionStats
     uint64_t interClusterEdges = 0;
 };
 
+/// Pre-cluster source geometry embedded for offline re-bake (UE-style static mesh source).
+struct SourceMeshSection
+{
+    std::string name;
+    std::string materialName;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    Bounds bounds;
+};
+
 constexpr uint32_t kNaniteMagic = ('F') | ('N' << 8) | ('A' << 16) | ('N' << 24);
 constexpr uint32_t kNaniteVersionV1 = 1;
 constexpr uint32_t kNaniteVersion = 2;
 
 constexpr uint32_t kFlagCompressedVertices = 1u << 0;
 constexpr uint32_t kFlagDebugUncompressed = 1u << 1;
+constexpr uint32_t kFlagHasSourceGeometry = 1u << 2;
 
 constexpr uint32_t kPageFlagResident = 1u << 0;
 
@@ -138,6 +149,9 @@ enum class ChunkType : uint32_t
     Index = 7,
     StringTable = 8,
     CompressedVertex = 9,
+    SourceMesh = 10,
+    SourceVertex = 11,
+    SourceIndex = 12,
 };
 
 inline Float3 operator+(Float3 a, Float3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }

@@ -19,6 +19,7 @@ struct Asset
     std::vector<PageDesc> pages;
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
+    std::vector<SourceMeshSection> sourceMeshes;
     Bounds bounds;
     uint32_t version = kNaniteVersion;
     uint32_t flags = 0;
@@ -32,15 +33,19 @@ struct WriteOptions
 {
     bool compressVertices = true;
     bool debugUncompressed = false;
+    bool embedSource = true;
     uint32_t groupClusters = 32;
 };
 
 uint64_t triangleCount(const Asset& asset);
+bool hasSourceGeometry(const Asset& asset);
 
 void buildMetadataTables(Asset& asset, uint32_t groupClusters);
 void writeAssetV1(const std::filesystem::path& path, const Asset& asset);
 void writeAsset(const std::filesystem::path& path, const Asset& asset, const WriteOptions& options = {});
 Asset readAsset(const std::filesystem::path& path);
+Asset mergeAssets(const std::vector<std::filesystem::path>& paths);
 std::vector<std::string> validateAsset(const Asset& asset);
+std::vector<std::string> validateSourceGeometry(const Asset& asset);
 
 } // namespace Falcor::Nanite

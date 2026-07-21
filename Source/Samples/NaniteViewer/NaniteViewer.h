@@ -21,13 +21,15 @@ public:
     bool onKeyEvent(const KeyboardEvent& keyEvent) override;
     bool onMouseEvent(const MouseEvent& mouseEvent) override;
 
-    void setAssetPath(const std::filesystem::path& path) { mAssetPath = path; }
+    void setAssetPath(const std::filesystem::path& path) { mAssetPaths = {path}; }
+    void setAssetPaths(const std::vector<std::filesystem::path>& paths) { mAssetPaths = paths; }
     void setScreenshotPath(const std::filesystem::path& path) { mScreenshotPath = path; }
     void setCsvPath(const std::filesystem::path& path) { mCsvPath = path; }
     void setHeadlessCapture(bool enable) { mHeadlessCapture = enable; }
 
 protected:
     void loadAsset(const std::filesystem::path& path);
+    void loadAssets(const std::vector<std::filesystem::path>& paths);
     void setupRenderGraph(RenderContext* pRenderContext);
 
 private:
@@ -48,6 +50,7 @@ private:
     uint32_t mAABBLineVertexCount = 0;
 
     std::filesystem::path mAssetPath;
+    std::vector<std::filesystem::path> mAssetPaths;
     std::filesystem::path mScreenshotPath = "data/nanite/screenshots/viewer_capture.png";
     std::filesystem::path mCsvPath = "data/nanite/nanite_perf.csv";
     bool mShowClusterAABBs = false;

@@ -7,11 +7,18 @@
 #include "Utils/Timing/Profiler.h"
 
 #include <chrono>
+#include <fstream>
 #include <limits>
 #include <numeric>
 
 namespace
 {
+void debugTrace(const char* msg)
+{
+    std::ofstream f("viewer_trace.log", std::ios::app);
+    f << msg << std::endl;
+    f.flush();
+}
 const char kCullShader[] = "RenderPasses/NaniteRaster/NaniteCull.cs.slang";
 const char kRasterShader[] = "RenderPasses/NaniteRaster/NaniteRaster.cs.slang";
 const char kResolveShader[] = "RenderPasses/NaniteRaster/NaniteMaterialResolve.cs.slang";
@@ -50,6 +57,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registr
 
 NaniteRaster::NaniteRaster(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 {
+    debugTrace("NaniteRaster ctor");
     if (auto mode = props.getOpt<NaniteDebugMode>("debugMode"))
         setDebugMode(*mode);
     if (auto threshold = props.getOpt<float>("lodErrorThreshold"))
@@ -57,6 +65,7 @@ NaniteRaster::NaniteRaster(ref<Device> pDevice, const Properties& props) : Rende
     if (auto occ = props.getOpt<bool>("enableOcclusion"))
         mEnableOcclusion = *occ;
     preparePasses();
+    debugTrace("NaniteRaster ctor done");
 }
 
 Properties NaniteRaster::getProperties() const
@@ -98,6 +107,7 @@ RenderPassReflection NaniteRaster::reflect(const CompileData& compileData)
 
 void NaniteRaster::compile(RenderContext* pRenderContext, const CompileData& compileData)
 {
+    debugTrace("NaniteRaster::compile enter");
     if (!mpNaniteAsset) return;
 
     mpVisibleClusters = mpDevice->createBuffer(
@@ -278,7 +288,9 @@ void NaniteRaster::clearOutputs(RenderContext* pRenderContext, const RenderData&
 
 void NaniteRaster::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    debugTrace("NaniteRaster::execute");
     if (!mpNaniteAsset || !mPassesPrepared || !mpVisibleClusters) return;
+    return;
 
     FALCOR_PROFILE(pRenderContext, "NaniteRaster::execute");
     const auto startTime = std::chrono::high_resolution_clock::now();

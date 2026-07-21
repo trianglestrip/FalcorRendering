@@ -16,4 +16,6 @@ struct BuildOptions
 };
 
 Asset buildNaniteAsset(const InputScene& scene, const BuildOptions& options);
+void embedSourceGeometry(Asset& asset, const InputScene& scene);
+InputScene inputSceneFromSource(const Asset& asset);
 }

@@ -210,9 +210,16 @@ namespace Falcor
         mCustomPrimitiveDesc = std::move(sceneData.customPrimitiveDesc);
         mCustomPrimitiveAABBs = std::move(sceneData.customPrimitiveAABBs);
 
-        if (!sceneData.naniteAssetPath.empty())
+        if (!sceneData.naniteAssetPath.empty() || sceneData.naniteAsset.has_value())
         {
-            mpNaniteAsset = NaniteAsset::create(mpDevice, sceneData.naniteAssetPath);
+            if (sceneData.naniteAsset.has_value())
+            {
+                mpNaniteAsset = NaniteAsset::create(mpDevice, std::move(sceneData.naniteAsset.value()));
+            }
+            else
+            {
+                mpNaniteAsset = NaniteAsset::create(mpDevice, sceneData.naniteAssetPath);
+            }
             mpNaniteStreamingManager = NaniteStreamingManager::create(mpNaniteAsset);
             mNaniteMeshDesc = std::move(sceneData.naniteMeshDesc);
             mNaniteInstanceData = std::move(sceneData.naniteInstanceData);

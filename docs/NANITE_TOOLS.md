@@ -60,6 +60,10 @@ Positional input is supported: if the first non-option argument is not prefixed 
 | `--cluster-tris <count>` | `128` | Target triangles per cluster. |
 | `--max-cluster-verts <count>` | `256` | Maximum local vertices per cluster. |
 | `--workers <count>` | hardware thread count | Taskflow worker threads for mesh-parallel cluster build. |
+| `--group-clusters <count>` | `32` | Clusters per cluster group. |
+| `--combined` | | Write one `.fnanite` for the entire scene (legacy). Multi-mesh inputs default to **one file per mesh**. |
+| `--rebuild`, `--rebuild-from-source` | | Re-cluster from embedded source geometry in an existing `.fnanite` (requires `-i` `.fnanite`). |
+| `--no-embed-source` | | Skip storing pre-cluster source geometry in the output. |
 | `--debug-json [path]` | `<output>.fnanite.json` | Write a JSON build summary (cluster bounds, triangle remap, stats). |
 | `-h`, `--help` | | Print usage and exit. |
 
@@ -72,9 +76,13 @@ Positional input is supported: if the first non-option argument is not prefixed 
 ### Build pipeline
 
 ```text
-OBJ load  ->  mesh sections / materials  ->  Morton-ordered cluster packing
-         ->  validate  ->  write .fnanite  ->  optional debug JSON
+OBJ/glTF/PBRT load  ->  one mesh per .fnanite (multi-mesh default)
+                   ->  embed source geometry chunk
+                   ->  Morton-ordered cluster packing
+                   ->  validate  ->  write .fnanite  ->  optional debug JSON
 ```
+
+For multi-mesh scenes (e.g. kitchen with hundreds of OBJ objects), NaniteBuilder writes **one static mesh per `.fnanite` file** by default. Use `--combined` to keep the old single-file behavior. Each file stores **embedded source geometry** so cluster parameters can be changed offline without re-importing the original OBJ/glTF/PBRT.
 
 Cluster construction uses taskflow for mesh-level parallelism. Results are merged in source order so repeated builds produce stable output.
 
@@ -100,6 +108,28 @@ build\windows-vs2022\bin\Release\NaniteBuilder.exe `
   --workers 4 `
   --debug-json data\nanite\cube.fnanite.json
 ```
+
+Re-cluster an existing asset with different parameters (no re-import):
+
+```powershell
+build\windows-vs2022\bin\Release\NaniteBuilder.exe `
+  --input data\nanite\cube.fnanite `
+  --output data\nanite\cube_64tris.fnanite `
+  --rebuild `
+  --cluster-tris 64
+```
+
+Per-mesh output for a multi-mesh scene (kitchen example):
+
+```powershell
+build\windows-vs2022\bin\Release\NaniteBuilder.exe `
+  --input path\to\kitchen.obj `
+  --output data\nanite\kitchen `
+  --cluster-tris 128 `
+  --max-cluster-verts 256
+```
+
+This writes `data\nanite\kitchen_<mesh_name>.fnanite` for each non-empty mesh in the same output directory. Use `--combined` to produce a single `kitchen.fnanite` instead.
 
 ## NaniteLoader
 
@@ -135,23 +165,30 @@ NaniteLoader --input <asset.fnanite> [options]
 build\windows-vs2022\bin\Release\NaniteLoader.exe -i data\nanite\cube.fnanite --list-meshes --list-clusters
 ```
 
-## `.fnanite` file format (V1)
+## `.fnanite` file format (V2)
 
-The current on-disk format is **version 1** (`kNaniteVersion = 1`, magic `FNAN`). Layout:
+The on-disk format is **version 2** (`kNaniteVersion = 2`, magic `FNAN`). V1 files remain readable.
+
+Layout:
 
 ```text
-Header (counts, bounds, block offsets)
-Mesh table
-Material table (string-table name offsets)
-Cluster table
-Vertex buffer (32-byte Vertex records)
-Index buffer (uint32)
-String table (mesh and material names)
+Header (counts, bounds, chunk table offset)
+Chunk table
+Mesh / Material / Cluster / ClusterGroup / Hierarchy / Page tables
+Cluster vertex + index buffers
+Optional source geometry chunks (SourceMesh + SourceVertex + SourceIndex)
+String table
 ```
 
-Each cluster record stores mesh/material indices, vertex and index ranges, triangle count, axis-aligned bounds, bounding sphere, normal cone, geometric error, and surface area. The loader verifies that all ranges stay within the vertex and index buffers and that cluster bounds contain their vertices.
+**Embedded source geometry** (V2 extension, flag `kFlagHasSourceGeometry`):
 
-Version 2 (chunk table, cluster groups, hierarchy, pages) is specified in [NANITE_IN_FALCOR_PLAN.md](./NANITE_IN_FALCOR_PLAN.md) §3.6–3.7 and is not implemented yet.
+- `SourceMesh` — per-section metadata (name, material, ranges, bounds)
+- `SourceVertex` — uncompressed pre-cluster vertices (position, normal, UV)
+- `SourceIndex` — uint32 triangle indices into the source vertex buffer
+
+This mirrors the UE static-mesh workflow: one logical mesh per `.fnanite`, with source data retained for offline re-bake via `--rebuild-from-source`.
+
+Version 1 layout (fixed offsets, no source chunk) is still supported for existing assets such as `cube.fnanite` built before this extension.
 
 ## Sample assets
 

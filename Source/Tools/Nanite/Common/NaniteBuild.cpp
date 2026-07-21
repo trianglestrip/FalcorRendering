@@ -639,4 +639,73 @@ Asset buildNaniteAsset(const InputScene& scene, const BuildOptions& options)
     if (asset.meshes.empty()) throw std::runtime_error("No meshes were converted into Nanite clusters.");
     return asset;
 }
+
+void embedSourceGeometry(Asset& asset, const InputScene& scene)
+{
+    asset.sourceMeshes.clear();
+    asset.sourceMeshes.reserve(scene.meshes.size());
+    for (const InputMesh& mesh : scene.meshes)
+    {
+        if (mesh.indices.empty()) continue;
+
+        SourceMeshSection section{};
+        section.name = mesh.name;
+        if (mesh.materialIndex < scene.materialNames.size())
+            section.materialName = scene.materialNames[mesh.materialIndex];
+        else if (!scene.materialNames.empty())
+            section.materialName = scene.materialNames.front();
+        else
+            section.materialName = "default";
+        section.vertices = mesh.vertices;
+        section.indices = mesh.indices;
+        section.bounds = mesh.bounds;
+        asset.sourceMeshes.push_back(std::move(section));
+    }
+
+    if (!asset.sourceMeshes.empty()) asset.flags |= kFlagHasSourceGeometry;
+}
+
+InputScene inputSceneFromSource(const Asset& asset)
+{
+    if (!hasSourceGeometry(asset))
+    {
+        throw std::runtime_error("Asset does not contain embedded source geometry.");
+    }
+
+    InputScene scene;
+    scene.sourcePath = asset.sourcePath;
+    scene.bounds = emptyBounds();
+
+    std::unordered_map<std::string, uint32_t> materialIndexByName;
+    auto getMaterialIndex = [&](const std::string& name) -> uint32_t
+    {
+        auto it = materialIndexByName.find(name);
+        if (it != materialIndexByName.end()) return it->second;
+
+        const uint32_t index = static_cast<uint32_t>(scene.materialNames.size());
+        scene.materialNames.push_back(name);
+        materialIndexByName.emplace(name, index);
+        return index;
+    };
+
+    scene.meshes.reserve(asset.sourceMeshes.size());
+    for (const SourceMeshSection& section : asset.sourceMeshes)
+    {
+        InputMesh mesh{};
+        mesh.name = section.name;
+        mesh.materialIndex = getMaterialIndex(section.materialName);
+        mesh.vertices = section.vertices;
+        mesh.indices = section.indices;
+        mesh.bounds = section.bounds;
+        include(scene.bounds, mesh.bounds);
+        scene.meshes.push_back(std::move(mesh));
+    }
+
+    if (scene.meshes.empty())
+    {
+        throw std::runtime_error("Embedded source geometry does not contain any mesh sections.");
+    }
+
+    return scene;
+}
 }

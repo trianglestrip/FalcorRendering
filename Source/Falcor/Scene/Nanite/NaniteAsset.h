@@ -16,6 +16,7 @@ class NaniteAsset : public Object
     FALCOR_OBJECT(NaniteAsset)
 public:
     static ref<NaniteAsset> create(ref<Device> pDevice, const std::filesystem::path& path);
+    static ref<NaniteAsset> create(ref<Device> pDevice, Nanite::Asset asset);
 
     NaniteAsset(ref<Device> pDevice, Nanite::Asset asset);
 

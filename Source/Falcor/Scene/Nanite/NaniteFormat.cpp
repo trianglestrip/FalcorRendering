@@ -159,6 +159,17 @@ struct DiskPageDesc
     uint32_t byteSize = 0;
 };
 
+struct DiskSourceMesh
+{
+    uint32_t nameOffset = 0;
+    uint32_t materialNameOffset = 0;
+    uint32_t vertexOffset = 0;
+    uint32_t vertexCount = 0;
+    uint32_t indexOffset = 0;
+    uint32_t indexCount = 0;
+    Bounds bounds{};
+};
+
 static_assert(sizeof(Vertex) == 32);
 
 template<typename T>
@@ -348,6 +359,72 @@ uint64_t triangleCount(const Asset& asset)
     uint64_t count = 0;
     for (const Cluster& cluster : asset.clusters) count += cluster.triangleCount;
     return count;
+}
+
+bool hasSourceGeometry(const Asset& asset)
+{
+    return (asset.flags & kFlagHasSourceGeometry) != 0 && !asset.sourceMeshes.empty();
+}
+
+void buildSourceDiskData(
+    const Asset& asset,
+    std::vector<char>& strings,
+    std::vector<DiskSourceMesh>& diskMeshes,
+    std::vector<Vertex>& vertices,
+    std::vector<uint32_t>& indices
+)
+{
+    diskMeshes.reserve(asset.sourceMeshes.size());
+    for (const SourceMeshSection& section : asset.sourceMeshes)
+    {
+        DiskSourceMesh disk{};
+        disk.nameOffset = addString(strings, section.name);
+        disk.materialNameOffset = addString(strings, section.materialName);
+        disk.vertexOffset = static_cast<uint32_t>(vertices.size());
+        disk.vertexCount = static_cast<uint32_t>(section.vertices.size());
+        disk.indexOffset = static_cast<uint32_t>(indices.size());
+        disk.indexCount = static_cast<uint32_t>(section.indices.size());
+        disk.bounds = section.bounds;
+        diskMeshes.push_back(disk);
+        vertices.insert(vertices.end(), section.vertices.begin(), section.vertices.end());
+        indices.insert(indices.end(), section.indices.begin(), section.indices.end());
+    }
+}
+
+void readSourceMeshes(
+    const std::vector<DiskSourceMesh>& diskMeshes,
+    const std::vector<Vertex>& vertices,
+    const std::vector<uint32_t>& indices,
+    const std::vector<char>& strings,
+    Asset& asset
+)
+{
+    asset.sourceMeshes.clear();
+    asset.sourceMeshes.reserve(diskMeshes.size());
+    for (const DiskSourceMesh& disk : diskMeshes)
+    {
+        SourceMeshSection section{};
+        section.name = readString(strings, disk.nameOffset);
+        section.materialName = readString(strings, disk.materialNameOffset);
+        section.bounds = disk.bounds;
+
+        if (disk.vertexOffset > vertices.size() || disk.vertexCount > vertices.size() - disk.vertexOffset)
+        {
+            throw std::runtime_error("Invalid source vertex range in .fnanite file.");
+        }
+        if (disk.indexOffset > indices.size() || disk.indexCount > indices.size() - disk.indexOffset)
+        {
+            throw std::runtime_error("Invalid source index range in .fnanite file.");
+        }
+
+        section.vertices.assign(
+            vertices.begin() + disk.vertexOffset,
+            vertices.begin() + disk.vertexOffset + disk.vertexCount);
+        section.indices.assign(
+            indices.begin() + disk.indexOffset,
+            indices.begin() + disk.indexOffset + disk.indexCount);
+        asset.sourceMeshes.push_back(std::move(section));
+    }
 }
 
 void buildMetadataTables(Asset& asset, uint32_t groupClusters)
@@ -556,9 +633,11 @@ void writeAsset(const std::filesystem::path& path, const Asset& asset, const Wri
     }
 
     const bool useCompression = options.compressVertices && !options.debugUncompressed;
+    const bool embedSource = options.embedSource && !assetCopy.sourceMeshes.empty();
     uint32_t fileFlags = 0;
     if (useCompression) fileFlags |= kFlagCompressedVertices;
     if (options.debugUncompressed) fileFlags |= kFlagDebugUncompressed;
+    if (embedSource) fileFlags |= kFlagHasSourceGeometry;
 
     std::vector<char> strings;
     addString(strings, assetCopy.sourcePath);
@@ -658,6 +737,14 @@ void writeAsset(const std::filesystem::path& path, const Asset& asset, const Wri
     std::vector<CompressedVertex> compressedVertices;
     if (useCompression) compressedVertices = compressVertices(assetCopy);
 
+    std::vector<DiskSourceMesh> sourceMeshes;
+    std::vector<Vertex> sourceVertices;
+    std::vector<uint32_t> sourceIndices;
+    if (embedSource)
+    {
+        buildSourceDiskData(assetCopy, strings, sourceMeshes, sourceVertices, sourceIndices);
+    }
+
     std::vector<ChunkDesc> chunks;
     auto addChunk = [&](ChunkType type, const auto& data)
     {
@@ -679,6 +766,12 @@ void writeAsset(const std::filesystem::path& path, const Asset& asset, const Wri
     else
         addChunk(ChunkType::Vertex, assetCopy.vertices);
     addChunk(ChunkType::Index, assetCopy.indices);
+    if (embedSource)
+    {
+        addChunk(ChunkType::SourceMesh, sourceMeshes);
+        addChunk(ChunkType::SourceVertex, sourceVertices);
+        addChunk(ChunkType::SourceIndex, sourceIndices);
+    }
     if (!strings.empty()) addChunk(ChunkType::StringTable, strings);
 
     DiskHeaderV2 header{};
@@ -725,6 +818,12 @@ void writeAsset(const std::filesystem::path& path, const Asset& asset, const Wri
     else
         writeArray(stream, assetCopy.vertices);
     writeArray(stream, assetCopy.indices);
+    if (embedSource)
+    {
+        writeArray(stream, sourceMeshes);
+        writeArray(stream, sourceVertices);
+        writeArray(stream, sourceIndices);
+    }
     if (!strings.empty()) stream.write(strings.data(), static_cast<std::streamsize>(strings.size()));
     if (!stream) throw std::runtime_error("Failed to write .fnanite file: " + path.string());
 }
@@ -827,6 +926,9 @@ Asset readAssetV2(std::ifstream& stream, const DiskHeaderV2& header, uint64_t fi
     const ChunkDesc* vertexChunk = findChunk(chunks, ChunkType::Vertex);
     const ChunkDesc* compressedChunk = findChunk(chunks, ChunkType::CompressedVertex);
     const ChunkDesc* indexChunk = findChunk(chunks, ChunkType::Index);
+    const ChunkDesc* sourceMeshChunk = findChunk(chunks, ChunkType::SourceMesh);
+    const ChunkDesc* sourceVertexChunk = findChunk(chunks, ChunkType::SourceVertex);
+    const ChunkDesc* sourceIndexChunk = findChunk(chunks, ChunkType::SourceIndex);
     const ChunkDesc* stringChunk = findChunk(chunks, ChunkType::StringTable);
 
     if (!meshChunk || !materialChunk || !clusterChunk || !indexChunk)
@@ -986,6 +1088,25 @@ Asset readAssetV2(std::ifstream& stream, const DiskHeaderV2& header, uint64_t fi
     const uint32_t indexCount = static_cast<uint32_t>(indexChunk->size / sizeof(uint32_t));
     asset.indices = readArray<uint32_t>(stream, indexChunk->offset, indexCount, fileSize, "index");
 
+    if (sourceMeshChunk && sourceVertexChunk && sourceIndexChunk)
+    {
+        const uint32_t sourceMeshCount = static_cast<uint32_t>(sourceMeshChunk->size / sizeof(DiskSourceMesh));
+        const uint32_t sourceVertexCount = static_cast<uint32_t>(sourceVertexChunk->size / sizeof(Vertex));
+        const uint32_t sourceIndexCount = static_cast<uint32_t>(sourceIndexChunk->size / sizeof(uint32_t));
+        const auto diskSourceMeshes = readArray<DiskSourceMesh>(
+            stream, sourceMeshChunk->offset, sourceMeshCount, fileSize, "source mesh");
+        const auto sourceVertices = readArray<Vertex>(
+            stream, sourceVertexChunk->offset, sourceVertexCount, fileSize, "source vertex");
+        const auto sourceIndices = readArray<uint32_t>(
+            stream, sourceIndexChunk->offset, sourceIndexCount, fileSize, "source index");
+        readSourceMeshes(diskSourceMeshes, sourceVertices, sourceIndices, strings, asset);
+        asset.flags |= kFlagHasSourceGeometry;
+    }
+    else if (sourceMeshChunk || sourceVertexChunk || sourceIndexChunk)
+    {
+        throw std::runtime_error("Incomplete source geometry chunks in .fnanite file.");
+    }
+
     if (asset.clusterGroups.empty() || asset.hierarchyNodes.empty() || asset.pages.empty())
     {
         buildMetadataTables(asset, 32);
@@ -1100,6 +1221,107 @@ std::vector<std::string> validateAsset(const Asset& asset)
     }
 
     return errors;
+}
+
+std::vector<std::string> validateSourceGeometry(const Asset& asset)
+{
+    std::vector<std::string> errors;
+    if (!hasSourceGeometry(asset)) return errors;
+
+    for (size_t sectionIndex = 0; sectionIndex < asset.sourceMeshes.size(); ++sectionIndex)
+    {
+        const SourceMeshSection& section = asset.sourceMeshes[sectionIndex];
+        if (section.vertices.empty()) errors.push_back("Source section " + std::to_string(sectionIndex) + " has no vertices.");
+        if (section.indices.empty()) errors.push_back("Source section " + std::to_string(sectionIndex) + " has no indices.");
+        if (section.indices.size() % 3 != 0)
+        {
+            errors.push_back("Source section " + std::to_string(sectionIndex) + " has a non-triangle index count.");
+        }
+
+        for (uint32_t index : section.indices)
+        {
+            if (index >= section.vertices.size())
+            {
+                errors.push_back("Source section " + std::to_string(sectionIndex) + " has an out-of-range index.");
+                break;
+            }
+        }
+    }
+
+    return errors;
+}
+
+namespace
+{
+void appendAsset(Asset& dest, Asset src)
+{
+    const uint32_t meshOffset = static_cast<uint32_t>(dest.meshes.size());
+    const uint32_t materialOffset = static_cast<uint32_t>(dest.materials.size());
+    const uint32_t clusterOffset = static_cast<uint32_t>(dest.clusters.size());
+    const uint32_t vertexOffset = static_cast<uint32_t>(dest.vertices.size());
+    const uint32_t indexOffset = static_cast<uint32_t>(dest.indices.size());
+
+    dest.materials.insert(dest.materials.end(), std::make_move_iterator(src.materials.begin()), std::make_move_iterator(src.materials.end()));
+
+    for (Mesh& mesh : src.meshes)
+    {
+        mesh.firstCluster += clusterOffset;
+        mesh.firstMaterial += materialOffset;
+        dest.meshes.push_back(std::move(mesh));
+    }
+
+    for (Cluster& cluster : src.clusters)
+    {
+        cluster.meshIndex += meshOffset;
+        cluster.materialIndex += materialOffset;
+        cluster.vertexOffset += vertexOffset;
+        cluster.indexOffset += indexOffset;
+        dest.clusters.push_back(std::move(cluster));
+    }
+
+    dest.vertices.insert(dest.vertices.end(), std::make_move_iterator(src.vertices.begin()), std::make_move_iterator(src.vertices.end()));
+    dest.indices.insert(dest.indices.end(), std::make_move_iterator(src.indices.begin()), std::make_move_iterator(src.indices.end()));
+    dest.sourceMeshes.insert(
+        dest.sourceMeshes.end(),
+        std::make_move_iterator(src.sourceMeshes.begin()),
+        std::make_move_iterator(src.sourceMeshes.end()));
+    dest.clusterDebugInfo.insert(
+        dest.clusterDebugInfo.end(),
+        std::make_move_iterator(src.clusterDebugInfo.begin()),
+        std::make_move_iterator(src.clusterDebugInfo.end()));
+
+    dest.partitionStats.totalLocalVertices += src.partitionStats.totalLocalVertices;
+    dest.partitionStats.boundarySourceVertices += src.partitionStats.boundarySourceVertices;
+    dest.partitionStats.interClusterEdges += src.partitionStats.interClusterEdges;
+    dest.sourceTriangleCount += src.sourceTriangleCount;
+    dest.degenerateTriangleCount += src.degenerateTriangleCount;
+
+    if (isEmpty(dest.bounds))
+    {
+        dest.bounds = src.bounds;
+    }
+    else
+    {
+        include(dest.bounds, src.bounds);
+    }
+}
+} // namespace
+
+Asset mergeAssets(const std::vector<std::filesystem::path>& paths)
+{
+    if (paths.empty()) throw std::runtime_error("mergeAssets requires at least one .fnanite path.");
+
+    Asset merged{};
+    merged.bounds = emptyBounds();
+    merged.version = kNaniteVersion;
+
+    for (const std::filesystem::path& path : paths)
+    {
+        appendAsset(merged, readAsset(path));
+    }
+
+    buildMetadataTables(merged, 32);
+    return merged;
 }
 
 } // namespace Falcor::Nanite
