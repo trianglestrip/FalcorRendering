@@ -29,6 +29,19 @@ set(FALCOR_USE_SYSTEM_PYTHON OFF CACHE BOOL "Use system Python distribution")
 # Enable/disable USD.
 set(FALCOR_ENABLE_USD ON CACHE BOOL "Enable USD")
 
+# ── Minimal build options (default ON = full build, OFF = strip module) ──
+option(FALCOR_ENABLE_NANITE       "Enable Nanite virtual geometry" ON)
+option(FALCOR_ENABLE_SDFS         "Enable SDF grids" ON)
+option(FALCOR_ENABLE_DIFFREND     "Enable differentiable rendering" ON)
+option(FALCOR_ENABLE_ANIMATION    "Enable animation/skinning" ON)
+option(FALCOR_ENABLE_CURVES       "Enable curve rendering" ON)
+option(FALCOR_ENABLE_VOLUMES      "Enable volume rendering" ON)
+option(FALCOR_ENABLE_DISPLACEMENT "Enable displacement mapping" ON)
+option(FALCOR_ENABLE_MERL         "Enable MERL measured materials" ON)
+option(FALCOR_ENABLE_RGL          "Enable RGL materials" ON)
+option(FALCOR_ENABLE_HAIRCLOTH    "Enable hair/cloth materials" ON)
+option(FALCOR_ENABLE_PBRT_MAT     "Enable PBRT materials" ON)
+
 
 # Enable/disable Address Sanitizer.
 set(FALCOR_ENABLE_ASAN OFF CACHE BOOL "Enable Address Sanitizer")
@@ -250,7 +263,7 @@ function(target_copy_shaders target output_dir)
 
     # Create custom commands for copying shader sources.
     foreach(file ${target_sources_})
-        if(${file} MATCHES ${SHADER_EXTENSION_REGEX})
+        if("${file}" MATCHES "${SHADER_EXTENSION_REGEX}")
             if(IS_ABSOLUTE ${file})
                 file(RELATIVE_PATH file ${target_source_dir} ${file})
             endif()

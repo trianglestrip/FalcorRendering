@@ -1,5 +1,6 @@
 # Build folder.
 /build/
+**/build/
 
 # Local SDK export folder.
 /sdk/

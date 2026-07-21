@@ -1,6 +1,6 @@
 add_library(Falcor SHARED)
 
-target_sources(Falcor PRIVATE
+set(FALCOR_ALL_SRCS
     Falcor.natvis
     Falcor.manifest
 
@@ -810,6 +810,8 @@ target_sources(Falcor PRIVATE
     ../../external/imgui_addons/imguinodegrapheditor/imguinodegrapheditor.h
     ../../external/imgui_addons/imguinodegrapheditor/imguinodegrapheditor.cpp
 )
+
+target_sources(Falcor PRIVATE ${FALCOR_ALL_SRCS})
 
 target_copy_shaders(Falcor .)
 
