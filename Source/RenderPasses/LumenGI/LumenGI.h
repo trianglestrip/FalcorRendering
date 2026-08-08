@@ -30,7 +30,9 @@
 #include "Falcor.h"
 #include "RenderGraph/RenderPass.h"
 #include "Utils/Sampling/SampleGenerator.h"
+#include "Rendering/Lights/LightBVHSampler.h"
 #include "LumenGIStats.h"
+#include "Capture/LumenCaptureScheduler.h" // Brings in Cards/LumenCardScene.h and SurfaceCache/LumenSurfaceCache.h.
 
 using namespace Falcor;
 
@@ -134,10 +136,58 @@ private:
     void ensureTraceResources();
     void readbackCounters(RenderContext* pRenderContext);
 
+    // ------------------------------------------------------------------------------------------
+    // S2: Surface Cache / Cards capture host
+    // ------------------------------------------------------------------------------------------
+    void invalidateCaptureResources();
+    void ensureCaptureResources(RenderContext* pRenderContext);
+    void createCaptureProgram();
+    void runSurfaceCacheCapture(RenderContext* pRenderContext, IScene::UpdateFlags updateFlags);
+    void runCapturePass(RenderContext* pRenderContext, const LumenCaptureFrame& frame);
+
+    ///< Per-scene card placement (Agent A). Rebuilt on setScene() and on geometry changes.
+    std::unique_ptr<LumenCardScene> mpCardScene;
+
+    ///< Tile-atlas page allocator (Agent B). The frame tick (endFrame()) is owned by
+    ///< mCaptureScheduler.scheduleFrame(); the host never calls it directly.
+    LumenSurfaceCache mPageCache;
+
+    ///< Dirty-card -> page -> capture-command scheduler (Agent H, S2-A2). Re-pointed at
+    ///< mpCardScene and mPageCache on setScene().
+    LumenCaptureSchedulerForScene mCaptureScheduler;
+
+    ///< Capture pass GPU resources. Created lazily by ensureCaptureResources(), scene-scoped,
+    ///< all named. Formats/sizes/lifetimes documented next to their creation in the .cpp.
+    struct
+    {
+        ref<Program> pProgram;       ///< LumenCardCapture.3d.slang (vsMain/psMain) + scene material shader modules.
+        ref<ProgramVars> pVars;      ///< Graphics vars with the scene parameter block (gScene) bound.
+        ref<GraphicsState> pState;   ///< FBO-less raster state; viewport and VAO are set per capture command.
+        ref<Vao> pVao32;             ///< Scene mesh VAO with R32 index buffer format; DRAW_ID = scene geometry instance ID.
+        ref<Vao> pVao16;             ///< Same VAO with R16 index buffer format (meshes with 16-bit indices).
+        ref<Buffer> pInstanceIDs;    ///< Per-instance identity buffer (element i == i), R32Uint, vertex slot 1.
+        ref<Buffer> pCards;          ///< gCards StructuredBuffer<LumenCard> (96 B/card), SRV, full upload per frame.
+        ref<Buffer> pPageTable;      ///< cardIndex -> pageID (uint32), SRV, host mirror upload per frame.
+        ref<Buffer> pDrawArgs;       ///< Per-command indirect draw arguments (20 B each), IndirectArg bind.
+        ref<Texture> pMaterialAtlas; ///< Material atlas, RGBA8 (base color + opacity), UAV + SRV.
+        ref<Texture> pRadianceAtlas; ///< Radiance atlas, RGBA16F, UAV + SRV; stale pages cleared by the shader.
+        ref<Texture> pMetadataAtlas; ///< Metadata atlas, RGBA16F (depth/flags/normal octahedral), UAV + SRV.
+    } mCapture;
+
+    uint32_t mAtlasSizeTexels = kLumenSurfaceCacheDefaultAtlasSize;        ///< Atlas side in texels (normalized to whole tiles).
+    uint32_t mCapturePagesPerSide = kLumenSurfaceCacheDefaultPagesPerSide; ///< Tiles per atlas side (bound as gPagesPerSide).
+    uint32_t mCaptureMaxPagesPerFrame = kLumenCaptureDefaultMaxPagesPerFrame; ///< Per-frame capture budget in pages.
+    std::vector<uint32_t> mCardPageTable; ///< Host mirror cardIndex -> pageID (kLumenCardInvalidID when no page is assigned).
+    LumenCaptureFrameStats mLastCaptureFrameStats; ///< Stats of the last scheduleFrame() call, for the UI.
+
     ref<Scene> mpScene;
     sigs::Connection mUpdateFlagsConnection;
     IScene::UpdateFlags mSceneUpdates = IScene::UpdateFlags::None;
     bool mLightCollectionInitialized = false;
+
+    ///< Emissive light BVH sampler for secondary-hit NEE; scene-scoped (rebuilt on setScene).
+    std::unique_ptr<LightBVHSampler> mpEmissiveLightSampler;
+
     ref<ComputePass> mpDebugPass;
     ref<SampleGenerator> mpSampleGenerator;
 

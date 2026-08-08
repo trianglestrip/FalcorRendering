@@ -34,6 +34,7 @@ import Scene.Intersection;
 import Utils.Math.MathHelpers;
 import Utils.Geometry.GeometryHelpers;
 import Utils.Sampling.SampleGenerator;
+import Rendering.Lights.EmissiveLightSampler;
 import LumenHitLighting;
 import RenderPasses.LumenGI.LumenGIData;
 import RenderPasses.LumenGI.Lighting.LumenGILighting;
@@ -80,6 +81,11 @@ RWTexture2D<float> gConfidence;
 // tracing path runs unmodified when the host has not wired them.
 RWStructuredBuffer<uint4> gLumenGICounters;
 RWTexture2D<float4> gLightingComponents;
+
+// Optional emissive light sampler (LightBVH or Null depending on the
+// _EMISSIVE_LIGHT_SAMPLER_TYPE define set by the host). The Null sampler
+// ignores all calls, so the resource may stay unbound.
+EmissiveLightSampler emissiveSampler;
 
 /** Payload for the single diffuse indirect ray (24 bytes).
  *
@@ -262,7 +268,7 @@ void handleLumenIndirectHit(const HitInfo hit, inout LumenIndirectPayload payloa
         sampleNext1D(sampleGenerator);
 
     LumenGILightingComponents components;
-    const LumenHitLightingResult lighting = evaluateLumenHitLighting(sd, materialInstance, sampleGenerator, components);
+    const LumenHitLightingResult lighting = evaluateLumenHitLighting(sd, materialInstance, emissiveSampler, sampleGenerator, components);
 
     float fireflyFlag;
     payload.radiance = finalizeLumenRadiance(lighting.radiance, fireflyFlag);

@@ -1,4 +1,4 @@
-/***************************************************************************
+﻿/***************************************************************************
  # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
  #
  # Redistribution and use in source and binary forms, with or without
@@ -34,6 +34,7 @@ namespace
 {
 const char kShaderFile[] = "RenderPasses/LumenGI/LumenGIDebug.cs.slang";
 const char kTraceShaderFile[] = "RenderPasses/LumenGI/Tracing/LumenHardwareTrace.rt.slang";
+const char kCaptureShaderFile[] = "RenderPasses/LumenGI/Capture/LumenCardCapture.3d.slang";
 
 const uint32_t kTracePayloadSizeBytes = 24u;
 const uint32_t kTraceRecursionDepth = 1u;
@@ -48,6 +49,17 @@ const char kUseScreenProbes[] = "useScreenProbes";
 const char kUseTemporalFilter[] = "useTemporalFilter";
 const char kUseSpatialFilter[] = "useSpatialFilter";
 const char kUseRadianceCache[] = "useRadianceCache";
+const char kSurfaceCacheAtlasSize[] = "surfaceCacheAtlasSize";
+const char kCaptureMaxPagesPerFrame[] = "captureMaxPagesPerFrame";
+
+///< Camera margin in front of the captured card face, in meters. Mirrors
+///< kLumenCardCaptureDefaultNearMargin in LumenCardCaptureData.slang (frozen with Agent C).
+const float kCaptureNearMargin = 0.01f;
+
+///< Byte size of one indirect draw argument slot. DrawIndexedArguments is 5 x uint32
+///< (20 B) and DrawArguments is 4 x uint32 (16 B, IndirectCommands.h); a uniform 20-byte
+///< stride is used for both so the GPU-side offset is always commandIndex * 20.
+constexpr uint32_t kCaptureDrawArgBytes = 20u;
 
 const ChannelList kInputChannels = {
     // clang-format off
@@ -85,7 +97,14 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registr
     ScriptBindings::registerBinding(registerBindings);
 }
 
-LumenGI::LumenGI(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
+LumenGI::LumenGI(ref<Device> pDevice, const Properties& props)
+    : RenderPass(pDevice)
+    , mPageCache(
+          kLumenSurfaceCacheDefaultAtlasSize,
+          kLumenSurfaceCacheDefaultMemoryBudgetBytes,
+          kLumenMinResidencyFrames
+      )
+    , mCaptureScheduler(nullptr, &mPageCache, kLumenCaptureDefaultMaxPagesPerFrame, kLumenCaptureDefaultInFlightTimeoutFrames)
 {
     if (!mpDevice->isShaderModelSupported(ShaderModel::SM6_5))
         FALCOR_THROW("LumenGI requires Shader Model 6.5 support.");
@@ -93,6 +112,17 @@ LumenGI::LumenGI(ref<Device> pDevice, const Properties& props) : RenderPass(pDev
         FALCOR_THROW("LumenGI requires Raytracing Tier 1.1 support.");
 
     parseProperties(props);
+
+    // Normalize the configured atlas size to whole tiles and rebuild the CPU components with
+    // it. The scheduler re-points at mpCardScene and mPageCache on setScene().
+    const uint32_t tileCount = std::max<uint32_t>(1u, mAtlasSizeTexels / kLumenSurfaceCacheTileSize);
+    mAtlasSizeTexels = tileCount * kLumenSurfaceCacheTileSize;
+    mCapturePagesPerSide = tileCount;
+    mPageCache = LumenSurfaceCache(mAtlasSizeTexels, kLumenSurfaceCacheDefaultMemoryBudgetBytes, kLumenMinResidencyFrames);
+    mCaptureScheduler = LumenCaptureSchedulerForScene(
+        mpCardScene.get(), &mPageCache, mCaptureMaxPagesPerFrame, kLumenCaptureDefaultInFlightTimeoutFrames
+    );
+
     mpSampleGenerator = SampleGenerator::create(mpDevice, SAMPLE_GENERATOR_DEFAULT);
     FALCOR_ASSERT(mpSampleGenerator);
     createDebugPass();
@@ -122,6 +152,10 @@ void LumenGI::parseProperties(const Properties& props)
             mUseSpatialFilter = value;
         else if (key == kUseRadianceCache)
             mUseRadianceCache = value;
+        else if (key == kSurfaceCacheAtlasSize)
+            mAtlasSizeTexels = value;
+        else if (key == kCaptureMaxPagesPerFrame)
+            mCaptureMaxPagesPerFrame = value;
         else
             logWarning("Unknown property '{}' in LumenGI properties.", key);
     }
@@ -140,6 +174,8 @@ Properties LumenGI::getProperties() const
     props[kUseTemporalFilter] = mUseTemporalFilter;
     props[kUseSpatialFilter] = mUseSpatialFilter;
     props[kUseRadianceCache] = mUseRadianceCache;
+    props[kSurfaceCacheAtlasSize] = mAtlasSizeTexels;
+    props[kCaptureMaxPagesPerFrame] = mCaptureMaxPagesPerFrame;
     return props;
 }
 
@@ -184,6 +220,9 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
         resetHistory();
     }
 
+    // Snapshot the accumulated scene updates before they are consumed below: both the
+    // existing trace path and the S2 capture path need the same flag value.
+    const IScene::UpdateFlags sceneUpdates = mSceneUpdates;
     if (mSceneUpdates != IScene::UpdateFlags::None)
     {
         if (is_set(mSceneUpdates, IScene::UpdateFlags::RecompileNeeded) ||
@@ -223,6 +262,22 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     mTracer.pProgram->addDefine("is_valid_gLightingComponents", mpLightingComponents ? "1" : "0");
     mTracer.pProgram->addDefines(mpSampleGenerator->getDefines());
 
+    // Secondary-hit emissive next-event estimation: create and bind the LightBVH
+    // sampler when the scene has active emissive lights. The sampler owns a BVH
+    // over the emissive triangles and is scene-scoped (rebuilt on setScene).
+    if (mpScene->useEmissiveLights())
+    {
+        if (!mpEmissiveLightSampler)
+            mpEmissiveLightSampler = std::make_unique<LightBVHSampler>(pRenderContext, mpScene->getILightCollection(pRenderContext));
+        mpEmissiveLightSampler->update(pRenderContext, mpScene->getILightCollection(pRenderContext));
+        mTracer.pProgram->addDefines(mpEmissiveLightSampler->getDefines());
+        mTracer.pProgram->addDefine("LUMEN_GI_HAS_EMISSIVE_SAMPLER", "1");
+    }
+    else
+    {
+        mTracer.pProgram->addDefine("LUMEN_GI_HAS_EMISSIVE_SAMPLER", "0");
+    }
+
     if (!mTracer.pVars)
         prepareTraceVars();
 
@@ -237,6 +292,8 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     traceVar["gConfidence"] = renderData.getTexture("confidence");
     traceVar["gLumenGICounters"] = mpLumenGICounters;
     traceVar["gLightingComponents"] = mpLightingComponents;
+    if (mpEmissiveLightSampler)
+        mpEmissiveLightSampler->bindShaderData(traceVar["emissiveSampler"]);
 
     // Clear the per-pixel lighting components before the trace so pixels
     // without a primary hit (sky, out-of-bounds) are not read as stale data.
@@ -254,6 +311,11 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
         pRenderContext->copyResource(mpLumenGICountersReadback.get(), mpLumenGICounters.get());
         mCounterReadbackPending = true;
     }
+
+    // S2: Surface Cache / Cards capture. Pure additive work gated behind mUseSurfaceCache;
+    // when disabled the pass behaves exactly like the S1 baseline.
+    if (mUseSurfaceCache)
+        runSurfaceCacheCapture(pRenderContext, sceneUpdates);
 
     if (!mpDebugPass)
         createDebugPass();
@@ -311,6 +373,59 @@ void LumenGI::renderUI(Gui::Widgets& widget)
         std::to_string(mCounters.tracedSamples)
     );
 
+    if (auto group = widget.group("Surface cache capture", true))
+    {
+        if (mpCardScene)
+        {
+            group.text(
+                "Cards: " + std::to_string(mpCardScene->getCardCount()) +
+                " (dirty: " + std::to_string(mpCardScene->getDirtyCardCount()) + ")"
+            );
+            group.text(
+                "Instances (supported / unsupported): " + std::to_string(mpCardScene->getSupportedInstanceCount()) +
+                " / " + std::to_string(mpCardScene->getUnsupportedInstanceCount())
+            );
+        }
+
+        const LumenSurfaceCacheStats cacheStats = mPageCache.getStats();
+        group.text(
+            "Pages: " + std::to_string(cacheStats.allocatedPageCount) + " / " + std::to_string(cacheStats.pageCount) +
+            " (free " + std::to_string(cacheStats.freePageCount) + ", evict-pending " +
+            std::to_string(cacheStats.evictedPendingCount) + ")"
+        );
+        group.text(
+            "Resident: " + std::to_string(cacheStats.residentBytes >> 20) + " MiB / budget " +
+            std::to_string(cacheStats.memoryBudgetBytes >> 20) + " MiB (min residency " +
+            std::to_string(cacheStats.minResidencyFrames) + " frames)"
+        );
+
+        const LumenCaptureSchedulerStats schedulerStats = mCaptureScheduler.getStats();
+        group.text(
+            "Last frame: commands " + std::to_string(mLastCaptureFrameStats.captureCommands) +
+            " (new pages " + std::to_string(mLastCaptureFrameStats.newPageAllocations) +
+            ", recaptures " + std::to_string(mLastCaptureFrameStats.recaptureWithPage) +
+            ", alloc failures " + std::to_string(mLastCaptureFrameStats.allocationFailures) +
+            ", lost " + std::to_string(mLastCaptureFrameStats.lostPages) +
+            ", released " + std::to_string(mLastCaptureFrameStats.releasedPages) +
+            ", pending " + std::to_string(mLastCaptureFrameStats.pendingCards) + ")"
+        );
+        group.text(
+            "Totals: alloc " + std::to_string(schedulerStats.totalAllocations) +
+            ", recapture " + std::to_string(schedulerStats.totalRecaptures) +
+            ", fail " + std::to_string(schedulerStats.totalAllocationFailures) +
+            ", lost " + std::to_string(schedulerStats.totalLostPages) +
+            ", release " + std::to_string(schedulerStats.totalReleases) +
+            ", complete " + std::to_string(schedulerStats.completedCaptures) +
+            ", rebuilds " + std::to_string(schedulerStats.structuralRebuildCount)
+        );
+        group.text(
+            "Atlas: " + std::to_string(mAtlasSizeTexels) + " texels (" + std::to_string(mCapturePagesPerSide) + " x " +
+            std::to_string(mCapturePagesPerSide) + " tiles of " + std::to_string(kLumenSurfaceCacheTileSize) + " texels)"
+        );
+        group.slider("Capture pages / frame", mCaptureMaxPagesPerFrame, 1u, 256u);
+        mCaptureScheduler.setMaxPagesPerFrame(mCaptureMaxPagesPerFrame);
+    }
+
     if (dirty)
     {
         mOptionsChanged = true;
@@ -327,7 +442,20 @@ void LumenGI::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mTracer.pBindingTable = nullptr;
     mTracer.pVars = nullptr;
     mLightCollectionInitialized = false;
+    mpEmissiveLightSampler = nullptr;
     resetHistory();
+
+    // S2: rebuild the card scene and reset the CPU components. invalidateCaptureResources()
+    // drops every GPU resource that references the old scene's mesh buffers (atlases persist:
+    // they are fixed-size and their contents are re-captured). The scheduler releases all
+    // pages it holds; the cache reset afterwards is a no-op for those pages, so both orders
+    // are safe (the scheduler contract allows either).
+    invalidateCaptureResources();
+    mpCardScene = pScene ? std::make_unique<LumenCardScene>(pScene) : nullptr;
+    mPageCache.reset();
+    mCaptureScheduler = LumenCaptureSchedulerForScene(
+        mpCardScene.get(), &mPageCache, mCaptureMaxPagesPerFrame, kLumenCaptureDefaultInFlightTimeoutFrames
+    );
 
     if (mpScene)
     {
@@ -344,6 +472,7 @@ void LumenGI::onHotReload(HotReloadFlags reloaded)
         mTracer.pProgram = nullptr;
         mTracer.pBindingTable = nullptr;
         mTracer.pVars = nullptr;
+        invalidateCaptureResources();
         resetHistory();
     }
 }
@@ -477,4 +606,309 @@ void LumenGI::readbackCounters(RenderContext* pRenderContext)
         mpLumenGICountersReadback->unmap();
     }
     mCounterReadbackPending = false;
+}
+
+// ------------------------------------------------------------------------------------------
+// S2: Surface Cache / Cards capture host
+// ------------------------------------------------------------------------------------------
+
+void LumenGI::invalidateCaptureResources()
+{
+    // Drop every capture resource that is scene-scoped or program-scoped. The atlas textures
+    // are deliberately kept: they are fixed-size and their pages are re-captured on demand.
+    mCapture.pProgram = nullptr;
+    mCapture.pVars = nullptr;
+    mCapture.pState = nullptr;
+    mCapture.pVao32 = nullptr;
+    mCapture.pVao16 = nullptr;
+    mCapture.pInstanceIDs = nullptr;
+    mCapture.pCards = nullptr;
+    mCapture.pPageTable = nullptr;
+    mCapture.pDrawArgs = nullptr;
+    mCardPageTable.clear();
+}
+
+void LumenGI::ensureCaptureResources(RenderContext* pRenderContext)
+{
+    if (!mpScene || !mpCardScene)
+        return;
+
+    // Atlas textures. Fixed size (mAtlasSizeTexels per side), UAV + SRV, cleared once at
+    // creation: material/radiance zero (opacity 0 = "not captured", radiance 0), metadata
+    // zero (flags 0 = invalid). Captured pages are overwritten by the shader.
+    if (!mCapture.pMaterialAtlas)
+    {
+        mCapture.pMaterialAtlas = mpDevice->createTexture2D(
+            mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::RGBA8Unorm, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mCapture.pMaterialAtlas->setName("LumenGI::Capture::MaterialAtlas"); // RGBA8, 4 B/texel, atlas lifetime.
+        pRenderContext->clearUAV(mCapture.pMaterialAtlas->getUAV().get(), float4(0.f));
+    }
+    if (!mCapture.pRadianceAtlas)
+    {
+        mCapture.pRadianceAtlas = mpDevice->createTexture2D(
+            mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mCapture.pRadianceAtlas->setName("LumenGI::Capture::RadianceAtlas"); // RGBA16F, 8 B/texel, atlas lifetime.
+        pRenderContext->clearUAV(mCapture.pRadianceAtlas->getUAV().get(), float4(0.f));
+    }
+    if (!mCapture.pMetadataAtlas)
+    {
+        mCapture.pMetadataAtlas = mpDevice->createTexture2D(
+            mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mCapture.pMetadataAtlas->setName("LumenGI::Capture::MetadataAtlas"); // RGBA16F, 8 B/texel, atlas lifetime.
+        pRenderContext->clearUAV(mCapture.pMetadataAtlas->getUAV().get(), float4(0.f));
+    }
+
+    const uint32_t cardCount = mpCardScene->getCardCount();
+
+    // gCards: StructuredBuffer<LumenCard>, 96 B/card, full upload every capture frame. The
+    // buffer (and the host page-table mirror) is recreated when the card count changes
+    // (geometry rebuild), which also resets the page table to invalid.
+    if (cardCount > 0 && (!mCapture.pCards || mCapture.pCards->getElementCount() != cardCount))
+    {
+        mCapture.pCards = mpDevice->createStructuredBuffer(sizeof(LumenCard), cardCount, ResourceBindFlags::ShaderResource);
+        mCapture.pCards->setName("LumenGI::Capture::Cards"); // StructuredBuffer<LumenCard>, 96 B stride, scene-scoped.
+        mCardPageTable.assign(cardCount, kLumenCardInvalidID);
+        mCapture.pPageTable = mpDevice->createStructuredBuffer(sizeof(uint32_t), cardCount, ResourceBindFlags::ShaderResource);
+        mCapture.pPageTable->setName("LumenGI::Capture::PageTable"); // cardIndex -> pageID, uint32, scene-scoped.
+    }
+
+    // Indirect draw argument blob: one 20-byte argument per command. Capacity = the per-frame
+    // capture budget (the scheduler never emits more commands than the budget); recreated
+    // when the budget grows past the current capacity (the UI slider can raise it at runtime).
+    const uint32_t maxCommands = std::max<uint32_t>(1u, mCaptureMaxPagesPerFrame);
+    if (!mCapture.pDrawArgs || mCapture.pDrawArgs->getSize() < (size_t)maxCommands * kCaptureDrawArgBytes)
+    {
+        mCapture.pDrawArgs = mpDevice->createBuffer(
+            (size_t)maxCommands * kCaptureDrawArgBytes, ResourceBindFlags::IndirectArg, MemoryType::DeviceLocal, nullptr
+        );
+        mCapture.pDrawArgs->setName("LumenGI::Capture::DrawArgs"); // DrawIndexedArguments/DrawArguments blob, scene-scoped.
+    }
+
+    if (!mCapture.pProgram)
+        createCaptureProgram();
+}
+
+void LumenGI::runSurfaceCacheCapture(RenderContext* pRenderContext, IScene::UpdateFlags updateFlags)
+{
+    if (!mpScene || !mpCardScene)
+        return;
+
+    // Structural scene changes invalidate the capture program/vars/VAOs and the card buffer
+    // (scene defines, mesh buffers and card indices may all have changed).
+    if (is_set(updateFlags, IScene::UpdateFlags::GeometryChanged) ||
+        is_set(updateFlags, IScene::UpdateFlags::MeshesChanged) ||
+        is_set(updateFlags, IScene::UpdateFlags::RecompileNeeded))
+    {
+        invalidateCaptureResources();
+    }
+
+    // Per-frame contract with the scheduler (Agent H): update the card scene with the same
+    // flags that scheduleFrame() receives, run the emitted commands through the capture pass,
+    // then complete them. endFrame() of the page cache happens inside scheduleFrame().
+    mpCardScene->update(pRenderContext, updateFlags);
+    ensureCaptureResources(pRenderContext);
+    if (!mCapture.pProgram)
+        return;
+
+    const LumenCaptureFrame frame = mCaptureScheduler.scheduleFrame(updateFlags);
+    mLastCaptureFrameStats = frame.stats;
+
+    // Full cards upload: the capture shader indexes gCards by gCardIndex, so every card must
+    // be current. (A dirty-range upload is future work; 96 B x card count is small.)
+    if (mCapture.pCards && mpCardScene->getCardCount() > 0)
+    {
+        const uint32_t count = mpCardScene->getCardCount();
+        std::vector<LumenCard> cards;
+        cards.reserve(count);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            cards.push_back(mpCardScene->getCard(i));
+        }
+        mCapture.pCards->setBlob(cards.data(), 0, cards.size() * sizeof(LumenCard));
+    }
+
+    // Page table upload: refresh the entries touched by this frame's commands. Entries go
+    // stale only transiently (an evicted page is re-allocated and re-emitted by the
+    // scheduler, which rewrites the entry; S3 consumers must check generation, future work).
+    if (!frame.commands.empty())
+    {
+        for (const LumenCaptureCommand& cmd : frame.commands)
+        {
+            if (cmd.cardIndex < mCardPageTable.size())
+                mCardPageTable[cmd.cardIndex] = cmd.pageID;
+        }
+    }
+    if (mCapture.pPageTable && !mCardPageTable.empty())
+    {
+        mCapture.pPageTable->setBlob(mCardPageTable.data(), 0, mCardPageTable.size() * sizeof(uint32_t));
+    }
+
+    if (!frame.commands.empty())
+        runCapturePass(pRenderContext, frame);
+
+    mCaptureScheduler.completeCaptures(frame.commands);
+}
+
+void LumenGI::runCapturePass(RenderContext* pRenderContext, const LumenCaptureFrame& frame)
+{
+    FALCOR_ASSERT(mCapture.pState && mCapture.pVars && mCapture.pCards && mCapture.pDrawArgs);
+    const uint32_t commandCount = (uint32_t)frame.commands.size();
+    if (commandCount == 0)
+        return;
+
+    // Per-command indirect draw arguments, one 20-byte slot per command (see
+    // kCaptureDrawArgBytes). Indexed meshes use DrawIndexedArguments (IndexCount,
+    // InstanceCount, StartIndex, BaseVertex, StartInstance); non-indexed meshes use
+    // DrawArguments (VertexCount, InstanceCount, StartVertex, StartInstance) - the 5th word
+    // of the slot is ignored by drawIndirect.
+    std::vector<uint32_t> args(commandCount * 5u);
+    for (uint32_t i = 0; i < commandCount; ++i)
+    {
+        const LumenCaptureCommand& cmd = frame.commands[i];
+        const LumenCard& card = mpCardScene->getCard(cmd.cardIndex);
+        const MeshDesc& mesh = mpScene->getMesh(MeshID::fromSlang(card.meshID));
+        const bool use16Bit = mesh.use16BitIndices();
+        const bool indexed = mesh.indexCount > 0;
+        args[i * 5u + 0u] = indexed ? mesh.indexCount : mesh.vertexCount;
+        args[i * 5u + 1u] = 1u; // InstanceCount.
+        args[i * 5u + 2u] = indexed ? (mesh.ibOffset * (use16Bit ? 2u : 1u)) : mesh.vbOffset;
+        args[i * 5u + 3u] = indexed ? mesh.vbOffset : 0u;
+        args[i * 5u + 4u] = card.instanceID; // StartInstanceLocation; the per-instance buffer is the identity map.
+    }
+    mCapture.pDrawArgs->setBlob(args.data(), 0, args.size() * sizeof(uint32_t));
+
+    auto var = mCapture.pVars->getRootVar();
+    var["gCards"] = mCapture.pCards;
+    var["gMaterialAtlas"] = mCapture.pMaterialAtlas;
+    var["gRadianceAtlas"] = mCapture.pRadianceAtlas;
+    var["gMetadataAtlas"] = mCapture.pMetadataAtlas;
+
+    for (uint32_t i = 0; i < commandCount; ++i)
+    {
+        const LumenCaptureCommand& cmd = frame.commands[i];
+        const LumenCard& card = mpCardScene->getCard(cmd.cardIndex);
+        const MeshDesc& mesh = mpScene->getMesh(MeshID::fromSlang(card.meshID));
+        const bool use16Bit = mesh.use16BitIndices();
+
+        // Viewport (and scissor) = the page texel region of the atlases, so SV_Position.xy
+        // inside the pixel shader is directly the atlas coordinate (Agent C contract).
+        const LumenSurfaceCacheCoord coord = mPageCache.getPageAtlasCoord(cmd.pageID);
+        const uint32_t originX = coord.atlasX * kLumenSurfaceCacheTileSize;
+        const uint32_t originY = coord.atlasY * kLumenSurfaceCacheTileSize;
+        mCapture.pState->setViewport(
+            0,
+            GraphicsState::Viewport(
+                (float)originX, (float)originY, (float)kLumenSurfaceCacheTileSize,
+                (float)kLumenSurfaceCacheTileSize, 0.f, 1.f
+            ),
+            true
+        );
+        mCapture.pState->setVao(use16Bit ? mCapture.pVao16 : mCapture.pVao32);
+
+        // Per-draw capture parameters (LumenCardCaptureCB, field layout in
+        // LumenCardCaptureData.slang). gPageTexelOrigin mirrors the Agent B formula and is
+        // used by the shader for debug writes only.
+        var["LumenCardCaptureCB"]["gCardIndex"] = cmd.cardIndex;
+        var["LumenCardCaptureCB"]["gPageID"] = cmd.pageID;
+        var["LumenCardCaptureCB"]["gPagesPerSide"] = mCapturePagesPerSide;
+        var["LumenCardCaptureCB"]["gPageTexelOrigin"] = uint2(originX, originY);
+        var["LumenCardCaptureCB"]["gNearMargin"] = kCaptureNearMargin;
+
+        const uint64_t argOffset = (uint64_t)i * kCaptureDrawArgBytes;
+        if (mesh.indexCount > 0)
+            pRenderContext->drawIndexedIndirect(mCapture.pState.get(), mCapture.pVars.get(), 1, mCapture.pDrawArgs.get(), argOffset, nullptr, 0);
+        else
+            pRenderContext->drawIndirect(mCapture.pState.get(), mCapture.pVars.get(), 1, mCapture.pDrawArgs.get(), argOffset, nullptr, 0);
+    }
+}
+
+void LumenGI::createCaptureProgram()
+{
+    FALCOR_ASSERT(mpScene && mpCardScene);
+
+    // Raster program: material system modules + the capture shader. The scene defines and
+    // type conformances come from the scene; they may change on geometry rebuilds, which is
+    // why this is recreated through invalidateCaptureResources() in that case.
+    ProgramDesc desc;
+    desc.addShaderModules(mpScene->getShaderModules());
+    desc.addShaderLibrary(kCaptureShaderFile).vsEntry("vsMain").psEntry("psMain");
+    desc.addTypeConformances(mpScene->getTypeConformances());
+    mCapture.pProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
+    // Optional resource defines (the shader defaults the rest: gCards/gMaterialAtlas/
+    // gMetadataAtlas are required and default to enabled). The params/debug atlases are not
+    // created in the MVP.
+    mCapture.pProgram->addDefine("is_valid_gRadianceAtlas", "1");
+    mCapture.pProgram->addDefine("is_valid_gMaterialParamsAtlas", "0");
+    mCapture.pProgram->addDefine("is_valid_gDebugTexture", "0");
+
+    mCapture.pVars = ProgramVars::create(mpDevice, mCapture.pProgram.get());
+    mpScene->bindShaderData(mCapture.pVars->getRootVar()["gScene"]);
+
+    // FBO-less raster state: all capture outputs are UAVs (RasterPass precedent). Backface
+    // rejection is done in the pixel shader (single-sided materials), so no culling here.
+    mCapture.pState = GraphicsState::create(mpDevice);
+    mCapture.pState->setProgram(mCapture.pProgram);
+    mCapture.pState->setRasterizerState(
+        RasterizerState::create(RasterizerState::Desc().setCullMode(RasterizerState::CullMode::None))
+    );
+
+    // Mesh VAOs. The scene's own VAO cannot be reused directly: its per-instance buffer
+    // stores draw-list indices, which only equal the scene geometry instance ID for scenes
+    // without displaced meshes/curves. Instead we bind a per-instance identity buffer
+    // (element i == i) and draw with StartInstanceLocation = scene instance ID, so the
+    // shader's DRAW_ID semantic (= gScene instance index, Agent C contract) is always the
+    // true geometry instance ID. The vertex layout mirrors the scene's (PackedStaticVertexData
+    // in buffer 0, per-instance ID in buffer 1), and the shared global index buffer supports
+    // both 16- and 32-bit index formats via two VAOs.
+    const ref<Vao>& pSceneVao = mpScene->getMeshVao();
+    if (pSceneVao && pSceneVao->getVertexBuffersCount() >= 2u)
+    {
+        const uint32_t instanceCount = std::max<uint32_t>(1u, mpScene->getGeometryInstanceCount());
+        std::vector<uint32_t> identity(instanceCount);
+        for (uint32_t i = 0; i < instanceCount; ++i)
+        {
+            identity[i] = i;
+        }
+        mCapture.pInstanceIDs = mpDevice->createBuffer(
+            instanceCount * sizeof(uint32_t), ResourceBindFlags::Vertex, MemoryType::DeviceLocal, identity.data()
+        );
+        mCapture.pInstanceIDs->setName("LumenGI::Capture::InstanceIDs"); // R32Uint identity map, scene-scoped.
+
+        ref<VertexLayout> pLayout = VertexLayout::create();
+        ref<VertexBufferLayout> pStaticLayout = VertexBufferLayout::create();
+        pStaticLayout->addElement(
+            VERTEX_POSITION_NAME, offsetof(PackedStaticVertexData, position), ResourceFormat::RGB32Float, 1, VERTEX_POSITION_LOC
+        );
+        pStaticLayout->addElement(
+            VERTEX_PACKED_NORMAL_TANGENT_CURVE_RADIUS_NAME,
+            offsetof(PackedStaticVertexData, packedNormalTangentCurveRadius),
+            ResourceFormat::RGB32Float, 1, VERTEX_PACKED_NORMAL_TANGENT_CURVE_RADIUS_LOC
+        );
+        pStaticLayout->addElement(
+            VERTEX_TEXCOORD_NAME, offsetof(PackedStaticVertexData, texCrd), ResourceFormat::RG32Float, 1, VERTEX_TEXCOORD_LOC
+        );
+        pLayout->addBufferLayout(0, pStaticLayout);
+        ref<VertexBufferLayout> pInstanceLayout = VertexBufferLayout::create();
+        pInstanceLayout->addElement(INSTANCE_DRAW_ID_NAME, 0, ResourceFormat::R32Uint, 1, INSTANCE_DRAW_ID_LOC);
+        pInstanceLayout->setInputClass(VertexBufferLayout::InputClass::PerInstanceData, 1);
+        pLayout->addBufferLayout(1, pInstanceLayout);
+
+        Vao::BufferVec pVBs(2);
+        pVBs[0] = pSceneVao->getVertexBuffer(0);
+        pVBs[1] = mCapture.pInstanceIDs;
+        const ref<Buffer>& pSceneIB = pSceneVao->getIndexBuffer();
+        mCapture.pVao32 = Vao::create(Vao::Topology::TriangleList, pLayout, pVBs, pSceneIB, ResourceFormat::R32Uint);
+        mCapture.pVao16 = Vao::create(Vao::Topology::TriangleList, pLayout, pVBs, pSceneIB, ResourceFormat::R16Uint);
+        // Scene mesh buffers (shared static VB + global IB), 32/16-bit index formats, scene-scoped.
+    }
+    else
+    {
+        logWarning("LumenGI: scene mesh VAO unavailable; card capture will be skipped.");
+    }
 }

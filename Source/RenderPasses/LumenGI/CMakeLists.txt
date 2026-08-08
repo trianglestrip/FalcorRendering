@@ -11,6 +11,7 @@ target_sources(LumenGI PRIVATE
     Tracing/LumenHardwareTrace.rt.slang
     Tracing/LumenHitLighting.slang
     Cards/LumenCardScene.h
+    Cards/LumenCardScene.cpp
     Cards/LumenCardPlacement.cs.slang
     SurfaceCache/LumenSurfaceCache.h
     Capture/LumenCardCaptureData.slang

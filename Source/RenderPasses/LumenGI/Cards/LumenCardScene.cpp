@@ -29,6 +29,8 @@
 #include "LumenCardScene.h"
 
 #include "Core/Error.h"
+#include "Scene/Scene.h"
+#include "Scene/Animation/AnimationController.h"
 #include <algorithm>
 
 namespace

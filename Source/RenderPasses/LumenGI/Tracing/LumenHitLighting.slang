@@ -38,6 +38,7 @@
 
 import Scene.Shading;
 import Utils.Sampling.SampleGenerator;
+import Rendering.Lights.EmissiveLightSampler;
 import RenderPasses.LumenGI.Lighting.LumenGILighting;
 import RenderPasses.LumenGI.Lighting.LumenGILightSampling;
 
@@ -51,6 +52,9 @@ import RenderPasses.LumenGI.Lighting.LumenGILightSampling;
 #endif
 #ifndef USE_EMISSIVE_LIGHTS
 #define USE_EMISSIVE_LIGHTS 1
+#endif
+#ifndef LUMEN_GI_HAS_EMISSIVE_SAMPLER
+#define LUMEN_GI_HAS_EMISSIVE_SAMPLER 0
 #endif
 
 /** Result of evaluating outgoing radiance at a secondary GI hit.
@@ -67,14 +71,17 @@ struct LumenHitLightingResult
 
 /** Evaluate the secondary-hit lighting used by the HWRT baseline.
 
-    Emissive lighting comes from the material system, analytic lighting from
-    a uniform light selection with next-event estimation (optionally MIS
-    weighted). The returned radiance is pre-clamp: the tracing shader applies
-    the radiance ceiling and the NaN/Inf guards before writing the payload.
+    Emissive lighting comes from the material system (emission) and, when the
+    host binds an emissive light sampler, from next-event estimation over the
+    emissive triangles. Analytic lighting is a uniform light selection with
+    next-event estimation (optionally MIS weighted). The returned radiance is
+    pre-clamp: the tracing shader applies the radiance ceiling and the NaN/Inf
+    guards before writing the payload.
 */
 LumenHitLightingResult evaluateLumenHitLighting(
     const ShadingData sd,
     const IMaterialInstance materialInstance,
+    const EmissiveLightSampler emissiveSampler,
     inout SampleGenerator sampleGenerator,
     out LumenGILightingComponents components
 )
@@ -82,6 +89,12 @@ LumenHitLightingResult evaluateLumenHitLighting(
     LumenHitLightingResult result = {};
     components.analyticRadiance = float3(0.f);
     components.emissiveRadiance = lumenGIEvaluateHitEmission(sd, materialInstance);
+
+#if USE_EMISSIVE_LIGHTS && LUMEN_GI_HAS_EMISSIVE_SAMPLER
+    LumenGILightSample emissiveSample;
+    if (lumenGISampleEmissiveLight(emissiveSampler, sd.posW, sd.faceN, true, sampleGenerator, emissiveSample))
+        components.emissiveRadiance += lumenGIEvaluateEmissiveLightingSample(sd, materialInstance, sampleGenerator, emissiveSample);
+#endif
 
 #if USE_ANALYTIC_LIGHTS
     LumenGILightSample lightSample;

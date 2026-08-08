@@ -281,3 +281,54 @@ float3 lumenGIEvaluateAnalyticLightingSample<S : ISampleGenerator>(
 
     return materialInstance.eval(sd, lightSample.direction, sampleGenerator) * lightSample.radianceOverPdf * misWeight;
 }
+
+/** Evaluate next-event direct lighting from a pre-sampled emissive triangle at
+    a secondary hit.
+
+    The estimator is f * cos * radianceOverPdf (radianceOverPdf = Le / pdf,
+    pdf with respect to solid angle from the shading point) with a visibility
+    test. The complementary BSDF-sampling technique (scatter a ray from the
+    hit to find emissive geometry) is not executed by the S1 single-bounce
+    model, so a balance weight would remove part of the integral without the
+    complementary technique being evaluated (identical reasoning to the
+    analytic path and to PathTracer's MIS exemption); the weight is therefore
+    1 by default. Set LUMEN_GI_ANALYTIC_LIGHT_MIS (shared with the analytic
+    path) to 1 only together with a scatter technique (S3 Surface Cache
+    lighting), where both strategies are executed and the balance weight is
+    unbiased.
+*/
+float3 lumenGIEvaluateEmissiveLightingSample<S : ISampleGenerator>(
+    const ShadingData sd,
+    const IMaterialInstance materialInstance,
+    inout S sampleGenerator,
+    const LumenGILightSample lightSample
+)
+{
+    // The sampled direction must lie in a hemisphere supported by the BSDF
+    // lobes (mirrors the analytic path and PathTracer's NEE test).
+    const uint lobeTypes = materialInstance.getLobeTypes(sd);
+    const bool hasReflection = (lobeTypes & uint(LobeType::Reflection)) != 0;
+    const bool hasTransmission = (lobeTypes & uint(LobeType::Transmission)) != 0;
+    const float NdotL = dot(sd.getOrientedFaceNormal(), lightSample.direction);
+    const bool validHemisphere = (NdotL > kMinCosTheta || hasTransmission) && (NdotL < -kMinCosTheta || hasReflection);
+    if (!validHemisphere)
+        return float3(0.f);
+
+    // Alpha-aware inline visibility query.
+    SceneRayQuery<1> sceneRayQuery;
+    if (!sceneRayQuery.traceVisibilityRay(lightSample.getVisibilityRay()))
+        return float3(0.f);
+
+    // MIS weight between the light-sampling technique and the BSDF-sampling
+    // technique evaluated at the light direction. Emissive sampling always
+    // has a positive pdf, so delta-light exemption is not needed here.
+    float misWeight = 1.f;
+#if LUMEN_GI_ANALYTIC_LIGHT_MIS
+    {
+        const float scatterPdf = materialInstance.evalPdf(sd, lightSample.direction, true);
+        misWeight = lumenGIEvalMIS(1.f, lightSample.pdf, 1.f, scatterPdf);
+    }
+#endif
+
+    return materialInstance.eval(sd, lightSample.direction, sampleGenerator) * lightSample.radianceOverPdf * misWeight;
+}
