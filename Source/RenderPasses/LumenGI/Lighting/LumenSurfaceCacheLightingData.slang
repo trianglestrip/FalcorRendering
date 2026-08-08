@@ -278,17 +278,24 @@ Texture2D<float4> gMaterialParamsAtlas;
 
 /** Environment sampler. Host: EnvMapSampler::bindShaderData(var["envMapSampler"])
     and LUMEN_GI_HAS_ENVIRONMENT_SAMPLER = 1 when created. Unbound ->
-    uniform-sphere fallback over gScene.envMap.
+    uniform-sphere fallback over gScene.envMap. The declaration is conditionally
+    compiled so the parameter (with its sampler state) only enters the root
+    signature when the host binds it.
 */
+#if LUMEN_GI_HAS_ENVIRONMENT_SAMPLER
 EnvMapSampler envMapSampler;
+#endif
 
 /** Emissive triangle sampler (LightBVHSampler in S3). Host:
     mpEmissiveSampler->bindShaderData(var["emissiveSampler"]) and
     LUMEN_GI_HAS_EMISSIVE_SAMPLER = 1, with the _EMISSIVE_LIGHT_SAMPLER_TYPE
     define from EmissiveLightSampler::getDefines(). Unbound (or the NULL
-    sampler type) -> emissive next-event term is a miss constant.
+    sampler type) -> emissive next-event term is a miss constant. The
+    declaration is conditional like the environment sampler above.
 */
+#if LUMEN_GI_HAS_EMISSIVE_SAMPLER
 EmissiveLightSampler emissiveSampler;
+#endif
 
 // --- Outputs (UAV) ---------------------------------------------------------
 

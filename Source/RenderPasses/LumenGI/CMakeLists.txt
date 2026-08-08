@@ -8,6 +8,8 @@ target_sources(LumenGI PRIVATE
     LumenGIStats.h
     Lighting/LumenGILighting.slang
     Lighting/LumenGILightSampling.slang
+    Lighting/LumenSurfaceCacheLighting.cs.slang
+    Lighting/LumenSurfaceCacheLightingData.slang
     Tracing/LumenHardwareTrace.rt.slang
     Tracing/LumenHitLighting.slang
     Cards/LumenCardScene.h

@@ -35,15 +35,22 @@ namespace
 const char kShaderFile[] = "RenderPasses/LumenGI/LumenGIDebug.cs.slang";
 const char kTraceShaderFile[] = "RenderPasses/LumenGI/Tracing/LumenHardwareTrace.rt.slang";
 const char kCaptureShaderFile[] = "RenderPasses/LumenGI/Capture/LumenCardCapture.3d.slang";
+const char kCacheLightingShaderFile[] = "RenderPasses/LumenGI/Lighting/LumenSurfaceCacheLighting.cs.slang";
 
 const uint32_t kTracePayloadSizeBytes = 24u;
 const uint32_t kTraceRecursionDepth = 1u;
+
+///< Fixed base seed for the cache-lighting RNG (task rule 5: every stochastic process must
+///< support a fixed seed). The shader rotates it per frame with kLumenGICacheSeedFrameStride,
+///< so adjacent frames sample different points while the sequence stays reproducible.
+const uint32_t kCacheLightingSeed = 0x51B8DC0Du;
 
 const char kEnabled[] = "enabled";
 const char kTraceMode[] = "traceMode";
 const char kQualityPreset[] = "qualityPreset";
 const char kDebugMode[] = "debugMode";
 const char kUseSurfaceCache[] = "useSurfaceCache";
+const char kUseCacheLighting[] = "useCacheLighting";
 const char kUseScreenTrace[] = "useScreenTrace";
 const char kUseScreenProbes[] = "useScreenProbes";
 const char kUseTemporalFilter[] = "useTemporalFilter";
@@ -60,6 +67,33 @@ const float kCaptureNearMargin = 0.01f;
 ///< (20 B) and DrawArguments is 4 x uint32 (16 B, IndirectCommands.h); a uniform 20-byte
 ///< stride is used for both so the GPU-side offset is always commandIndex * 20.
 constexpr uint32_t kCaptureDrawArgBytes = 20u;
+
+///< Host mirror of cbuffer LumenSurfaceCacheLightingCB in
+///< LumenSurfaceCacheLightingData.slang (frozen 48-byte layout). The host binds every field by
+///< name each dispatch; this struct only documents and static-asserts the GPU layout so a
+///< future root-side copy cannot drift from the shader contract.
+struct LumenSurfaceCacheLightingCB
+{
+    uint32_t gPagesPerSide;    // +0  Tiles per atlas side (must equal the allocator grid).
+    uint32_t gRenderPageCount; // +4  Pages lit this dispatch == dispatch X size.
+    uint32_t gFrameIndex;      // +8  Frame counter, rotates the per-frame RNG seed.
+    uint32_t gSeed;            // +12 Fixed base seed.
+    uint32_t gSamplesPerTexel; // +16 1/2/4/8 (LumenCacheLightingQuality).
+    uint32_t gDebugMode;       // +20 kLumenDebug* from LumenGIData.slang; inert without gDebugTexture.
+    uint32_t gAtlasSize[2];    // +24 Atlas size in texels.
+    float gNearMargin;         // +32 Card camera near margin (meters); <= 0 -> shader default.
+    uint32_t gReserved[2];     // +36 Padding to 48 bytes.
+};
+static_assert(sizeof(LumenSurfaceCacheLightingCB) == 44, "LumenSurfaceCacheLightingCB mirror is 44 bytes; slang cbuffer pads to 48 (16B-aligned)");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gPagesPerSide) == 0, "gPagesPerSide offset");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gRenderPageCount) == 4, "gRenderPageCount offset");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gFrameIndex) == 8, "gFrameIndex offset");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gSeed) == 12, "gSeed offset");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gSamplesPerTexel) == 16, "gSamplesPerTexel offset");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gDebugMode) == 20, "gDebugMode offset");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gAtlasSize) == 24, "gAtlasSize offset");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gNearMargin) == 32, "gNearMargin offset");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gReserved) == 36, "gReserved offset");
 
 const ChannelList kInputChannels = {
     // clang-format off
@@ -146,6 +180,8 @@ void LumenGI::parseProperties(const Properties& props)
             mDebugMode = value;
         else if (key == kUseSurfaceCache)
             mUseSurfaceCache = value;
+        else if (key == kUseCacheLighting)
+            mUseCacheLighting = value;
         else if (key == kUseScreenTrace)
             mUseScreenTrace = value;
         else if (key == kUseScreenProbes)
@@ -173,6 +209,7 @@ Properties LumenGI::getProperties() const
     props[kQualityPreset] = mQualityPreset;
     props[kDebugMode] = mDebugMode;
     props[kUseSurfaceCache] = mUseSurfaceCache;
+    props[kUseCacheLighting] = mUseCacheLighting;
     props[kUseScreenTrace] = mUseScreenTrace;
     props[kUseScreenProbes] = mUseScreenProbes;
     props[kUseTemporalFilter] = mUseTemporalFilter;
@@ -193,6 +230,17 @@ RenderPassReflection LumenGI::reflect(const CompileData& compileData)
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
         compileData.defaultTexDims
     );
+
+    // Scriptable S3 gate channel: exposes the internal radiance atlas (RGB = direct, linear)
+    // at atlas resolution for tests/lumengi/run_cachelighting.py (Agent N) and the S3 gate.
+    // Optional so it is only allocated when the graph marks it as an output; the host blits
+    // the atlas into it each frame (exportCacheDirectRadiance). RenderTarget flag is required
+    // for the blit's destination RTV.
+    auto& cacheDirect = reflector.addOutput(kCacheDirectRadiance, "Surface cache direct radiance atlas (RGB, linear)");
+    cacheDirect.texture2D(mAtlasSizeTexels, mAtlasSizeTexels);
+    cacheDirect.format(ResourceFormat::RGBA16Float);
+    cacheDirect.bindFlags(ResourceBindFlags::ShaderResource | ResourceBindFlags::RenderTarget);
+    cacheDirect.flags(RenderPassReflection::Field::Flags::Optional);
     return reflector;
 }
 
@@ -279,7 +327,14 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     }
     else
     {
+        // No emissive light sampler this frame. Falcor's Program::addDefine never removes a
+        // define, so pin the shader-side _EMISSIVE_LIGHT_SAMPLER_TYPE back to the Null sampler
+        // (EmissiveLightSamplerType::Null = 0xff); otherwise the typedef keeps resolving to the
+        // previously-bound LightBVH type across scene/light toggles and default-initializing a
+        // resource-typed sampler fails in dxc.
         mTracer.pProgram->addDefine("LUMEN_GI_HAS_EMISSIVE_SAMPLER", "0");
+        // EmissiveLightSamplerType::Null == 0xff (see EmissiveLightSamplerType.slangh).
+        mTracer.pProgram->addDefine("_EMISSIVE_LIGHT_SAMPLER_TYPE", "255");
     }
 
     if (!mTracer.pVars)
@@ -320,6 +375,18 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     // when disabled the pass behaves exactly like the S1 baseline.
     if (mUseSurfaceCache)
         runSurfaceCacheCapture(pRenderContext, sceneUpdates);
+
+    // S3: Surface Cache direct lighting (S3-B1). Runs AFTER the capture pass so this frame's
+    // freshly captured pages are lit immediately. Data dependency: the radiance atlas is only
+    // consumed by later stages (S3-B2 feedback, S4 cache queries) in FUTURE frames; the screen
+    // trace neither writes nor reads it, so placement after the trace/capture is safe either way.
+    // Requires useSurfaceCache (the atlases and card->page mirror only exist then).
+    if (mUseCacheLighting && mUseSurfaceCache)
+        runCacheLighting(pRenderContext);
+
+    // Scriptable S3 gate channel: copy the internal radiance atlas into the optional graph
+    // output (atlas-sized) so tests/lumengi can read the cache-direct radiance directly.
+    exportCacheDirectRadiance(pRenderContext, renderData);
 
     if (!mpDebugPass)
         createDebugPass();
@@ -401,6 +468,7 @@ void LumenGI::renderUI(Gui::Widgets& widget)
     if (auto group = widget.group("Features", true))
     {
         dirty |= group.checkbox("Surface cache", mUseSurfaceCache);
+        dirty |= group.checkbox("Cache lighting", mUseCacheLighting);
         dirty |= group.checkbox("Screen trace", mUseScreenTrace);
         dirty |= group.checkbox("Screen probes", mUseScreenProbes);
         dirty |= group.checkbox("Temporal filter", mUseTemporalFilter);
@@ -469,6 +537,25 @@ void LumenGI::renderUI(Gui::Widgets& widget)
         mCaptureScheduler.setMaxPagesPerFrame(mCaptureMaxPagesPerFrame);
     }
 
+    if (auto group = widget.group("Cache lighting", true))
+    {
+        group.text(
+            "Pages lit (last dispatch): " + std::to_string(mLastCacheLightingPageCount) +
+            " (samples/texel: " + std::to_string(cacheLightingSamplesPerTexel()) + ")"
+        );
+        group.text(
+            "Counters (NaN/Inf, firefly, negative, traced): " +
+            std::to_string(mCacheLightingCounters.nanInfSamples) + ", " +
+            std::to_string(mCacheLightingCounters.fireflySamples) + ", " +
+            std::to_string(mCacheLightingCounters.negativeSamples) + ", " +
+            std::to_string(mCacheLightingCounters.tracedSamples)
+        );
+        group.text(
+            "Env sampler: " + std::string(mpEnvMapSampler ? "created" : "none") +
+            "; emissive sampler: " + std::string(mpEmissiveLightSampler ? "created" : "none")
+        );
+    }
+
     if (dirty)
     {
         mOptionsChanged = true;
@@ -486,6 +573,10 @@ void LumenGI::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mTracer.pVars = nullptr;
     mLightCollectionInitialized = false;
     mpEmissiveLightSampler = nullptr;
+    mpEnvMapSampler = nullptr;
+    mCacheLightingCounters.reset();
+    mCacheLightingCounterReadbackPending = false;
+    mLastCacheLightingPageCount = 0;
     resetHistory();
 
     // S2: rebuild the card scene and reset the CPU components. invalidateCaptureResources()
@@ -715,6 +806,17 @@ std::map<std::string, double> LumenGI::getSurfaceCacheStats() const
     stats["lastLostPages"] = (double)last.lostPages;
     stats["lastTouchCalls"] = (double)last.touchCalls;
 
+    // S3: Surface Cache lighting state and counters. cacheLightingPagesLit is the dispatch
+    // size of the last run; the counters are the last completed dispatch's readback.
+    stats["useCacheLighting"] = mUseCacheLighting ? 1.0 : 0.0;
+    stats["cacheLightingActive"] = (mUseCacheLighting && mUseSurfaceCache) ? 1.0 : 0.0;
+    stats["cacheLightingPagesLit"] = (double)mLastCacheLightingPageCount;
+    stats["cacheLightingSamplesPerTexel"] = (double)cacheLightingSamplesPerTexel();
+    stats["cacheLightingCounterNanInf"] = (double)mCacheLightingCounters.nanInfSamples;
+    stats["cacheLightingCounterFirefly"] = (double)mCacheLightingCounters.fireflySamples;
+    stats["cacheLightingCounterNegative"] = (double)mCacheLightingCounters.negativeSamples;
+    stats["cacheLightingCounterTraced"] = (double)mCacheLightingCounters.tracedSamples;
+
     return stats;
 }
 
@@ -732,6 +834,12 @@ void LumenGI::invalidateCaptureResources()
     mCapture.pPageTable = nullptr;
     mCapture.pDrawArgs = nullptr;
     mCardPageTable.clear();
+    mCardPageGeneration.clear();
+    // S3: the cache lighting program carries the scene defines/type conformances and must be
+    // recreated on scene/geometry rebuilds. The pageToCard/renderList buffers and the visibility
+    // atlas are atlas-lifetime (fixed size) and are deliberately kept; their contents are rebuilt
+    // every frame.
+    mCacheLighting.pPass = nullptr;
 }
 
 void LumenGI::ensureCaptureResources(RenderContext* pRenderContext)
@@ -780,6 +888,7 @@ void LumenGI::ensureCaptureResources(RenderContext* pRenderContext)
         mCapture.pCards = mpDevice->createStructuredBuffer(sizeof(LumenCard), cardCount, ResourceBindFlags::ShaderResource);
         mCapture.pCards->setName("LumenGI::Capture::Cards"); // StructuredBuffer<LumenCard>, 96 B stride, scene-scoped.
         mCardPageTable.assign(cardCount, kLumenCardInvalidID);
+        mCardPageGeneration.assign(cardCount, 0u);
         mCapture.pPageTable = mpDevice->createStructuredBuffer(sizeof(uint32_t), cardCount, ResourceBindFlags::ShaderResource);
         mCapture.pPageTable->setName("LumenGI::Capture::PageTable"); // cardIndex -> pageID, uint32, scene-scoped.
     }
@@ -847,12 +956,18 @@ void LumenGI::runSurfaceCacheCapture(RenderContext* pRenderContext, IScene::Upda
     // Page table upload: refresh the entries touched by this frame's commands. Entries go
     // stale only transiently (an evicted page is re-allocated and re-emitted by the
     // scheduler, which rewrites the entry; S3 consumers must check generation, future work).
+    // mCardPageGeneration records the page generation each card received at its last command,
+    // so S3 can resolve the current page owner when it rebuilds the page->card table.
     if (!frame.commands.empty())
     {
         for (const LumenCaptureCommand& cmd : frame.commands)
         {
             if (cmd.cardIndex < mCardPageTable.size())
+            {
                 mCardPageTable[cmd.cardIndex] = cmd.pageID;
+                if (cmd.cardIndex < mCardPageGeneration.size())
+                    mCardPageGeneration[cmd.cardIndex] = cmd.generation;
+            }
         }
     }
     if (mCapture.pPageTable && !mCardPageTable.empty())
@@ -1021,5 +1136,295 @@ void LumenGI::createCaptureProgram()
     else
     {
         logWarning("LumenGI: scene mesh VAO unavailable; card capture will be skipped.");
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// S3: Surface Cache direct lighting host (S3-B1)
+// ------------------------------------------------------------------------------------------
+
+uint32_t LumenGI::cacheLightingSamplesPerTexel() const
+{
+    // LumenCacheLightingQuality mapping (LumenSurfaceCacheLightingData.slang):
+    // Low/Medium/High/Reference -> 1/2/4/8 NEE draws per texel per technique.
+    switch (mQualityPreset)
+    {
+    case QualityPreset::Low:
+        return 1u;
+    case QualityPreset::Medium:
+        return 2u;
+    case QualityPreset::High:
+        return 4u;
+    case QualityPreset::Reference:
+        return 8u;
+    default:
+        return 4u;
+    }
+}
+
+uint32_t LumenGI::buildCacheLightingRenderData()
+{
+    // Rebuild pageID -> cardIndex from the host card->page mirror (maintained from the
+    // scheduler command stream in runSurfaceCacheCapture) plus the page cache residency and
+    // the per-card page generation. A page maps to a card only when that card's recorded page
+    // generation equals the page cache's CURRENT generation for the page: after an eviction
+    // and reallocation the new owner's generation matches while every stale card->page entry
+    // has a mismatched (older) generation and is skipped, so gLumenPageToCard never points at
+    // a card that does not own the page. The render list is then every resident page with a
+    // valid owner (render-list mode; full-atlas mode would dispatch pagesPerSide^2
+    // threadgroups and light empty slots -- S3-A1's prioritized scheduling can trim this).
+    const uint32_t pageCount = mPageCache.getPageCount();
+    if (mPageToCardData.size() != pageCount + 1)
+        mPageToCardData.assign(pageCount + 1, kLumenCardInvalidID);
+    std::fill(mPageToCardData.begin(), mPageToCardData.end(), kLumenCardInvalidID);
+
+    const uint32_t cardCount = mpCardScene ? mpCardScene->getCardCount() : 0u;
+    if (mCardPageTable.size() != cardCount || mCardPageGeneration.size() != cardCount)
+        return 0u; // capture resources not initialized yet (no cards captured this frame).
+
+    for (uint32_t card = 0; card < cardCount; ++card)
+    {
+        const uint32_t pageID = mCardPageTable[card];
+        if (pageID == kInvalidPageID || pageID > pageCount)
+            continue;
+        if (!mPageCache.isPageAllocated(pageID))
+            continue;
+        if (mCardPageGeneration[card] != mPageCache.getGeneration(pageID))
+            continue;
+        mPageToCardData[pageID] = card;
+    }
+
+    mRenderListData.clear();
+    mRenderListData.reserve(pageCount);
+    for (uint32_t pageID = 1; pageID <= pageCount; ++pageID)
+    {
+        if (mPageToCardData[pageID] != kLumenCardInvalidID)
+            mRenderListData.push_back(pageID);
+    }
+    // D3D12 dispatch dimension cap: the X dimension of Dispatch is limited to 65535 thread
+    // groups. Only reachable when the whole 65536-page atlas becomes resident (~256 MiB),
+    // which the default per-frame budget cannot produce; clamp defensively.
+    constexpr uint32_t kMaxDispatchX = 65535u;
+    if (mRenderListData.size() > kMaxDispatchX)
+    {
+        logWarning("LumenGI: cache lighting render list clamped from {} to {} pages.", mRenderListData.size(), kMaxDispatchX);
+        mRenderListData.resize(kMaxDispatchX);
+    }
+    return (uint32_t)mRenderListData.size();
+}
+
+void LumenGI::createCacheLightingProgram()
+{
+    FALCOR_ASSERT(mpScene);
+
+    // Compute program: the lighting shader imports Scene.Scene / Scene.RaytracingInline for the
+    // scene block and inline shadow ray queries, but never evaluates materials, so it needs the
+    // scene's type conformances and defines (not the capture's VAO machinery). Mirrors the
+    // GBufferRTInline compute-pass pattern.
+    ProgramDesc desc;
+    desc.addShaderModules(mpScene->getShaderModules());
+    desc.addShaderLibrary(kCacheLightingShaderFile).csEntry("main");
+    desc.addTypeConformances(mpScene->getTypeConformances());
+    DefineList defines;
+    defines.add(mpScene->getSceneDefines());
+    defines.add(mpSampleGenerator->getDefines()); // SAMPLE_GENERATOR_TYPE selects the shader RNG type.
+    mCacheLighting.pPass = ComputePass::create(mpDevice, desc, defines, /*createVars=*/true);
+}
+
+void LumenGI::ensureCacheLightingResources(RenderContext* pRenderContext)
+{
+    // Visibility/confidence atlas: R16F, atlas-lifetime (kept across scene changes like the
+    // capture atlases; contents are re-written every dispatch).
+    if (!mCacheLighting.pVisibilityAtlas)
+    {
+        mCacheLighting.pVisibilityAtlas = mpDevice->createTexture2D(
+            mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::R16Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mCacheLighting.pVisibilityAtlas->setName("LumenGI::CacheLighting::VisibilityAtlas"); // R16F, atlas lifetime.
+        pRenderContext->clearUAV(mCacheLighting.pVisibilityAtlas->getUAV().get(), float4(0.f));
+    }
+
+    // gLumenPageToCard: one uint per page ID (index 0 unused; the shader guards pageID == 0).
+    // gLumenRenderList: capacity == page count; only the first renderPageCount entries are used.
+    const uint32_t pageCount = mPageCache.getPageCount();
+    if (!mCacheLighting.pPageToCard || mCacheLighting.pPageToCard->getElementCount() != pageCount + 1)
+    {
+        mCacheLighting.pPageToCard = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), pageCount + 1, ResourceBindFlags::ShaderResource
+        );
+        mCacheLighting.pPageToCard->setName("LumenGI::CacheLighting::PageToCard"); // gLumenPageToCard, uint32, atlas lifetime.
+    }
+    if (!mCacheLighting.pRenderList || mCacheLighting.pRenderList->getElementCount() != pageCount)
+    {
+        mCacheLighting.pRenderList = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), pageCount, ResourceBindFlags::ShaderResource
+        );
+        mCacheLighting.pRenderList->setName("LumenGI::CacheLighting::RenderList"); // gLumenRenderList, uint32, atlas lifetime.
+    }
+
+    // Independent cache-lighting counters (see the header comment: separate from the trace
+    // counters so the S1/S2 counter statistics stay unchanged). LumenGICounterIndex layout.
+    constexpr uint32_t kCounterCount = 4u;
+    if (!mpCacheLightingCounters)
+    {
+        mpCacheLightingCounters = mpDevice->createStructuredBuffer(
+            sizeof(uint4), kCounterCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mpCacheLightingCounters->setName("LumenGI::CacheLighting::Counters");
+    }
+    if (!mpCacheLightingCountersReadback)
+    {
+        mpCacheLightingCountersReadback = mpDevice->createStructuredBuffer(
+            sizeof(uint4), kCounterCount, ResourceBindFlags::None, MemoryType::ReadBack
+        );
+        mpCacheLightingCountersReadback->setName("LumenGI::CacheLighting::CountersReadback");
+    }
+
+    if (!mCacheLighting.pPass)
+        createCacheLightingProgram();
+}
+
+void LumenGI::runCacheLighting(RenderContext* pRenderContext)
+{
+    // Read back the previous dispatch's counters (one-frame lag, same as the trace path).
+    if (mCacheLightingCounterReadbackPending && mpCacheLightingCountersReadback)
+    {
+        const uint4* pCounters = static_cast<const uint4*>(mpCacheLightingCountersReadback->map());
+        if (pCounters)
+        {
+            mCacheLightingCounters.nanInfSamples = pCounters[0].x;
+            mCacheLightingCounters.fireflySamples = pCounters[1].x;
+            mCacheLightingCounters.negativeSamples = pCounters[2].x;
+            mCacheLightingCounters.tracedSamples = pCounters[3].x;
+            mpCacheLightingCountersReadback->unmap();
+        }
+        mCacheLightingCounterReadbackPending = false;
+    }
+
+    // EnvMapSampler lifecycle (scene-scoped, mirrors PathTracer.cpp): create when the scene has
+    // an env map, drop otherwise. Construction builds the importance map internally.
+    if (mpScene->useEnvLight())
+    {
+        if (!mpEnvMapSampler)
+            mpEnvMapSampler = std::make_unique<EnvMapSampler>(mpDevice, mpScene->getEnvMap());
+    }
+    else
+    {
+        mpEnvMapSampler = nullptr;
+    }
+
+    if (!mpCardScene || !mCapture.pCards || !mCapture.pMaterialAtlas || !mCapture.pRadianceAtlas ||
+        !mCapture.pMetadataAtlas)
+    {
+        return; // capture never ran; nothing to light.
+    }
+
+    ensureCacheLightingResources(pRenderContext);
+    if (!mCacheLighting.pPass || !mCacheLighting.pVisibilityAtlas || !mCacheLighting.pPageToCard ||
+        !mCacheLighting.pRenderList)
+    {
+        return;
+    }
+
+    const uint32_t renderPageCount = buildCacheLightingRenderData();
+    if (renderPageCount == 0)
+    {
+        mLastCacheLightingPageCount = 0;
+        return;
+    }
+
+    // Upload the two tables. The render list is re-uploaded in full every frame (small).
+    mCacheLighting.pPageToCard->setBlob(mPageToCardData.data(), 0, mPageToCardData.size() * sizeof(uint32_t));
+    mCacheLighting.pRenderList->setBlob(mRenderListData.data(), 0, renderPageCount * sizeof(uint32_t));
+
+    // Per-frame program specialization. Program::addDefine returns true only when a value
+    // changed; setVars(nullptr) recreates the vars (and thus the gScene binding) on change.
+    ref<Program> pProgram = mCacheLighting.pPass->getProgram();
+    bool programChanged = false;
+    programChanged |= pProgram->addDefine("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
+    programChanged |= pProgram->addDefine("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
+    programChanged |= pProgram->addDefine("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
+    programChanged |= pProgram->addDefine("LUMEN_GI_HAS_ENVIRONMENT_SAMPLER", mpEnvMapSampler ? "1" : "0");
+    programChanged |= pProgram->addDefine("LUMEN_GI_HAS_EMISSIVE_SAMPLER", mpEmissiveLightSampler ? "1" : "0");
+    if (mpEmissiveLightSampler)
+        programChanged |= pProgram->addDefines(mpEmissiveLightSampler->getDefines());
+    else
+        programChanged |= pProgram->addDefine("_EMISSIVE_LIGHT_SAMPLER_TYPE", "255"); // EmissiveLightSamplerType::Null, pin across toggles.
+    // LUMEN_GI_ANALYTIC_LIGHT_MIS stays 0 (single-technique NEE; only meaningful together with
+    // the S3-B2 BSDF-scatter feedback). LUMEN_GI_CACHE_LIGHTING_SHADOWS stays at the default 1
+    // (DXR 1.1 inline ray queries; the scene data is bound below).
+    programChanged |= pProgram->addDefine("is_valid_gMaterialParamsAtlas", "0");
+    programChanged |= pProgram->addDefine("is_valid_gLumenVisibilityAtlas", "1");
+    programChanged |= pProgram->addDefine("is_valid_gLumenGICounters", mpCacheLightingCounters ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gDebugTexture", "0");
+    if (programChanged)
+        mCacheLighting.pPass->setVars(nullptr);
+
+    // Bind the scene block (gScene.envMap fallback, light list) and the ray tracing data
+    // (TLAS for the inline shadow ray queries). Both are per-frame so a vars recreation is
+    // self-healing and the TLAS is rebuilt lazily only when the scene requires it.
+    ShaderVar cacheVar = mCacheLighting.pPass->getRootVar();
+    mpScene->bindShaderData(cacheVar["gScene"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, cacheVar["gScene"], 0u);
+
+    cacheVar["gCards"] = mCapture.pCards;
+    cacheVar["gMaterialAtlas"] = mCapture.pMaterialAtlas;
+    cacheVar["gMetadataAtlas"] = mCapture.pMetadataAtlas;
+    cacheVar["gRadianceAtlas"] = mCapture.pRadianceAtlas;
+    cacheVar["gLumenVisibilityAtlas"] = mCacheLighting.pVisibilityAtlas;
+    cacheVar["gLumenPageToCard"] = mCacheLighting.pPageToCard;
+    cacheVar["gLumenRenderList"] = mCacheLighting.pRenderList;
+    cacheVar["gLumenGICounters"] = mpCacheLightingCounters;
+    if (mpEnvMapSampler)
+        mpEnvMapSampler->bindShaderData(cacheVar["envMapSampler"]);
+    if (mpEmissiveLightSampler)
+        mpEmissiveLightSampler->bindShaderData(cacheVar["emissiveSampler"]);
+
+    // Constant buffer (LumenSurfaceCacheLightingCB; every field filled every dispatch).
+    ShaderVar cb = cacheVar["LumenSurfaceCacheLightingCB"];
+    cb["gPagesPerSide"] = mCapturePagesPerSide;
+    cb["gRenderPageCount"] = renderPageCount;
+    cb["gFrameIndex"] = mFrameIndex;
+    cb["gSeed"] = kCacheLightingSeed;
+    cb["gSamplesPerTexel"] = cacheLightingSamplesPerTexel();
+    cb["gDebugMode"] = static_cast<uint32_t>(mDebugMode);
+    cb["gAtlasSize"] = uint2(mAtlasSizeTexels, mAtlasSizeTexels);
+    cb["gNearMargin"] = kCaptureNearMargin;
+
+    // The counters must be cleared before each dispatch; copied to the readback buffer after.
+    if (mpCacheLightingCounters)
+        pRenderContext->clearUAV(mpCacheLightingCounters->getUAV().get(), uint4(0));
+
+    // One 16x16 threadgroup per page: ComputePass::execute takes THREAD counts, so the group
+    // count is nThreads / threadGroupSize. Passing (renderPageCount, 1, 1) threads would give
+    // ceil(renderPageCount/16) groups (wrong); multiply the X axis by the tile size so the
+    // dispatch issues exactly renderPageCount threadgroups (SV_GroupID.x == page index).
+    mCacheLighting.pPass->execute(
+        pRenderContext, uint3(renderPageCount * kLumenSurfaceCacheTileSize, kLumenSurfaceCacheTileSize, 1)
+    );
+
+    if (mpCacheLightingCounters && mpCacheLightingCountersReadback)
+    {
+        pRenderContext->copyResource(mpCacheLightingCountersReadback.get(), mpCacheLightingCounters.get());
+        mCacheLightingCounterReadbackPending = true;
+    }
+    mLastCacheLightingPageCount = renderPageCount;
+}
+
+void LumenGI::exportCacheDirectRadiance(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    const ref<Texture> pCacheDirect = renderData.getTexture(kCacheDirectRadiance);
+    if (!pCacheDirect)
+        return; // optional channel not allocated (graph does not mark it as an output).
+    if (mCapture.pRadianceAtlas)
+    {
+        // Whole-texture blit (point filter, no scaling): identical size/format (RGBA16F).
+        pRenderContext->blit(mCapture.pRadianceAtlas->getSRV(), pCacheDirect->getRTV());
+    }
+    else
+    {
+        // No atlas (surface cache off): keep the channel well-defined (zero) instead of stale.
+        pRenderContext->clearRtv(pCacheDirect->getRTV().get(), float4(0.f));
     }
 }

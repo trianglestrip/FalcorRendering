@@ -1,0 +1,101 @@
+############################################################################
+# LumenGI S3-C2 test scene: BLACK ROOM (no lights, no env, no emissive).
+#
+# Purpose
+# -------
+# Enforces the task.md 15.4 hard invariant "black scene does not brighten by
+# itself". A closed room made of DARK diffuse materials with NO light source
+# of any kind: no analytic light, no env map, no emissive triangle. One
+# light-gray box is present purely to give the tracer geometry to bounce off
+# -- its indirect radiance must also stay ~0. With the whole scene at ~0, any
+# self-brightening (leak from uninitialized radiance-atlas pages, multi-bounce
+# feedback gain, stale history) shows up as a growing diffuseGI mean.
+#
+# Consumed by
+# -----------
+# tests/lumengi/run_stability.py (S3-C2, Agent R). Loaded by ABSOLUTE PATH
+# (see tests/lumengi/scenes/cornell_pointlight.pyscene header for the
+# AssetResolver caveat). The scene cache key is derived from the absolute
+# path (SceneBuilder::computeSceneCacheKey); if the file is edited and stale
+# geometry shows up, delete the cache entry or load with cache disabled.
+#
+# Geometry layout mirrors media/test_scenes/cornell_box.pyscene so camera,
+# wall placement and scale match the rest of the S3 scene set.
+############################################################################
+
+# --- Materials: everything dark diffuse; one light-gray box (geometry only) ---
+
+floor = StandardMaterial('Floor')
+floor.baseColor = float4(0.02, 0.02, 0.02, 1.0)
+floor.roughness = 0.8
+
+backWall = StandardMaterial('Back Wall')
+backWall.baseColor = float4(0.02, 0.02, 0.02, 1.0)
+backWall.roughness = 0.8
+
+ceiling = StandardMaterial('Ceiling')
+ceiling.baseColor = float4(0.02, 0.02, 0.02, 1.0)
+ceiling.roughness = 0.8
+
+leftWall = StandardMaterial('Left Wall')
+leftWall.baseColor = float4(0.02, 0.02, 0.02, 1.0)
+leftWall.roughness = 0.8
+
+rightWall = StandardMaterial('Right Wall')
+rightWall.baseColor = float4(0.02, 0.02, 0.02, 1.0)
+rightWall.roughness = 0.8
+
+# The one light-ish object: gives the tracer geometry (and the surface-cache
+# cards) something to bounce off. 0.6 albedo with zero incident light is
+# still black; if any spurious energy appears it is most visible on this box.
+grayBox = StandardMaterial('Gray Box')
+grayBox.baseColor = float4(0.6, 0.6, 0.6, 1.0)
+grayBox.roughness = 0.6
+
+# Create geometry
+
+quadMesh = TriangleMesh.createQuad()
+cubeMesh = TriangleMesh.createCube()
+
+# Create mesh instances (room layout identical to cornell_box.pyscene)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Floor', Transform(scaling=float3(0.55, 1.0, 0.56))),
+    sceneBuilder.addTriangleMesh(quadMesh, floor)
+)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Ceiling', Transform(scaling=float3(0.55, 1.0, 0.56), translation=float3(0, 0.55, 0), rotationEulerDeg=float3(180, 0, 0))),
+    sceneBuilder.addTriangleMesh(quadMesh, ceiling)
+)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Back Wall', Transform(scaling=float3(0.55, 1.0, 0.56), translation=float3(0, 0.275, -0.275), rotationEulerDeg=float3(90, 0, 0))),
+    sceneBuilder.addTriangleMesh(quadMesh, backWall)
+)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Left Wall', Transform(scaling=float3(0.55, 1.0, 0.56), translation=float3(-0.275, 0.275, 0), rotationEulerDeg=float3(0, 0, -90))),
+    sceneBuilder.addTriangleMesh(quadMesh, leftWall)
+)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Right Wall', Transform(scaling=float3(0.55, 1.0, 0.56), translation=float3(0.275, 0.275, 0), rotationEulerDeg=float3(0, 0, 90))),
+    sceneBuilder.addTriangleMesh(quadMesh, rightWall)
+)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Gray Box', Transform(scaling=float3(0.165, 0.165, 0.165), translation=float3(0.09, 0.0825, 0.111), rotationEuler=float3(0, -0.29, 0))),
+    sceneBuilder.addTriangleMesh(cubeMesh, grayBox)
+)
+
+# NOTE: deliberately NO light source of any kind is added here.
+
+# Create camera (same as cornell_box.pyscene)
+
+camera = Camera()
+camera.position = float3(0, 0.28, 1.2)
+camera.target = float3(0, 0.28, 0)
+camera.up = float3(0, 1, 0)
+camera.focalLength = 35.0
+sceneBuilder.addCamera(camera)

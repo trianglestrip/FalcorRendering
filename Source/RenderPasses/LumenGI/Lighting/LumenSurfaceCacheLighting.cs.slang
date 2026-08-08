@@ -142,6 +142,7 @@ import Utils.Sampling.SampleGenerator;
 import Scene.Scene;
 import Scene.RaytracingInline;
 import Utils.Math.MathHelpers;
+import Rendering.Lights.EnvMapSampler;
 import RenderPasses.LumenGI.Lighting.LumenSurfaceCacheLightingData;
 import RenderPasses.LumenGI.Lighting.LumenGILightSampling;
 
@@ -442,7 +443,7 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 #endif
 
         // Environment next-event estimation.
-#if USE_ENV_LIGHT
+#if USE_ENV_LIGHT && LUMEN_GI_HAS_ENVIRONMENT_SAMPLER
         {
             LumenGILightSample lightSample;
             if (lumenCacheSampleEnvironment(envMapSampler, positionW, normalW, sampleGenerator, lightSample))
@@ -469,7 +470,7 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 
         // Emissive triangle next-event estimation. With no sampler bound the
         // estimate degrades to a miss constant (see the data module).
-#if USE_EMISSIVE_LIGHTS
+#if USE_EMISSIVE_LIGHTS && LUMEN_GI_HAS_EMISSIVE_SAMPLER
         {
             LumenGILightSample lightSample;
             if (lumenGISampleEmissiveLight(emissiveSampler, positionW, normalW, true, sampleGenerator, lightSample))

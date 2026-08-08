@@ -1,0 +1,121 @@
+############################################################################
+# LumenGI S3-C2 test scene: STRONG EMISSIVE GLOW.
+#
+# Purpose
+# -------
+# Enforces the task.md 15.4 invariants "no NaN/Inf", "radiance non-negative"
+# and the firefly-clamp expectation ("emissive can light adjacent surfaces")
+# under a BRIGHT emissive source: emitted radiance (1700, 1200, 400) --
+# emissiveColor (17, 12, 4) * emissiveFactor 100, i.e. "emissiveColor * 100".
+#
+# The adjacent neutral-gray walls/boxes must be visibly lit (diffuseGI mean
+# > 0) and the per-frame max must stay bounded by the clamp ceiling
+# kLumenGIMaxRadiance = 10000 (LumenGIData.slang:64, applied by
+# finalizeLumenRadiance in LumenHardwareTrace.rt.slang:198 and the cache
+# lighting shader): no fireflies exploding past the ceiling, no NaN/Inf.
+#
+# Consumed by
+# -----------
+# tests/lumengi/run_stability.py and tests/lumengi/run_lightstep.py
+# (S3-C2, Agent R). Loaded by ABSOLUTE PATH (see
+# tests/lumengi/scenes/cornell_pointlight.pyscene header for the
+# AssetResolver caveat). Scene-cache caveat as in black_room.pyscene.
+############################################################################
+
+# --- Materials: neutral gray room, strong emissive panel, two gray boxes ---
+
+floor = StandardMaterial('Floor')
+floor.baseColor = float4(0.5, 0.5, 0.5, 1.0)
+floor.roughness = 0.6
+
+backWall = StandardMaterial('Back Wall')
+backWall.baseColor = float4(0.5, 0.5, 0.5, 1.0)
+backWall.roughness = 0.6
+
+ceiling = StandardMaterial('Ceiling')
+ceiling.baseColor = float4(0.5, 0.5, 0.5, 1.0)
+ceiling.roughness = 0.6
+
+leftWall = StandardMaterial('Left Wall')
+leftWall.baseColor = float4(0.5, 0.5, 0.5, 1.0)
+leftWall.roughness = 0.6
+
+rightWall = StandardMaterial('Right Wall')
+rightWall.baseColor = float4(0.5, 0.5, 0.5, 1.0)
+rightWall.roughness = 0.6
+
+largeBox = StandardMaterial('Large Box')
+largeBox.baseColor = float4(0.5, 0.5, 0.5, 1.0)
+largeBox.roughness = 0.6
+
+smallBox = StandardMaterial('Small Box')
+smallBox.baseColor = float4(0.5, 0.5, 0.5, 1.0)
+smallBox.roughness = 0.6
+
+# Strong emissive panel: emitted radiance = emissiveColor * emissiveFactor =
+# (17, 12, 4) * 100 = (1700, 1200, 400) -- "emissiveColor * 100" per task.md 8.
+panel = StandardMaterial('Glow Panel')
+panel.baseColor = float4(1.0, 1.0, 1.0, 1.0)
+panel.emissiveColor = float3(17, 12, 4)
+panel.emissiveFactor = 100.0
+panel.roughness = 0.6
+
+# Create geometry
+
+quadMesh = TriangleMesh.createQuad()
+cubeMesh = TriangleMesh.createCube()
+
+# Create mesh instances (room layout identical to cornell_box.pyscene)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Floor', Transform(scaling=float3(0.55, 1.0, 0.56))),
+    sceneBuilder.addTriangleMesh(quadMesh, floor)
+)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Ceiling', Transform(scaling=float3(0.55, 1.0, 0.56), translation=float3(0, 0.55, 0), rotationEulerDeg=float3(180, 0, 0))),
+    sceneBuilder.addTriangleMesh(quadMesh, ceiling)
+)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Back Wall', Transform(scaling=float3(0.55, 1.0, 0.56), translation=float3(0, 0.275, -0.275), rotationEulerDeg=float3(90, 0, 0))),
+    sceneBuilder.addTriangleMesh(quadMesh, backWall)
+)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Left Wall', Transform(scaling=float3(0.55, 1.0, 0.56), translation=float3(-0.275, 0.275, 0), rotationEulerDeg=float3(0, 0, -90))),
+    sceneBuilder.addTriangleMesh(quadMesh, leftWall)
+)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Right Wall', Transform(scaling=float3(0.55, 1.0, 0.56), translation=float3(0.275, 0.275, 0), rotationEulerDeg=float3(0, 0, 90))),
+    sceneBuilder.addTriangleMesh(quadMesh, rightWall)
+)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Large Box', Transform(scaling=float3(0.165, 0.33, 0.165), translation=float3(-0.093, 0.165, -0.071), rotationEuler=float3(0, -1.27, 0))),
+    sceneBuilder.addTriangleMesh(cubeMesh, largeBox)
+)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Small Box', Transform(scaling=float3(0.165, 0.165, 0.165), translation=float3(0.09, 0.0825, 0.111), rotationEuler=float3(0, -0.29, 0))),
+    sceneBuilder.addTriangleMesh(cubeMesh, smallBox)
+)
+
+# Strong emissive panel on the ceiling, facing down into the room (same
+# transform as the cornell_box 'Light' quad, larger footprint).
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Glow Panel', Transform(scaling=0.35, translation=float3(0, 0.549, 0), rotationEulerDeg=float3(180, 0, 0))),
+    sceneBuilder.addTriangleMesh(quadMesh, panel)
+)
+
+# NOTE: deliberately NO analytic light and NO env map in this scene.
+
+# Create camera (same as cornell_box.pyscene)
+
+camera = Camera()
+camera.position = float3(0, 0.28, 1.2)
+camera.target = float3(0, 0.28, 0)
+camera.up = float3(0, 1, 0)
+camera.focalLength = 35.0
+sceneBuilder.addCamera(camera)

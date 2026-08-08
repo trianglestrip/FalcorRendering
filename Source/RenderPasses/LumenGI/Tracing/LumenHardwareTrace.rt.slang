@@ -83,9 +83,12 @@ RWStructuredBuffer<uint4> gLumenGICounters;
 RWTexture2D<float4> gLightingComponents;
 
 // Optional emissive light sampler (LightBVH or Null depending on the
-// _EMISSIVE_LIGHT_SAMPLER_TYPE define set by the host). The Null sampler
-// ignores all calls, so the resource may stay unbound.
+// _EMISSIVE_LIGHT_SAMPLER_TYPE define set by the host). The declaration is
+// conditional so the parameter (with its sampler state) only enters the
+// binding table when the host actually binds it (LUMEN_GI_HAS_EMISSIVE_SAMPLER).
+#if LUMEN_GI_HAS_EMISSIVE_SAMPLER
 EmissiveLightSampler emissiveSampler;
+#endif
 
 /** Payload for the single diffuse indirect ray (24 bytes).
  *
@@ -267,8 +270,14 @@ void handleLumenIndirectHit(const HitInfo hit, inout LumenIndirectPayload payloa
     for (uint i = 0; i < kLumenGIPrimaryRaySampleCount; ++i)
         sampleNext1D(sampleGenerator);
 
+    // Pass the bound sampler when the host wired it; otherwise hand an empty
+    // (Null-typed) instance so the emissive next-event term is skipped.
+    EmissiveLightSampler activeSampler = {};
+#if LUMEN_GI_HAS_EMISSIVE_SAMPLER
+    activeSampler = emissiveSampler;
+#endif
     LumenGILightingComponents components;
-    const LumenHitLightingResult lighting = evaluateLumenHitLighting(sd, materialInstance, emissiveSampler, sampleGenerator, components);
+    const LumenHitLightingResult lighting = evaluateLumenHitLighting(sd, materialInstance, activeSampler, sampleGenerator, components);
 
     float fireflyFlag;
     payload.radiance = finalizeLumenRadiance(lighting.radiance, fireflyFlag);

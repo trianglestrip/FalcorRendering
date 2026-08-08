@@ -31,6 +31,7 @@
 #include "RenderGraph/RenderPass.h"
 #include "Utils/Sampling/SampleGenerator.h"
 #include "Rendering/Lights/LightBVHSampler.h"
+#include "Rendering/Lights/EnvMapSampler.h"
 #include "LumenGIStats.h"
 #include "Capture/LumenCaptureScheduler.h" // Brings in Cards/LumenCardScene.h and SurfaceCache/LumenSurfaceCache.h.
 
@@ -152,6 +153,23 @@ private:
     void runSurfaceCacheCapture(RenderContext* pRenderContext, IScene::UpdateFlags updateFlags);
     void runCapturePass(RenderContext* pRenderContext, const LumenCaptureFrame& frame);
 
+    // ------------------------------------------------------------------------------------------
+    // S3: Surface Cache direct lighting host (S3-B1)
+    // ------------------------------------------------------------------------------------------
+    void createCacheLightingProgram();
+    void ensureCacheLightingResources(RenderContext* pRenderContext);
+    void runCacheLighting(RenderContext* pRenderContext);
+    void exportCacheDirectRadiance(RenderContext* pRenderContext, const RenderData& renderData);
+
+    ///< Rebuild pageID -> cardIndex and the per-frame lighting render list from the host
+    ///< card->page mirror (mCardPageTable/mCardPageGeneration, maintained from the scheduler
+    ///< command stream) plus the page cache residency/generation. Returns the render list size.
+    uint32_t buildCacheLightingRenderData();
+
+    ///< gSamplesPerTexel preset mapping: Low/Medium/High/Reference -> 1/2/4/8
+    ///< (LumenCacheLightingQuality in LumenSurfaceCacheLightingData.slang).
+    uint32_t cacheLightingSamplesPerTexel() const;
+
     ///< Per-scene card placement (Agent A). Rebuilt on setScene() and on geometry changes.
     std::unique_ptr<LumenCardScene> mpCardScene;
 
@@ -187,6 +205,43 @@ private:
     std::vector<uint32_t> mCardPageTable; ///< Host mirror cardIndex -> pageID (kLumenCardInvalidID when no page is assigned).
     LumenCaptureFrameStats mLastCaptureFrameStats; ///< Stats of the last scheduleFrame() call, for the UI.
 
+    // ------------------------------------------------------------------------------------------
+    // S3: Surface Cache direct lighting host (S3-B1)
+    // ------------------------------------------------------------------------------------------
+    ///< Cache lighting pass GPU resources. Created lazily by ensureCacheLightingResources();
+    ///< pPass is scene-scoped (recreated on setScene/geometry rebuild through
+    ///< invalidateCaptureResources()); the buffers and the visibility atlas are atlas-lifetime.
+    struct
+    {
+        ref<ComputePass> pPass;          ///< LumenSurfaceCacheLighting.cs.slang, entry "main".
+        ref<Buffer> pPageToCard;         ///< gLumenPageToCard (uint32, pageCount+1), SRV; pageID -> cardIndex.
+        ref<Buffer> pRenderList;         ///< gLumenRenderList (uint32, pageCount), SRV; resident pages to light this frame.
+        ref<Texture> pVisibilityAtlas;   ///< gLumenVisibilityAtlas (R16F), UAV + SRV; per-texel confidence.
+    } mCacheLighting;
+
+    ///< Host mirror cardIndex -> page generation at the last capture command (size = card
+    ///< count). Used to resolve which card currently owns a page when the page->card table is
+    ///< rebuilt: only the card whose recorded generation matches the page cache's current page
+    ///< generation owns the page (a stale card->page entry has a mismatched generation).
+    std::vector<uint32_t> mCardPageGeneration;
+    std::vector<uint32_t> mPageToCardData; ///< Host mirror pageID -> cardIndex (pageCount+1), rebuilt per frame.
+    std::vector<uint32_t> mRenderListData; ///< Host mirror of the frame's lighting render list.
+
+    ///< Optional cache-lighting GPU counters (LumenGICounterIndex layout). SEPARATE buffer from
+    ///< mpLumenGICounters (trace): the trace readback/copy happens earlier in the frame and the
+    ///< trace counters must stay S1/S2-identical, so cache lighting cannot share them without
+    ///< either double-counting (post-copy writes accumulate into the next frame's trace counts)
+    ///< or re-ordering the trace sequence. Independent counters keep both diagnostics clean.
+    ref<Buffer> mpCacheLightingCounters;
+    ref<Buffer> mpCacheLightingCountersReadback;
+    bool mCacheLightingCounterReadbackPending = false;
+    LumenGIFrameCounters mCacheLightingCounters; ///< Read back cache-lighting counter values (last completed dispatch).
+    uint32_t mLastCacheLightingPageCount = 0;    ///< Pages lit by the last dispatch (0 = none).
+
+    ///< Scriptable S3 gate channel name: exposes the internal radiance atlas (RGB = direct,
+    ///< linear) at atlas resolution for tests/lumengi/run_cachelighting.py (Agent N).
+    static constexpr const char* kCacheDirectRadiance = "cacheDirectRadiance";
+
     ref<Scene> mpScene;
     sigs::Connection mUpdateFlagsConnection;
     IScene::UpdateFlags mSceneUpdates = IScene::UpdateFlags::None;
@@ -194,6 +249,11 @@ private:
 
     ///< Emissive light BVH sampler for secondary-hit NEE; scene-scoped (rebuilt on setScene).
     std::unique_ptr<LightBVHSampler> mpEmissiveLightSampler;
+
+    ///< EnvMap importance sampler for the Surface Cache lighting NEE (S3-B1); scene-scoped.
+    ///< Created lazily when the scene has an env map, mirroring PathTracer.cpp (EnvMapSampler
+    ///< needs only a Device + EnvMap; the importance map is built internally on construction).
+    std::unique_ptr<EnvMapSampler> mpEnvMapSampler;
 
     ref<ComputePass> mpDebugPass;
     ref<SampleGenerator> mpSampleGenerator;
@@ -224,6 +284,7 @@ private:
     QualityPreset mQualityPreset = QualityPreset::High;
     DebugMode mDebugMode = DebugMode::None;
     bool mUseSurfaceCache = false;
+    bool mUseCacheLighting = false;
     bool mUseScreenTrace = false;
     bool mUseScreenProbes = false;
     bool mUseTemporalFilter = false;
