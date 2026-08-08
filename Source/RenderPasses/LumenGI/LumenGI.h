@@ -96,6 +96,7 @@ public:
         AnalyticOnly,
         IndirectOnly,
         FireflyMask,
+        CardsOverlay,
     };
 
     FALCOR_ENUM_INFO(
@@ -113,6 +114,7 @@ public:
             {DebugMode::AnalyticOnly, "AnalyticOnly"},
             {DebugMode::IndirectOnly, "IndirectOnly"},
             {DebugMode::FireflyMask, "FireflyMask"},
+            {DebugMode::CardsOverlay, "CardsOverlay"},
         }
     );
 
@@ -125,6 +127,11 @@ public:
     void renderUI(Gui::Widgets& widget) override;
     void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
     void onHotReload(HotReloadFlags reloaded) override;
+
+    ///< Scriptable snapshot of the Surface Cache / Cards capture state for the S2 gate
+    ///< (read through the Python binding "surfaceCacheStats"). Values are doubles so the
+    ///< map converts losslessly to a Python dict. Keys are documented in the .cpp.
+    std::map<std::string, double> getSurfaceCacheStats() const;
 
 private:
     void parseProperties(const Properties& props);
@@ -203,6 +210,7 @@ private:
     ref<Buffer> mpLumenGICountersReadback;
     bool mCounterReadbackPending = false;
     LumenGIFrameCounters mCounters;
+    uint64_t mCaptureStatsLogCounter = 0;
 
     /// Optional per-pixel lighting components written by the trace shader.
     ref<Texture> mpLightingComponents;

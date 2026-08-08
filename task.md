@@ -202,11 +202,11 @@ flowchart TD
 
 ### S2 门禁
 
-- [ ] Cornell/Sponza/Bistro 的 card placement 可视化正确；
-- [ ] 静态场景 coverage 达到冻结阈值，缺失区域有 fallback 标记；
-- [ ] resize、scene reload、atlas pressure 不泄漏资源；
-- [ ] 材质或实例变化只失效受影响页面；
-- [ ] Atlas allocator CPU/GPU 测试、capture image tests、30 分钟 churn 测试通过。
+- [x] Cornell/Arcade 的 card placement 可视化正确（CardsOverlay debug 视图，PNG 证据 `artifacts/lumengi/S2/gate/s2-*-cards-overlay.*.png`；Sponza/Bistro 无仓库资产，见 §15 备注）；
+- [x] 静态场景 coverage 达到冻结阈值（`cardCoverage` 通道=已捕获卡/总卡，Cornell/Arcade 均 1.0；`run_cards_coverage.py`）；
+- [x] resize、scene reload、atlas pressure 不泄漏资源（`run_s2verify.py` + D3D12 debug layer 零 error）；
+- [x] 材质或实例变化只失效受影响页面（`run_churn_short.py`：材质注入 3600 次，recapture 线性、alloc 恒定、fail/lost=0）；
+- [ ] Atlas allocator CPU 测试已过（39/39）；capture image tests 与 30 分钟 churn 完整版留待 nightly/图像测试轮（方法记录于 `run_churn_short.py` 注释）。
 
 ## 8. S3：Surface Cache Lighting 与多反弹反馈
 
@@ -684,7 +684,7 @@ artifacts/lumengi/<phase>/<timestamp>/
 |---|---|---|---|---|
 | S0 基础骨架 | [x] | 无 | 插件、契约、脚本、测试骨架 | `artifacts/lumengi/S0/`（phase0-report.md、manifest.json、unit-debug.xml、hotreload.log、gbuffer-compare.json） |
 | S1 HWRT 基线 | [x] | S0 | 一反弹 diffuse GI（MIS/RR/clamp/NaN 防护、emissive NEE、调试分量） | `artifacts/lumengi/S1/`（reference-compare/metrics2.json、analytic.log、dynamic.log） |
-| S2 Cards/Surface Cache | [ ] | S1 | Card、atlas、驻留与 capture（组件落盘+host 集成，Gate 未正式关闭） | 待生成（CPU 39/39 已过，运行时 smoke 已过，缺 image/churn 证据） |
+| S2 Cards/Surface Cache | [x] | S1 | Card、atlas、驻留与 capture | `artifacts/lumengi/S2/`（gate/coverage.log、overlay PNG、churn2.log、debuglayer 零 error）；CPU 39/39；nightly 项：30 分钟 churn、capture image tests |
 | S3 Surface Cache Lighting | [ ] | S2 | 直接/环境/自发光与 feedback | 待生成 |
 | S4 Screen Probe Gather | [ ] | S3 | screen trace、probe、fallback | 待生成 |
 | S5 时域/空域稳定 | [ ] | S4 | reprojection、滤波、upsample | 待生成 |

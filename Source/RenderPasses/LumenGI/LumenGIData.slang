@@ -43,6 +43,7 @@ static const uint kLumenDebugEmissiveOnly = 8;
 static const uint kLumenDebugAnalyticOnly = 9;
 static const uint kLumenDebugIndirectOnly = 10;
 static const uint kLumenDebugFireflyMask = 11;
+static const uint kLumenDebugCardsOverlay = 12;
 
 /** Hit distance written by the miss shader. The value is the maximum
     representable float16, which is also the output format of the hit-distance

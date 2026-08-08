@@ -82,12 +82,16 @@ const ChannelList kOutputChannels = {
     { "confidence",                    "gConfidence",                    "GI confidence", false, ResourceFormat::R16Float },
     { "bentNormal",                    "gBentNormal",                    "Optional world-space bent normal", true, ResourceFormat::RGBA16Float },
     { "debugOutput",                   "gDebugOutput",                   "Selected LumenGI diagnostic output", false, ResourceFormat::RGBA16Float },
+    { "cardCoverage",                  "gCardCoverage",                  "Surface cache page coverage (allocated / total pages)", true, ResourceFormat::R32Float },
     // clang-format on
 };
 
 void registerBindings(pybind11::module& m)
 {
     pybind11::class_<LumenGI, RenderPass, ref<LumenGI>> pass(m, "LumenGI");
+    // Scriptable S2 gate snapshot: read as m.activeGraph.getPass("LumenGI").surfaceCacheStats.
+    // std::map<std::string, double> converts to a Python dict losslessly.
+    pass.def_property_readonly("surfaceCacheStats", &LumenGI::getSurfaceCacheStats);
 }
 } // namespace
 
@@ -327,6 +331,8 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     defines.add("is_valid_gConfidence", "1");
     defines.add("is_valid_gDiffuseRadianceHitDist", "1");
     defines.add("is_valid_gLightingComponents", mpLightingComponents ? "1" : "0");
+    defines.add("is_valid_gCards", (mUseSurfaceCache && mCapture.pCards) ? "1" : "0");
+    defines.add("is_valid_gCardCoverage", renderData.getTexture("cardCoverage") ? "1" : "0");
     if (mpDebugPass->getProgram()->addDefines(defines))
         mpDebugPass->setVars(nullptr);
 
@@ -334,6 +340,24 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     var["CB"]["gFrameDim"] = mFrameDim;
     var["CB"]["gFrameIndex"] = mFrameIndex;
     var["CB"]["gDebugMode"] = static_cast<uint32_t>(mDebugMode);
+    // Cards overlay projection uses the same camera matrices as the GBuffer pass.
+    var["CB"]["gViewProj"] = mpScene->getCamera()->getViewProjMatrixNoJitter();
+    var["CB"]["gCardCount"] = (mUseSurfaceCache && mpCardScene) ? mpCardScene->getCardCount() : 0u;
+    // Page coverage scalars written by the debug pass into the cardCoverage channel.
+    // R = captured-card coverage (clean / total cards), the S2-gate metric for
+    // card placement completeness. G/B/A = atlas allocated/total/free pages.
+    const LumenSurfaceCacheStats cacheStats = mPageCache.getStats();
+    float coverage = 0.f;
+    if (mUseSurfaceCache && mpCardScene)
+    {
+        const uint32_t totalCards = mpCardScene->getCardCount();
+        const uint32_t dirtyCards = mpCardScene->getDirtyCardCount();
+        coverage = totalCards > 0 ? (float)(totalCards - dirtyCards) / (float)totalCards : 0.f;
+    }
+    var["CB"]["gCardCoverageValue"] = coverage;
+    var["CB"]["gAllocatedPages"] = (float)cacheStats.allocatedPageCount;
+    var["CB"]["gTotalPages"] = (float)cacheStats.pageCount;
+    var["CB"]["gFreePages"] = (float)cacheStats.freePageCount;
     var["gLinearZ"] = renderData.getTexture("linearZ");
     var["gMotionVector"] = renderData.getTexture("mvec");
     var["gMotionVectorW"] = renderData.getTexture("mvecW");
@@ -341,8 +365,27 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     var["gConfidence"] = renderData.getTexture("confidence");
     var["gDiffuseRadianceHitDist"] = renderData.getTexture("diffuseRadianceHitDist");
     var["gLightingComponents"] = mpLightingComponents;
+    if (mUseSurfaceCache && mCapture.pCards)
+        var["gCards"] = mCapture.pCards;
     var["gDebugOutput"] = renderData.getTexture("debugOutput");
+    if (renderData.getTexture("cardCoverage"))
+        var["gCardCoverage"] = renderData.getTexture("cardCoverage");
     mpDebugPass->execute(pRenderContext, uint3(mFrameDim, 1));
+
+    // Periodic capture telemetry for scripted churn/soak gates (every 60 frames).
+    // Uses a dedicated counter: resetHistory() (material/scene changes) resets
+    // mFrameIndex, which would otherwise print this every frame during churn.
+    if (mUseSurfaceCache && mpCardScene && (++mCaptureStatsLogCounter % 60 == 0))
+    {
+        const LumenCaptureSchedulerStats stats = mCaptureScheduler.getStats();
+        logInfo(
+            "LumenGI capture stats: frame={} cards={} dirty={} alloc={} release={} fail={} lost={} recapture={} "
+            "completed={} pending={} residentBytes={}",
+            mFrameIndex, mpCardScene->getCardCount(), mpCardScene->getDirtyCardCount(), stats.totalAllocations,
+            stats.totalReleases, stats.totalAllocationFailures, stats.totalLostPages, stats.totalRecaptures,
+            stats.completedCaptures, stats.pendingQueueDepth, mPageCache.getResidentBytes()
+        );
+    }
 
     ++mFrameIndex;
 }
@@ -612,6 +655,69 @@ void LumenGI::readbackCounters(RenderContext* pRenderContext)
 // S2: Surface Cache / Cards capture host
 // ------------------------------------------------------------------------------------------
 
+std::map<std::string, double> LumenGI::getSurfaceCacheStats() const
+{
+    std::map<std::string, double> stats;
+    stats["frameIndex"] = (double)mFrameIndex;
+    stats["useSurfaceCache"] = mUseSurfaceCache ? 1.0 : 0.0;
+    stats["maxPagesPerFrame"] = (double)mCaptureMaxPagesPerFrame;
+    stats["atlasSizeTexels"] = (double)mAtlasSizeTexels;
+    stats["pagesPerSide"] = (double)mCapturePagesPerSide;
+
+    if (mpCardScene)
+    {
+        stats["cards"] = (double)mpCardScene->getCardCount();
+        stats["dirtyCards"] = (double)mpCardScene->getDirtyCardCount();
+        stats["supportedInstances"] = (double)mpCardScene->getSupportedInstanceCount();
+        stats["unsupportedInstances"] = (double)mpCardScene->getUnsupportedInstanceCount();
+    }
+
+    const LumenSurfaceCacheStats cacheStats = mPageCache.getStats();
+    stats["totalPages"] = (double)cacheStats.pageCount;
+    stats["allocatedPages"] = (double)cacheStats.allocatedPageCount;
+    stats["freePages"] = (double)cacheStats.freePageCount;
+    stats["evictedPendingPages"] = (double)cacheStats.evictedPendingCount;
+    stats["coverage"] = cacheStats.pageCount > 0 ? (double)cacheStats.allocatedPageCount / (double)cacheStats.pageCount : 0.0;
+    stats["residentBytesMB"] = (double)(cacheStats.residentBytes >> 20);
+    stats["allocations"] = (double)cacheStats.allocationCount;
+    stats["releases"] = (double)cacheStats.releaseCount;
+    stats["evictions"] = (double)cacheStats.evictionCount;
+    stats["invalidations"] = (double)cacheStats.invalidationCount;
+
+    const LumenCaptureSchedulerStats schedulerStats = mCaptureScheduler.getStats();
+    stats["schedulerFrameIndex"] = (double)schedulerStats.frameIndex;
+    stats["schedCaptureCommands"] = (double)schedulerStats.totalCaptureCommands;
+    stats["schedAllocations"] = (double)schedulerStats.totalAllocations;
+    stats["schedRecaptures"] = (double)schedulerStats.totalRecaptures;
+    stats["schedAllocFailures"] = (double)schedulerStats.totalAllocationFailures;
+    stats["schedStarvationFrames"] = (double)schedulerStats.totalStarvationFrames;
+    stats["schedReleases"] = (double)schedulerStats.totalReleases;
+    stats["schedLostPages"] = (double)schedulerStats.totalLostPages;
+    stats["schedTouches"] = (double)schedulerStats.totalTouches;
+    stats["schedCompletedCaptures"] = (double)schedulerStats.completedCaptures;
+    stats["avgQueuedFrames"] = schedulerStats.averageQueuedFrames;
+    stats["maxQueuedFrames"] = (double)schedulerStats.maxQueuedFrames;
+    stats["pendingQueueDepth"] = (double)schedulerStats.pendingQueueDepth;
+    stats["maxPendingDepth"] = (double)schedulerStats.maxPendingDepth;
+    stats["schedStructuralRebuilds"] = (double)schedulerStats.structuralRebuildCount;
+
+    const LumenCaptureFrameStats& last = mLastCaptureFrameStats;
+    stats["lastRequestedCards"] = (double)last.requestedCards;
+    stats["lastCaptureCommands"] = (double)last.captureCommands;
+    stats["lastNewPageAllocations"] = (double)last.newPageAllocations;
+    stats["lastRecaptureWithPage"] = (double)last.recaptureWithPage;
+    stats["lastAllocFailures"] = (double)last.allocationFailures;
+    stats["lastBudgetCappedCards"] = (double)last.budgetCappedCards;
+    stats["lastInFlightCards"] = (double)last.inFlightCards;
+    stats["lastPendingCards"] = (double)last.pendingCards;
+    stats["lastStarvationFrames"] = (double)last.starvationFrames;
+    stats["lastReleasedPages"] = (double)last.releasedPages;
+    stats["lastLostPages"] = (double)last.lostPages;
+    stats["lastTouchCalls"] = (double)last.touchCalls;
+
+    return stats;
+}
+
 void LumenGI::invalidateCaptureResources()
 {
     // Drop every capture resource that is scene-scoped or program-scoped. The atlas textures
@@ -698,6 +804,11 @@ void LumenGI::runSurfaceCacheCapture(RenderContext* pRenderContext, IScene::Upda
 {
     if (!mpScene || !mpCardScene)
         return;
+
+    // Keep the scheduler budget in sync with the property every frame so the
+    // captureMaxPagesPerFrame property hot-switch works in headless runs
+    // (the UI slider path only runs when the GUI is active). Idempotent.
+    mCaptureScheduler.setMaxPagesPerFrame(mCaptureMaxPagesPerFrame);
 
     // Structural scene changes invalidate the capture program/vars/VAOs and the card buffer
     // (scene defines, mesh buffers and card indices may all have changed).

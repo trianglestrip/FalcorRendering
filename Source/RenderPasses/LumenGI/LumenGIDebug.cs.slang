@@ -29,10 +29,17 @@
 import Utils.Math.HashUtils;
 import Utils.Math.MathHelpers;
 import LumenGIData;
+import RenderPasses.LumenGI.Capture.LumenCardCaptureData;
 
 // Falcor's optional render-pass resources are specialized through
 // is_valid_<shader resource name> defines. Keep local defaults so this shader
 // can also be compiled before all optional channels are reflected by the host.
+#ifndef is_valid_gCards
+#define is_valid_gCards 0
+#endif
+#ifndef is_valid_gCardCoverage
+#define is_valid_gCardCoverage 0
+#endif
 #ifndef is_valid_gLinearZ
 #define is_valid_gLinearZ 0
 #endif
@@ -62,7 +69,15 @@ cbuffer CB
     uint2 gFrameDim;
     uint gFrameIndex;
     uint gDebugMode;
+    float4x4 gViewProj;      //< Camera view-projection (mul(M, v) convention), for the cards overlay.
+    uint gCardCount;         //< Number of valid cards in gCards (0 when the overlay is disabled).
+    float gCardCoverageValue; //< R channel of the cardCoverage output: allocated / total pages.
+    float gAllocatedPages;   //< G channel: allocated page count.
+    float gTotalPages;       //< B channel: total page capacity.
+    float gFreePages;        //< A channel: free page count.
 }
+
+StructuredBuffer<LumenCard> gCards;
 
 Texture2D<float2> gLinearZ;
 Texture2D<float2> gMotionVector;
@@ -73,6 +88,7 @@ Texture2D<float4> gDiffuseRadianceHitDist;
 Texture2D<float4> gLightingComponents;
 
 RWTexture2D<float4> gDebugOutput;
+RWTexture2D<float> gCardCoverage;
 
 static const float4 kMissingInputColor = float4(1.f, 0.f, 1.f, 1.f);
 
@@ -299,6 +315,110 @@ float4 visualizeFireflyMask(uint2 pixel)
     return kMissingInputColor;
 }
 
+/** Project a world-space point to viewport pixel coordinates through the
+    camera view-projection. Returns false when the point is behind the camera
+    (its clip-space w is non-positive), in which case screenPos is undefined.
+*/
+bool projectToScreen(float3 worldPos, out float2 screenPos)
+{
+    const float4 clip = mul(gViewProj, float4(worldPos, 1.f));
+    if (clip.w <= 1e-6f)
+        return false;
+    const float3 ndc = clip.xyz / clip.w;
+    screenPos = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f) * float2(gFrameDim);
+    return true;
+}
+
+/** Distance from a point to a 2D segment (pixel units). */
+float distanceToSegment(float2 p, float2 a, float2 b)
+{
+    const float2 ab = b - a;
+    const float len2 = dot(ab, ab);
+    if (len2 <= 1e-8f)
+        return length(p - a);
+    const float t = saturate(dot(p - a, ab) / len2);
+    return length(p - (a + t * ab));
+}
+
+/** Card placement overlay (S2 gate): wireframe boxes around each card-ized
+    instance's world AABB, drawn over a dimmed tonemapped radiance backdrop so
+    the placement is verifiable against the rendered geometry.
+
+    Deterministic and exact: every AABB is projected with the camera
+    view-projection and the box edges are rasterized as 2D segments in pixel
+    space. All six faces of an instance share the same world AABB (per-face
+    slab refinement is future work), so only face 0 of each instance is drawn
+    to avoid six identical overdraws. No randomness anywhere.
+*/
+float4 visualizeCardsOverlay(uint2 pixel)
+{
+    if (!is_valid(gCards) || gCardCount == 0u)
+        return kMissingInputColor;
+
+    // Dimmed tonemapped radiance gives geometric context for the overlay.
+    float3 background = float3(0.f);
+    if (is_valid(gDiffuseRadianceHitDist) && containsPixel(gDiffuseRadianceHitDist, pixel))
+        background = 0.25f * tonemapRadiance(gDiffuseRadianceHitDist[pixel].rgb);
+
+    const float lineWidth = 1.5f;
+    const float2 pixelF = float2(pixel) + 0.5f; //< Pixel-center in the projection's pixel space.
+
+    for (uint c = 0; c < gCardCount; ++c)
+    {
+        const LumenCard card = gCards[c];
+        if (card.faceIndex != 0u)
+            continue;
+
+        const float3 corners[8] = {
+            float3(card.boundsMin.x, card.boundsMin.y, card.boundsMin.z),
+            float3(card.boundsMax.x, card.boundsMin.y, card.boundsMin.z),
+            float3(card.boundsMin.x, card.boundsMax.y, card.boundsMin.z),
+            float3(card.boundsMax.x, card.boundsMax.y, card.boundsMin.z),
+            float3(card.boundsMin.x, card.boundsMin.y, card.boundsMax.z),
+            float3(card.boundsMax.x, card.boundsMin.y, card.boundsMax.z),
+            float3(card.boundsMin.x, card.boundsMax.y, card.boundsMax.z),
+            float3(card.boundsMax.x, card.boundsMax.y, card.boundsMax.z),
+        };
+
+        float2 screen[8];
+        bool behind = false;
+        for (int i = 0; i < 8; ++i)
+        {
+            if (!projectToScreen(corners[i], screen[i]))
+            {
+                behind = true;
+                break;
+            }
+        }
+        if (behind)
+            continue;
+
+        float2 lo = min(
+            min(min(screen[0], screen[1]), min(screen[2], screen[3])),
+            min(min(screen[4], screen[5]), min(screen[6], screen[7]))
+        );
+        float2 hi = max(
+            max(max(screen[0], screen[1]), max(screen[2], screen[3])),
+            max(max(screen[4], screen[5]), max(screen[6], screen[7]))
+        );
+        if (any(pixelF < lo - lineWidth) || any(pixelF > hi + lineWidth))
+            continue;
+
+        const uint2 edges[12] = {
+            uint2(0, 1), uint2(2, 3), uint2(4, 5), uint2(6, 7), // x-direction edges
+            uint2(0, 2), uint2(1, 3), uint2(4, 6), uint2(5, 7), // y-direction edges
+            uint2(0, 4), uint2(1, 5), uint2(2, 6), uint2(3, 7), // z-direction edges
+        };
+        for (int e = 0; e < 12; ++e)
+        {
+            if (distanceToSegment(pixelF, screen[edges[e].x], screen[edges[e].y]) <= lineWidth)
+                return float4(pseudocolor(c) * 0.85f + background * 0.15f, 1.f);
+        }
+    }
+
+    return float4(background, 1.f);
+}
+
 [numthreads(16, 16, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
@@ -345,10 +465,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     case kLumenDebugFireflyMask:
         output = visualizeFireflyMask(pixel);
         break;
+    case kLumenDebugCardsOverlay:
+        output = visualizeCardsOverlay(pixel);
+        break;
     default:
         output = kMissingInputColor;
         break;
     }
 
     gDebugOutput[pixel] = output;
+
+    // Scriptable page-coverage channel: the same scalar is written to every
+    // pixel so Python can read it with get_output().to_numpy(). R32Float to
+    // avoid half-float encoding ambiguity in the diagnostic channel.
+    if (is_valid(gCardCoverage))
+        gCardCoverage[pixel] = gCardCoverageValue;
 }

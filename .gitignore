@@ -36,3 +36,4 @@
 artifacts/
 .codegraph/
 tests/temp/
+.playwright-mcp/
