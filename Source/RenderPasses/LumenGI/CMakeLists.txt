@@ -1,0 +1,24 @@
+add_plugin(LumenGI)
+
+target_sources(LumenGI PRIVATE
+    LumenGI.cpp
+    LumenGI.h
+    LumenGIData.slang
+    LumenGIDebug.cs.slang
+    LumenGIStats.h
+    Lighting/LumenGILighting.slang
+    Lighting/LumenGILightSampling.slang
+    Tracing/LumenHardwareTrace.rt.slang
+    Tracing/LumenHitLighting.slang
+    Cards/LumenCardScene.h
+    Cards/LumenCardPlacement.cs.slang
+    SurfaceCache/LumenSurfaceCache.h
+    Capture/LumenCardCaptureData.slang
+    Capture/LumenCardCapture.3d.slang
+    ScreenTrace/LumenScreenTraceData.slang
+    ScreenTrace/LumenScreenTrace.cs.slang
+)
+
+target_copy_shaders(LumenGI RenderPasses/LumenGI)
+
+target_source_group(LumenGI "RenderPasses")

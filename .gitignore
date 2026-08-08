@@ -31,3 +31,8 @@
 *.tlog
 *.bak
 *.swp
+
+# LumenGI development artifacts (do not commit).
+artifacts/
+.codegraph/
+tests/temp/

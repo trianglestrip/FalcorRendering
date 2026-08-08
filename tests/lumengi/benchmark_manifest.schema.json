@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://falcor.example/schemas/lumengi-benchmark-manifest-v1.json",
+  "title": "LumenGI benchmark manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "benchmark",
+    "status",
+    "git",
+    "system",
+    "configuration",
+    "lumen_gi",
+    "profiler",
+    "error"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "benchmark": { "const": "LumenGI" },
+    "status": { "enum": ["running", "completed", "failed"] },
+    "git": { "type": "object" },
+    "system": { "type": "object" },
+    "configuration": { "type": "object" },
+    "lumen_gi": {
+      "type": "object",
+      "required": ["pass_properties", "resource_stats"],
+      "properties": {
+        "pass_properties": { "type": "object" },
+        "resource_stats": { "type": "object" }
+      }
+    },
+    "profiler": {
+      "type": "object",
+      "required": ["frame_count", "events"],
+      "properties": {
+        "frame_count": { "type": "integer", "minimum": 0 },
+        "events": { "type": "object" }
+      }
+    },
+    "error": { "type": ["string", "null"] }
+  }
+}

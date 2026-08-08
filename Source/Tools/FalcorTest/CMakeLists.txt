@@ -52,6 +52,11 @@ target_sources(FalcorTest PRIVATE
     Tests/Platform/MonitorInfoTests.cpp
     Tests/Platform/OSTests.cpp
 
+    Tests/RenderPasses/LumenGIStatsTests.cpp
+    Tests/RenderPasses/LumenGISamplingTests.cpp
+    Tests/RenderPasses/LumenSurfaceCacheTests.cpp
+    Tests/RenderPasses/LumenCaptureSchedulerTests.cpp
+
     Tests/Rendering/Materials/BSDFIntegratorTests.cpp
     Tests/Rendering/Materials/RGLAcquisitionTests.cpp
     Tests/Rendering/Materials/MicrofacetTests.cpp
