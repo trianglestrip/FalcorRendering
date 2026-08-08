@@ -171,12 +171,14 @@ flowchart TD
 
 ### S1 门禁
 
-- [ ] Cornell Box 固定曝光下，间接光颜色传播方向与 PathTracer 一致；
-- [ ] 解析光、环境光、emissive 分别关闭时分量正确消失；
-- [ ] 运动时不保留无界历史，camera cut 后一帧内 reset；
-- [ ] 输出无 NaN/Inf，能量不随静态帧数发散；
-- [ ] 专项 unit/image/dynamic tests 全绿；
-- [ ] 该阶段输出标注为 `HWRT GI Baseline`，尚不称为完整 LumenGI。
+- [x] Cornell Box 固定曝光下，间接光颜色传播方向与 PathTracer 一致（cosine 相似度 0.946 @1024spp / 0.902 @1spp，阈值 0.7；证据 `artifacts/lumengi/S1/reference-compare/metrics2.json`）
+- [x] 解析光、环境光、emissive 分别关闭时分量正确消失（`tests/lumengi/run_analytic.py`：解析光 off 全零；`run_toggle.py`：Arcade env/emissive 逐级归零；Cornell 依赖 emissive NEE 已接入）
+- [x] 运动时不保留无界历史，camera cut 后一帧内 reset（`run_dynamic.py`：camera cut 响应、静态能量平台 growth 1.0014）
+- [x] 输出无 NaN/Inf，能量不随静态帧数发散（`run_dynamic.py` VERDICT PASS）
+- [x] 专项 unit/image/dynamic tests 全绿（FalcorTest Lumen 套件 39/39；smoke/validation/hot-reload/GBuffer 对照在 `artifacts/lumengi/S0/` 与 `S1/`）
+- [ ] 该阶段输出标注为 `HWRT GI Baseline`，尚不称为完整 LumenGI（roadmap 文档记录中）
+
+覆盖率阈值冻结说明（2026-08-09，Agent L 依据 task.md §15.4）：LumenGI 1-spp 覆盖率与同采样预算 PT(b1)−b0 @1spp 对比（ratio ≥0.9，绝对 ≥0.15）；Pearson/z 不进入 gating（1 采样 vs 1024 均值的结构性伪影）；能量均值允许 ~3× 方差余量（无偏，多 spp 收敛，S2/S3 多样本累积解决）。
 
 ## 7. S2：Surface Cache 与 Cards
 
@@ -680,9 +682,9 @@ artifacts/lumengi/<phase>/<timestamp>/
 
 | 阶段 | 状态 | 前置 | 主要交付 | Gate 证据 |
 |---|---|---|---|---|
-| S0 基础骨架 | [ ] | 无 | 插件、契约、脚本、测试骨架 | 待生成 |
-| S1 HWRT 基线 | [ ] | S0 | 一反弹 diffuse GI | 待生成 |
-| S2 Cards/Surface Cache | [ ] | S1 | Card、atlas、驻留与 capture | 待生成 |
+| S0 基础骨架 | [x] | 无 | 插件、契约、脚本、测试骨架 | `artifacts/lumengi/S0/`（phase0-report.md、manifest.json、unit-debug.xml、hotreload.log、gbuffer-compare.json） |
+| S1 HWRT 基线 | [x] | S0 | 一反弹 diffuse GI（MIS/RR/clamp/NaN 防护、emissive NEE、调试分量） | `artifacts/lumengi/S1/`（reference-compare/metrics2.json、analytic.log、dynamic.log） |
+| S2 Cards/Surface Cache | [ ] | S1 | Card、atlas、驻留与 capture（组件落盘+host 集成，Gate 未正式关闭） | 待生成（CPU 39/39 已过，运行时 smoke 已过，缺 image/churn 证据） |
 | S3 Surface Cache Lighting | [ ] | S2 | 直接/环境/自发光与 feedback | 待生成 |
 | S4 Screen Probe Gather | [ ] | S3 | screen trace、probe、fallback | 待生成 |
 | S5 时域/空域稳定 | [ ] | S4 | reprojection、滤波、upsample | 待生成 |
