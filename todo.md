@@ -43,16 +43,17 @@ Get-CimInstance Win32_Process |
 - `Source\Tools\MeshSDFBuilder\`（S6-A1，Agent D）：独立 CLI 工具，`.msdf` 自描述格式 + FNV-1a64 hash + open/thin/watertight 检测，纯标准库，`cl /Zs` 已验语法。S6A Gate 过 + 格式冻结后再注册 CMake。
 - `tests\lumengi\run_reference.py` / `run_analytic.py` / `run_dynamic.py` / `scenes\cornell_pointlight.pyscene`（S1 Gate 脚本，Agent F）：均已 GPU 实跑通过。
 - `Source\RenderPasses\LumenGI\ScreenTrace\`（S4-B1，root 亲写）：精确透视 HZB screen trace，已注册进 CMake 复制列表，运行时编译待 S4-A1 集成验证。
-- `Source\RenderPasses\LumenGI\Lighting\LumenSurfaceCacheLighting*.slang`（S3-B1，Agent J）：direct cache lighting，待 S3 集成。
-- `Source\RenderPasses\LumenGI\MeshSDF\LumenMeshSDFAtlas.*`（S6-B2，Agent I）：落盘未验证，S6B 集成时 cl/MSBuild 验证。
+- `Source\RenderPasses\LumenGI\Lighting\LumenSurfaceCacheLighting*.slang`（S3-B1，Agent J）：direct cache lighting，已集成（S3）。
+- `Source\RenderPasses\LumenGI\MeshSDF\LumenGlobalDistanceField.h` + 测试（S6-A3，Agent Q2，2026-08-09 落盘）：相机中心多级 clipmap、ceil 取整、滚动/dirty/驻留、预算，CPU 测试全绿。
+- `tests\lumengi\run_screentrace.py` / `run_hzb_check.py`（S4 测试资产，Agent R2）：骨架 + S4_TODO 契约。
+- **待办（Atlas 打磨）**：`LumenMeshSDFAtlas` 4 个 CPU 测试失败（SharedPagesAcrossInstances 引用计数、MultiBrickTiling/NonUniformScaleRoundTrip 采样精度、EvictionAndReload）——S6B 轮修复。
 
 ## 1.6 下一步（root 集成优先序）
 
-1. **S2 集成**（下一大块）：LumenGI.cpp 接线 LumenCardScene + LumenCaptureScheduler + LumenSurfaceCache + Capture 3D pass（每 card 一 draw 写 atlas 页）；S2 Gate（card placement 可视化、coverage、resize/reload、churn）。
-2. **S1 收尾**：PathTracer 参考定量对比（run_reference.py 已出 LumenGI 侧数据；需建 PathTracer graph + 固定曝光 + RMSE/FLIP 计算）。
-3. **S4-A1**：HZB 构建 pass + screen trace dispatch + miss reason 统计。
-4. **S3 集成**：cache lighting compute pass + 解析光/emissive/env sampler 绑定。
-5. **S6B**：MeshSDF 集成（注册 CMake、cl 验证 Atlas、GDF clipmap 之后）。
+1. **S3-B2 多反弹反馈**（P2 被中断未做）：S3 gate 关键项（白炉收敛、动态光延迟）。
+2. **S3 Gate 收尾**：cache lighting vs hit-lighting reference 对比、动态光更新延迟。
+3. **S4 集成**：HZB 构建 pass + screen trace dispatch 接入 LumenGI.cpp（S4-A1），消费 S4-B1 shader。
+4. **S6B**：Atlas 4 个测试修复 + MeshSDF 集成 + GDF clipmap 接线。
 
 ## 2. 已落盘实现
 

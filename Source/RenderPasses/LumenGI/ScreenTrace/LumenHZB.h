@@ -45,7 +45,9 @@ namespace Falcor
  * by the S4-B1 screen trace through hzbSampleMaxDepth in
  * LumenScreenTrace.cs.slang):
  *
- *   - mip m  dims  = max(frameDim >> m, 1x1).
+ *   - mip m  dims  = max(ceil(dim / 2^m), 1x1) (ceil-halving, see
+ *     mipDimension: every mip fully covers its parent, so the max chain is
+ *     conservative for hierarchical screen tracing).
  *   - mip 0  holds the full-resolution linear depth, identical to
  *     GBufferRT linearZ.x (RG32F, .x only).
  *   - mip m+1 texel (x, y) = MAX of mip m texels
@@ -126,20 +128,25 @@ public:
         }
     };
 
-    /** mip m dimension of a full-res dimension: max(fullDim >> m, 1). */
+    /** mip m dimension of a full-res dimension: ceil-halving so that every
+        mip fully covers its parent (no discarded odd tail row/column). This
+        keeps the max chain conservative for hierarchical screen tracing:
+        max(dim >> m, 1) (floor) drops the last texel of odd-sized mips and
+        under-estimates the block max. */
     static uint32_t mipDimension(uint32_t fullDim, uint32_t mip)
     {
-        return std::max(fullDim >> mip, 1u);
+        return std::max((fullDim + ((1u << mip) - 1u)) >> mip, 1u);
     }
 
-    /** Number of mip levels: 1 + floor(log2(max(width, height))). */
+    /** Number of mip levels: 1 + ceil(log2(max(width, height))), i.e. the
+        number of ceil-halvings needed to reach 1x1. */
     static uint32_t mipCount(uint32_t width, uint32_t height)
     {
         uint32_t dim = std::max(width, height);
         uint32_t count = 1;
         while (dim > 1)
         {
-            dim >>= 1;
+            dim = (dim + 1u) / 2u;
             ++count;
         }
         return count;

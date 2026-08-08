@@ -87,8 +87,11 @@ static const float kLumenScreenTraceMinProjectDenom = 1e-8f;
 /** Sample the maximum depth of the HZB cell containing pixel p at mip m. */
 float hzbSampleMaxDepth(uint2 p, uint mip)
 {
-    const uint2 mipSize = max(gFrameDim >> mip, uint2(1u, 1u));
-    const uint2 cell = clamp(p >> mip, uint2(0u, 0u), mipSize - 1u);
+    // Ceil-halving, matching LumenHZB.h / LumenHZBBuild.cs.slang: every mip
+    // fully covers its parent so the max chain is conservative.
+    const uint2 scale = uint2(1u << min(mip, 31u), 1u << min(mip, 31u));
+    const uint2 mipSize = max((gFrameDim + scale - 1u) / scale, uint2(1u, 1u));
+    const uint2 cell = clamp(p / scale, uint2(0u, 0u), mipSize - 1u);
     return gHZB.Load(int3(cell, int(mip))).x;
 }
 

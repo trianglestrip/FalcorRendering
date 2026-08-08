@@ -133,16 +133,16 @@ void fillRandom(std::vector<float>& values, uint32_t seed)
 
 CPU_TEST(LumenHZB_MipChainFormulaAndDispatchParams)
 {
-    // 1920x1080: 1 + floor(log2(1920)) = 11 levels.
+    // 1920x1080: ceil-halving reaches 1x1 in 11 steps -> 12 levels.
     const LumenHZB::CreateParams params = LumenHZB::makeCreateParams(1920, 1080);
     EXPECT_TRUE(params.isValid());
     EXPECT_EQ(params.width, 1920u);
     EXPECT_EQ(params.height, 1080u);
-    EXPECT_EQ(params.mipCount, 11u);
+    EXPECT_EQ(params.mipCount, 12u);
 
-    // dim(m) = max(fullDim >> m, 1) for both axes, ending in 1x1.
-    const uint32_t expectedWidths[11] = {1920, 960, 480, 240, 120, 60, 30, 15, 7, 3, 1};
-    const uint32_t expectedHeights[11] = {1080, 540, 270, 135, 67, 33, 16, 8, 4, 2, 1};
+    // dim(m) = ceil(fullDim / 2^m), ending in 1x1 (every mip covers its parent).
+    const uint32_t expectedWidths[12] = {1920, 960, 480, 240, 120, 60, 30, 15, 8, 4, 2, 1};
+    const uint32_t expectedHeights[12] = {1080, 540, 270, 135, 68, 34, 17, 9, 5, 3, 2, 1};
     for (uint32_t mip = 0; mip < params.mipCount; ++mip)
     {
         EXPECT_EQ(LumenHZB::mipDimension(1920, mip), expectedWidths[mip]);
@@ -180,8 +180,8 @@ CPU_TEST(LumenHZB_MipChainFormulaAndDispatchParams)
     EXPECT_EQ(dispatches[0].groupsY, (1080u + 15u) / 16u); // 68
     EXPECT_EQ(dispatches[1].groupsX, (960u + 15u) / 16u);  // 60
     EXPECT_EQ(dispatches[1].groupsY, (540u + 15u) / 16u);  // 34
-    EXPECT_EQ(dispatches[10].groupsX, 1u);                 // 1x1 last mip
-    EXPECT_EQ(dispatches[10].groupsY, 1u);
+    EXPECT_EQ(dispatches[11].groupsX, 1u);                 // 1x1 last mip
+    EXPECT_EQ(dispatches[11].groupsY, 1u);
 
     // Chain layout: per-mip texel counts sum to the chain total, offsets are
     // non-overlapping and contiguous.
@@ -193,14 +193,14 @@ CPU_TEST(LumenHZB_MipChainFormulaAndDispatchParams)
     }
     EXPECT_EQ(LumenHZB::chainTexelCount(params), texelSum);
 
-    // Non-power-of-two and tiny mip counts.
+    // Non-power-of-two and tiny mip counts (ceil-halving).
     EXPECT_EQ(LumenHZB::makeCreateParams(1, 1).mipCount, 1u);
     EXPECT_EQ(LumenHZB::makeCreateParams(2, 2).mipCount, 2u);
-    EXPECT_EQ(LumenHZB::makeCreateParams(3, 3).mipCount, 2u);
-    EXPECT_EQ(LumenHZB::makeCreateParams(5, 5).mipCount, 3u);
-    EXPECT_EQ(LumenHZB::makeCreateParams(33, 17).mipCount, 6u); // 1 + floor(log2(33)) = 6
-    EXPECT_EQ(LumenHZB::mipDimension(33, 4), 2u);
-    EXPECT_EQ(LumenHZB::mipDimension(33, 5), 1u);
+    EXPECT_EQ(LumenHZB::makeCreateParams(3, 3).mipCount, 3u);
+    EXPECT_EQ(LumenHZB::makeCreateParams(5, 5).mipCount, 4u);
+    EXPECT_EQ(LumenHZB::makeCreateParams(33, 17).mipCount, 7u); // ceil-halving to 1x1
+    EXPECT_EQ(LumenHZB::mipDimension(33, 4), 3u); // ceil(33/16)
+    EXPECT_EQ(LumenHZB::mipDimension(33, 5), 2u); // ceil(33/32)
     EXPECT_EQ(LumenHZB::mipDimension(33, 6), 1u); // clamps at 1
 }
 
@@ -220,30 +220,34 @@ CPU_TEST(LumenHZB_MaxPoolingGolden)
     EXPECT_EQ(chain4x4[19], 16.f); // mip 1 (1,1) = max(11,12,15,16)
     EXPECT_EQ(chain4x4[20], 16.f); // mip 2 (0,0) = max of mip 1
 
-    // 5x3 non-power-of-two: mip 1 is 2x1, mip 2 is 1x1. The frozen edge rule
-    // pools texels (2x,2x+1) x (2y,2y+1); source column 4 and row 2 are not
-    // covered by any 2x2 block and are dropped.
+    // 5x3 non-power-of-two: ceil-halving gives mip 1 = 3x2, mip 2 = 2x1,
+    // mip 3 = 1x1. The conservative rule clamps the last odd column
+    // (5,10,15) into the final mip-1 texel instead of dropping it.
     //  1  2  3  4  5
     //  6  7  8  9 10
     // 11 12 13 14 15
     const std::vector<float> input5x3 = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
     const LumenHZB::CreateParams params5x3 = LumenHZB::makeCreateParams(5, 3);
-    EXPECT_EQ(params5x3.mipCount, 3u);
+    EXPECT_EQ(params5x3.mipCount, 4u);
     const std::vector<float> chain5x3 = LumenHZB::buildChainCPU(input5x3.data(), params5x3);
-    EXPECT_EQ(chain5x3.size(), 15u + 2u + 1u);
+    EXPECT_EQ(chain5x3.size(), 15u + 6u + 2u + 1u);
     EXPECT_EQ(chain5x3[15], 7.f);  // mip 1 (0,0) = max(1,2,6,7)
     EXPECT_EQ(chain5x3[16], 9.f);  // mip 1 (1,0) = max(3,4,8,9)
-    EXPECT_EQ(chain5x3[17], 9.f);  // mip 2 (0,0) = max of mip 1
+    EXPECT_EQ(chain5x3[17], 10.f); // mip 1 (2,0) = max(5,10) clamped edge column
+    EXPECT_EQ(chain5x3[21], 14.f); // mip 2 (0,0) = max(mip1 0,0 /1,0 /0,1 /1,1)
+    EXPECT_EQ(chain5x3[23], 15.f); // mip 3 (0,0) = max(mip2)
 
-    // A 3x1 input whose global maximum sits in the dropped column: mip 1 is
-    // 1x1 and must NOT include texel 2 (99).
+    // A 3x1 input whose global maximum sits in the last column: ceil-halving
+    // conservatively includes it (mip 1 is 2x1, texel 1 = max(2,99)).
     //  1  2 99
     const std::vector<float> input3x1 = {1, 2, 99};
     const LumenHZB::CreateParams params3x1 = LumenHZB::makeCreateParams(3, 1);
-    EXPECT_EQ(params3x1.mipCount, 2u);
+    EXPECT_EQ(params3x1.mipCount, 3u);
     const std::vector<float> chain3x1 = LumenHZB::buildChainCPU(input3x1.data(), params3x1);
-    EXPECT_EQ(chain3x1.size(), 3u + 1u);
-    EXPECT_EQ(chain3x1[3], 2.f); // 99 is in the dropped column
+    EXPECT_EQ(chain3x1.size(), 3u + 2u + 1u);
+    EXPECT_EQ(chain3x1[3], 2.f);   // mip 1 (0,0) = max(1,2)
+    EXPECT_EQ(chain3x1[4], 99.f);  // mip 1 (1,0) = max(99) clamped edge
+    EXPECT_EQ(chain3x1[5], 99.f);  // mip 2 = max(mip1)
 }
 
 CPU_TEST(LumenHZB_TinyAndBoundarySizes)
