@@ -47,12 +47,25 @@
  *     layout, the debug mode values. This module reads them, never changes
  *     them.
  *
- * Radiance atlas channel layout (frozen by Agent C):
- *   R,G,B = direct radiance (written by this pass)
- *   A     = indirect radiance (written by S3-B2, multi-bounce feedback).
- * This pass therefore PRESERVES the existing A channel (read-modify-write).
+ * Radiance atlas channel layout (frozen by Agent C, extended by S3-B2):
+ *   R,G,B = total radiance = direct + indirect (direct written by S3-B1,
+ *           indirect added by the S3-B2 multi-bounce feedback).
+ *   A     = indirect radiance (scalar luminance proxy, S3-B2). The capture
+ *           pass clears the whole texel (A = 0) on every (re)capture
+ *           (LumenCardCapture.3d.slang), which the S3-B2 feedback uses as a
+ *           "freshly captured, restart the accumulation" signal.
  * Confidence/visibility is written to the separate gLumenVisibilityAtlas
  * (R16F), because the radiance atlas A channel is not free.
+ *
+ * S3-B2 feedback contract (frozen by this module):
+ *   indirect_curr = albedo * (direct + strength * indirect_prev)
+ *   radiance      = direct + indirect_curr
+ * The recurrence telescopes onto the analytic white-furnace equilibrium
+ * radiance = direct / (1 - albedo*strength) (one extra albedo power per
+ * frame); the bounce cap and the kLumenGIMaxRadiance energy clamp keep every
+ * texel bounded. The host double-buffers two indirect atlases and binds the
+ * previous frame's output as gIndirectPrev; when that buffer is unbound the
+ * shader degrades to the single-bounce result (is_valid guard).
  */
 
 __exported import RenderPasses.LumenGI.Capture.LumenCardCaptureData;
@@ -180,6 +193,12 @@ static const uint kLumenGICacheSeedFrameStride = 0x9E3779B9u;
 // The host binds this cbuffer by name and fills every field every dispatch.
 // Field offsets are fixed below so a C++ struct mirror (added by the root
 // integrator) can be static_asserted against the GPU layout.
+//
+// S3-B2: the previous gReserved[2] padding slot was replaced by the three
+// feedback fields below; the total size stays 48 bytes (16-byte aligned), so
+// hosts written against the S3-B1 48-byte cbuffer keep the same layout for
+// every pre-S3-B2 field. Hosts that never write the three feedback fields
+// leave them 0, which disables the feedback path.
 // ---------------------------------------------------------------------------
 cbuffer LumenSurfaceCacheLightingCB
 {
@@ -191,7 +210,9 @@ cbuffer LumenSurfaceCacheLightingCB
     uint  gDebugMode;       // +20 kLumenDebug* value from LumenGIData.slang; 0 = final output.
     uint2 gAtlasSize;       // +24 Atlas texture size in texels; every page write is bounds-checked against it.
     float gNearMargin;      // +32 Same value the capture pass used for its card cameras (meters); <= 0 means the frozen default kLumenCardCaptureDefaultNearMargin.
-    uint2 gReserved;        // +36 Padding to 48 bytes (multiple of 16).
+    uint  gCacheLightingFeedbackEnabled;    // +36 S3-B2 multi-bounce feedback enable (0/1). Host sets 1 only together with binding gIndirectPrev.
+    float gCacheLightingFeedbackStrength;   // +40 S3-B2 feedback strength multiplier (default 1.0); non-negative, 0 disables the indirect term.
+    uint  gCacheLightingFeedbackMaxBounces; // +44 S3-B2 bounce cap (default 4); indirect saturates (stops growing) after this many bounces.
 };
 
 // ---------------------------------------------------------------------------
@@ -223,6 +244,15 @@ cbuffer LumenSurfaceCacheLightingCB
 #endif
 #ifndef is_valid_gRadianceAtlas
 #define is_valid_gRadianceAtlas 1
+#endif
+#ifndef is_valid_gIndirectPrev
+#define is_valid_gIndirectPrev 0
+#endif
+#ifndef is_valid_gIndirectCurr
+#define is_valid_gIndirectCurr 0
+#endif
+#ifndef is_valid_gBounceCountAtlas
+#define is_valid_gBounceCountAtlas 0
 #endif
 #ifndef is_valid_gLumenVisibilityAtlas
 #define is_valid_gLumenVisibilityAtlas 1
@@ -299,11 +329,30 @@ EmissiveLightSampler emissiveSampler;
 
 // --- Outputs (UAV) ---------------------------------------------------------
 
-/** Radiance atlas (RGBA16F UAV): RGB = average direct radiance (linear),
-    written by this pass; A = indirect radiance, PRESERVED from the previous
-    contents (S3-B2 owns it). Required.
-*/
+/** Radiance atlas (RGBA16F UAV): RGB = total radiance (direct + indirect,
+    linear), written by this pass; A = scalar indirect-radiance proxy (luminance).
+    Required. */
 RWTexture2D<float4> gRadianceAtlas;
+
+/** Previous-frame indirect radiance atlas (RGBA16F SRV, S3-B2 feedback). The
+    host double-buffers two indirect atlases (R,G,B = last frame's indirect)
+    and binds the PREVIOUS frame's output here. The is_valid guard turns the
+    feedback off when this buffer is unbound (see the cs.slang entry point).
+    When the host cannot bind it, the shader falls back to reading the
+    previous indirect from the radiance atlas A channel (the "previous-frame
+    radiance atlas" of the task.md S3-B2 description). */
+Texture2D<float4> gIndirectPrev;
+
+/** Current-frame indirect atlas (RGBA16F UAV, S3-B2). Written by this pass
+    whenever feedback is active (or cleared to 0 when it is not), so the host
+    can flip it into the previous slot on the next frame. */
+RWTexture2D<float4> gIndirectCurr;
+
+/** Per-texel multi-bounce counter (R32Uint UAV, S3-B2). Number of feedback
+    bounces accumulated per texel; the bounce cap freezes indirect growth once
+    it reaches gCacheLightingFeedbackMaxBounces. The capture-reset signal (a
+    zeroed radiance atlas A channel after a re-capture) restarts the counter. */
+RWTexture2D<uint> gBounceCountAtlas;
 
 /** Visibility/confidence atlas (R16F UAV): fraction of samples per texel
     whose next-event estimate survived the hemisphere test AND the shadow

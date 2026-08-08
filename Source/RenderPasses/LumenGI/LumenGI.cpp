@@ -51,6 +51,9 @@ const char kQualityPreset[] = "qualityPreset";
 const char kDebugMode[] = "debugMode";
 const char kUseSurfaceCache[] = "useSurfaceCache";
 const char kUseCacheLighting[] = "useCacheLighting";
+const char kCacheLightingFeedback[] = "cacheLightingFeedback";
+const char kCacheLightingFeedbackStrength[] = "cacheLightingFeedbackStrength";
+const char kCacheLightingFeedbackMaxBounces[] = "cacheLightingFeedbackMaxBounces";
 const char kUseScreenTrace[] = "useScreenTrace";
 const char kUseScreenProbes[] = "useScreenProbes";
 const char kUseTemporalFilter[] = "useTemporalFilter";
@@ -71,7 +74,9 @@ constexpr uint32_t kCaptureDrawArgBytes = 20u;
 ///< Host mirror of cbuffer LumenSurfaceCacheLightingCB in
 ///< LumenSurfaceCacheLightingData.slang (frozen 48-byte layout). The host binds every field by
 ///< name each dispatch; this struct only documents and static-asserts the GPU layout so a
-///< future root-side copy cannot drift from the shader contract.
+///< future root-side copy cannot drift from the shader contract. S3-B2: the S3-B1 gReserved[2]
+///< padding slot was replaced by the three feedback fields; the total stays 48 bytes
+///< (16-byte aligned, no padding), so the pre-S3-B2 fields keep their offsets.
 struct LumenSurfaceCacheLightingCB
 {
     uint32_t gPagesPerSide;    // +0  Tiles per atlas side (must equal the allocator grid).
@@ -82,9 +87,11 @@ struct LumenSurfaceCacheLightingCB
     uint32_t gDebugMode;       // +20 kLumenDebug* from LumenGIData.slang; inert without gDebugTexture.
     uint32_t gAtlasSize[2];    // +24 Atlas size in texels.
     float gNearMargin;         // +32 Card camera near margin (meters); <= 0 -> shader default.
-    uint32_t gReserved[2];     // +36 Padding to 48 bytes.
+    uint32_t gCacheLightingFeedbackEnabled;    // +36 S3-B2 feedback enable (0/1).
+    float gCacheLightingFeedbackStrength;      // +40 S3-B2 feedback strength multiplier.
+    uint32_t gCacheLightingFeedbackMaxBounces; // +44 S3-B2 bounce cap (uint).
 };
-static_assert(sizeof(LumenSurfaceCacheLightingCB) == 44, "LumenSurfaceCacheLightingCB mirror is 44 bytes; slang cbuffer pads to 48 (16B-aligned)");
+static_assert(sizeof(LumenSurfaceCacheLightingCB) == 48, "LumenSurfaceCacheLightingCB mirror is 48 bytes (16B-aligned, no padding)");
 static_assert(offsetof(LumenSurfaceCacheLightingCB, gPagesPerSide) == 0, "gPagesPerSide offset");
 static_assert(offsetof(LumenSurfaceCacheLightingCB, gRenderPageCount) == 4, "gRenderPageCount offset");
 static_assert(offsetof(LumenSurfaceCacheLightingCB, gFrameIndex) == 8, "gFrameIndex offset");
@@ -93,7 +100,9 @@ static_assert(offsetof(LumenSurfaceCacheLightingCB, gSamplesPerTexel) == 16, "gS
 static_assert(offsetof(LumenSurfaceCacheLightingCB, gDebugMode) == 20, "gDebugMode offset");
 static_assert(offsetof(LumenSurfaceCacheLightingCB, gAtlasSize) == 24, "gAtlasSize offset");
 static_assert(offsetof(LumenSurfaceCacheLightingCB, gNearMargin) == 32, "gNearMargin offset");
-static_assert(offsetof(LumenSurfaceCacheLightingCB, gReserved) == 36, "gReserved offset");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gCacheLightingFeedbackEnabled) == 36, "gCacheLightingFeedbackEnabled offset");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gCacheLightingFeedbackStrength) == 40, "gCacheLightingFeedbackStrength offset");
+static_assert(offsetof(LumenSurfaceCacheLightingCB, gCacheLightingFeedbackMaxBounces) == 44, "gCacheLightingFeedbackMaxBounces offset");
 
 const ChannelList kInputChannels = {
     // clang-format off
@@ -182,6 +191,12 @@ void LumenGI::parseProperties(const Properties& props)
             mUseSurfaceCache = value;
         else if (key == kUseCacheLighting)
             mUseCacheLighting = value;
+        else if (key == kCacheLightingFeedback)
+            mCacheLightingFeedbackEnabled = value;
+        else if (key == kCacheLightingFeedbackStrength)
+            mCacheLightingFeedbackStrength = value;
+        else if (key == kCacheLightingFeedbackMaxBounces)
+            mCacheLightingFeedbackMaxBounces = value;
         else if (key == kUseScreenTrace)
             mUseScreenTrace = value;
         else if (key == kUseScreenProbes)
@@ -210,6 +225,9 @@ Properties LumenGI::getProperties() const
     props[kDebugMode] = mDebugMode;
     props[kUseSurfaceCache] = mUseSurfaceCache;
     props[kUseCacheLighting] = mUseCacheLighting;
+    props[kCacheLightingFeedback] = mCacheLightingFeedbackEnabled;
+    props[kCacheLightingFeedbackStrength] = mCacheLightingFeedbackStrength;
+    props[kCacheLightingFeedbackMaxBounces] = mCacheLightingFeedbackMaxBounces;
     props[kUseScreenTrace] = mUseScreenTrace;
     props[kUseScreenProbes] = mUseScreenProbes;
     props[kUseTemporalFilter] = mUseTemporalFilter;
@@ -306,13 +324,19 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     readbackCounters(pRenderContext);
     ensureTraceResources();
 
-    mTracer.pProgram->addDefine("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
-    mTracer.pProgram->addDefine("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
-    mTracer.pProgram->addDefine("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
-    mTracer.pProgram->addDefine("is_valid_gViewW", renderData.getTexture("viewW") ? "1" : "0");
-    mTracer.pProgram->addDefine("is_valid_gLumenGICounters", mpLumenGICounters ? "1" : "0");
-    mTracer.pProgram->addDefine("is_valid_gLightingComponents", mpLightingComponents ? "1" : "0");
-    mTracer.pProgram->addDefines(mpSampleGenerator->getDefines());
+    // Track program-define changes so the vars are recreated whenever the program
+    // recompiles. Without this the per-frame bindings below (notably the emissive
+    // sampler) can target a reflection that no longer matches the freshly
+    // recompiled program, which crashes the bind ("No member named 'emissiveSampler'
+    // found", or an access violation in bindShaderData) on scene/light toggles.
+    bool programChanged = false;
+    programChanged |= mTracer.pProgram->addDefine("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
+    programChanged |= mTracer.pProgram->addDefine("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
+    programChanged |= mTracer.pProgram->addDefine("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
+    programChanged |= mTracer.pProgram->addDefine("is_valid_gViewW", renderData.getTexture("viewW") ? "1" : "0");
+    programChanged |= mTracer.pProgram->addDefine("is_valid_gLumenGICounters", mpLumenGICounters ? "1" : "0");
+    programChanged |= mTracer.pProgram->addDefine("is_valid_gLightingComponents", mpLightingComponents ? "1" : "0");
+    programChanged |= mTracer.pProgram->addDefines(mpSampleGenerator->getDefines());
 
     // Secondary-hit emissive next-event estimation: create and bind the LightBVH
     // sampler when the scene has active emissive lights. The sampler owns a BVH
@@ -322,8 +346,8 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
         if (!mpEmissiveLightSampler)
             mpEmissiveLightSampler = std::make_unique<LightBVHSampler>(pRenderContext, mpScene->getILightCollection(pRenderContext));
         mpEmissiveLightSampler->update(pRenderContext, mpScene->getILightCollection(pRenderContext));
-        mTracer.pProgram->addDefines(mpEmissiveLightSampler->getDefines());
-        mTracer.pProgram->addDefine("LUMEN_GI_HAS_EMISSIVE_SAMPLER", "1");
+        programChanged |= mTracer.pProgram->addDefines(mpEmissiveLightSampler->getDefines());
+        programChanged |= mTracer.pProgram->addDefine("LUMEN_GI_HAS_EMISSIVE_SAMPLER", "1");
     }
     else
     {
@@ -332,11 +356,15 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
         // (EmissiveLightSamplerType::Null = 0xff); otherwise the typedef keeps resolving to the
         // previously-bound LightBVH type across scene/light toggles and default-initializing a
         // resource-typed sampler fails in dxc.
-        mTracer.pProgram->addDefine("LUMEN_GI_HAS_EMISSIVE_SAMPLER", "0");
+        programChanged |= mTracer.pProgram->addDefine("LUMEN_GI_HAS_EMISSIVE_SAMPLER", "0");
         // EmissiveLightSamplerType::Null == 0xff (see EmissiveLightSamplerType.slangh).
-        mTracer.pProgram->addDefine("_EMISSIVE_LIGHT_SAMPLER_TYPE", "255");
+        programChanged |= mTracer.pProgram->addDefine("_EMISSIVE_LIGHT_SAMPLER_TYPE", "255");
     }
 
+    // Recreate the vars when any program define changed so the reflection the
+    // bindings below are resolved against matches the compiled program.
+    if (programChanged)
+        mTracer.pVars = nullptr;
     if (!mTracer.pVars)
         prepareTraceVars();
 
@@ -351,7 +379,10 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     traceVar["gConfidence"] = renderData.getTexture("confidence");
     traceVar["gLumenGICounters"] = mpLumenGICounters;
     traceVar["gLightingComponents"] = mpLightingComponents;
-    if (mpEmissiveLightSampler)
+    // Bind the emissive sampler only when the emissive-light defines are active this frame
+    // (LUMEN_GI_HAS_EMISSIVE_SAMPLER = 1): binding it while the define is 0 targets a parameter
+    // that no longer exists in the shader and crashes the bind.
+    if (mpEmissiveLightSampler && mpScene->useEmissiveLights())
         mpEmissiveLightSampler->bindShaderData(traceVar["emissiveSampler"]);
 
     // Clear the per-pixel lighting components before the trace so pixels
@@ -554,6 +585,14 @@ void LumenGI::renderUI(Gui::Widgets& widget)
             "Env sampler: " + std::string(mpEnvMapSampler ? "created" : "none") +
             "; emissive sampler: " + std::string(mpEmissiveLightSampler ? "created" : "none")
         );
+
+        // S3-B2 multi-bounce feedback controls. The toggles take effect
+        // immediately (like the capture budget slider above): when feedback is
+        // turned off the shader self-cleans the double-buffer and the bounce
+        // counter, so a later enable restarts from the single bounce.
+        group.checkbox("Multi-bounce feedback", mCacheLightingFeedbackEnabled);
+        group.slider("Feedback strength", mCacheLightingFeedbackStrength, 0.f, 2.f, false);
+        group.slider("Feedback max bounces", mCacheLightingFeedbackMaxBounces, 1u, 32u);
     }
 
     if (dirty)
@@ -577,6 +616,20 @@ void LumenGI::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mCacheLightingCounters.reset();
     mCacheLightingCounterReadbackPending = false;
     mLastCacheLightingPageCount = 0;
+    // S3-B2: reset the feedback history on scene change. The indirect double buffer and the
+    // bounce counter are atlas-lifetime; clearing them here (plus the capture pass zeroing the
+    // radiance atlas A channel on every re-capture) guarantees a fresh single-bounce start.
+    mCacheLighting.indirectCurrIndex = 0;
+    if (pRenderContext)
+    {
+        for (const ref<Texture>& pIndirect : mCacheLighting.pIndirect)
+        {
+            if (pIndirect)
+                pRenderContext->clearUAV(pIndirect->getUAV().get(), float4(0.f));
+        }
+        if (mCacheLighting.pBounceCount)
+            pRenderContext->clearUAV(mCacheLighting.pBounceCount->getUAV().get(), uint4(0));
+    }
     resetHistory();
 
     // S2: rebuild the card scene and reset the CPU components. invalidateCaptureResources()
@@ -1281,6 +1334,35 @@ void LumenGI::ensureCacheLightingResources(RenderContext* pRenderContext)
         mpCacheLightingCountersReadback->setName("LumenGI::CacheLighting::CountersReadback");
     }
 
+    // S3-B2 multi-bounce feedback resources: two indirect atlases (RGBA16F, same format as the
+    // radiance atlas; RGB = indirect radiance) double-buffered by the host, plus one per-texel
+    // bounce-cap counter (R32Uint). All cleared once at creation; the shader rewrites every
+    // texel it lights every dispatch (or clears the indirect when the feedback is off), and the
+    // capture pass's radiance-atlas A-channel zeroing is the re-capture reset signal.
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        if (!mCacheLighting.pIndirect[i])
+        {
+            mCacheLighting.pIndirect[i] = mpDevice->createTexture2D(
+                mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+            mCacheLighting.pIndirect[i]->setName(
+                std::string("LumenGI::CacheLighting::Indirect") + (i == 0 ? "A" : "B")
+            ); // RGBA16F, atlas lifetime, S3-B2 double buffer.
+            pRenderContext->clearUAV(mCacheLighting.pIndirect[i]->getUAV().get(), float4(0.f));
+        }
+    }
+    if (!mCacheLighting.pBounceCount)
+    {
+        mCacheLighting.pBounceCount = mpDevice->createTexture2D(
+            mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::R32Uint, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mCacheLighting.pBounceCount->setName("LumenGI::CacheLighting::BounceCount"); // R32Uint, atlas lifetime, S3-B2.
+        pRenderContext->clearUAV(mCacheLighting.pBounceCount->getUAV().get(), uint4(0));
+    }
+
     if (!mCacheLighting.pPass)
         createCacheLightingProgram();
 }
@@ -1358,6 +1440,13 @@ void LumenGI::runCacheLighting(RenderContext* pRenderContext)
     programChanged |= pProgram->addDefine("is_valid_gLumenVisibilityAtlas", "1");
     programChanged |= pProgram->addDefine("is_valid_gLumenGICounters", mpCacheLightingCounters ? "1" : "0");
     programChanged |= pProgram->addDefine("is_valid_gDebugTexture", "0");
+    // S3-B2 feedback resources: gIndirectPrev is only bound (and its is_valid define set) when
+    // the feedback is enabled; the shader guard turns feedback off without it. gIndirectCurr
+    // and the bounce counter stay bound even when disabled so the shader self-cleans them.
+    const bool feedbackOn = mCacheLightingFeedbackEnabled && mUseCacheLighting && mUseSurfaceCache;
+    programChanged |= pProgram->addDefine("is_valid_gIndirectPrev", feedbackOn ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gIndirectCurr", "1");
+    programChanged |= pProgram->addDefine("is_valid_gBounceCountAtlas", "1");
     if (programChanged)
         mCacheLighting.pPass->setVars(nullptr);
 
@@ -1376,6 +1465,13 @@ void LumenGI::runCacheLighting(RenderContext* pRenderContext)
     cacheVar["gLumenPageToCard"] = mCacheLighting.pPageToCard;
     cacheVar["gLumenRenderList"] = mCacheLighting.pRenderList;
     cacheVar["gLumenGICounters"] = mpCacheLightingCounters;
+    // S3-B2 feedback double buffer. When the feedback is off, gIndirectPrev is left unbound
+    // (is_valid_gIndirectPrev = 0 -> shader guard turns the feedback off) and the shader clears
+    // gIndirectCurr to zero, so a later enable starts from a clean single bounce.
+    if (feedbackOn)
+        cacheVar["gIndirectPrev"] = mCacheLighting.pIndirect[1 - mCacheLighting.indirectCurrIndex];
+    cacheVar["gIndirectCurr"] = mCacheLighting.pIndirect[mCacheLighting.indirectCurrIndex];
+    cacheVar["gBounceCountAtlas"] = mCacheLighting.pBounceCount;
     if (mpEnvMapSampler)
         mpEnvMapSampler->bindShaderData(cacheVar["envMapSampler"]);
     if (mpEmissiveLightSampler)
@@ -1391,6 +1487,9 @@ void LumenGI::runCacheLighting(RenderContext* pRenderContext)
     cb["gDebugMode"] = static_cast<uint32_t>(mDebugMode);
     cb["gAtlasSize"] = uint2(mAtlasSizeTexels, mAtlasSizeTexels);
     cb["gNearMargin"] = kCaptureNearMargin;
+    cb["gCacheLightingFeedbackEnabled"] = feedbackOn ? 1u : 0u;
+    cb["gCacheLightingFeedbackStrength"] = mCacheLightingFeedbackStrength;
+    cb["gCacheLightingFeedbackMaxBounces"] = std::max<uint32_t>(1u, mCacheLightingFeedbackMaxBounces);
 
     // The counters must be cleared before each dispatch; copied to the readback buffer after.
     if (mpCacheLightingCounters)
@@ -1403,6 +1502,10 @@ void LumenGI::runCacheLighting(RenderContext* pRenderContext)
     mCacheLighting.pPass->execute(
         pRenderContext, uint3(renderPageCount * kLumenSurfaceCacheTileSize, kLumenSurfaceCacheTileSize, 1)
     );
+
+    // Flip the S3-B2 indirect double buffer: the buffer just written becomes the previous
+    // frame's input on the next dispatch (feedback on or off).
+    mCacheLighting.indirectCurrIndex ^= 1u;
 
     if (mpCacheLightingCounters && mpCacheLightingCountersReadback)
     {

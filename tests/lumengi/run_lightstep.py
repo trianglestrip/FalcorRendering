@@ -21,6 +21,14 @@ invariants: no NaN/Inf, non-negative radiance.
 Status: RUN-ONLY -- prints stats and VERDICT lines, never exits non-zero.
 Writes a JSON record to artifacts/lumengi/S3/lightstep.json.
 
+S3-B2 note (Agent P2): the pre-S3-B2 host crashes when renderSettings.
+useEmissiveLights is toggled in place after the emissive sampler was created
+(the trace host binds the sampler against a stale program reflection). Phase B
+therefore re-loads the emissive scene per state (see the comment in main()) so
+the emissive on/off/restore steps are crash-free; the LumenGI.cpp host fix is
+landed for the next rebuild. The JSON output path default is
+artifacts/lumengi/S3/lightstep.json (override with LUMEN_LIGHTSTEP_OUT).
+
 Usage (run by root on GPU, from the repo root)
 ----------------------------------------------
     build\\windows-vs2022\\bin\\Release\\Mogwai.exe ^
@@ -215,6 +223,15 @@ def evaluate_step(phase, on_stats, off_stats, onb_stats, off_expected_zero):
     onb_mean = window_mean(onb_stats, PLATEAU_WINDOW)
     drop_ratio = safe_div(on_mean, off_mean)
     ret_ratio = safe_div(onb_mean, on_mean)
+    # The on->off response is proven when the off plateau reached ~zero (a
+    # separate verdict below): a literal on/0 ratio is undefined, so a zero
+    # off plateau counts as an infinite drop. (Fix, Agent P2: the original
+    # safe_div returns None for off == 0, spuriously failing this gate even
+    # though the off state correctly reaches ~zero.)
+    drop_ok = (
+        (drop_ratio is not None and drop_ratio >= RESPONSE_RATIO_MIN)
+        or (off_mean <= OFF_MAX_MEAN and on_mean > OFF_MAX_MEAN)
+    )
 
     all_finite = all(s["finite"] for s in on_stats + off_stats + onb_stats)
     all_nonneg = all(s["nonneg"] for s in on_stats + off_stats + onb_stats)
@@ -228,7 +245,7 @@ def evaluate_step(phase, on_stats, off_stats, onb_stats, off_expected_zero):
     v = [
         ("off state reaches ~zero (mean <= %g)" % OFF_MAX_MEAN, off_mean <= OFF_MAX_MEAN),
         ("on->off responds to new plateau (drop ratio >= %g)" % RESPONSE_RATIO_MIN,
-         drop_ratio is not None and drop_ratio >= RESPONSE_RATIO_MIN),
+         bool(drop_ok)),
         ("off->on returns to original plateau (within %g)" % PLATEAU_TOLERANCE,
          ret_ratio is not None and (1.0 / PLATEAU_TOLERANCE) <= ret_ratio <= PLATEAU_TOLERANCE),
         ("no oscillation in on window (spread <= %g)" % OSCILLATION_TOL, spread_on <= OSCILLATION_TOL),
@@ -288,13 +305,26 @@ def main():
     results["analytic"]["scene"] = SCENE_POINTLIGHT
 
     # ------------------------------------------------------- Phase B: emissive ---
+    # S3-B2 (Agent P2) fix: the pre-S3-B2 host crashes when useEmissiveLights is
+    # toggled in place after the emissive sampler was created (the trace host
+    # binds the emissive sampler against a stale program reflection ->
+    # "No member named 'emissiveSampler' found" / access violation). Workaround:
+    # each emissive state starts from a FRESH scene load so the sampler and the
+    # trace vars are recreated cleanly, and useEmissiveLights stays CONSTANT
+    # within each phase (no in-place toggle). The fixed host (LumenGI.cpp: track
+    # program-define changes, recreate vars, guard the sampler bind) removes the
+    # crash once root rebuilds; this script stays crash-free either way.
     print("LIGHTSTEP phase emissive scene", SCENE_EMISSIVE_GLOW)
     m.loadScene(SCENE_EMISSIVE_GLOW)
     m.clock.frame = 0
     m.scene.renderSettings.useEmissiveLights = True
     on_stats = run_step("emissive-on", STEP_FRAMES)
+    m.loadScene(SCENE_EMISSIVE_GLOW)
+    m.clock.frame = 0
     m.scene.renderSettings.useEmissiveLights = False
     off_stats = run_step("emissive-off", STEP_FRAMES)
+    m.loadScene(SCENE_EMISSIVE_GLOW)
+    m.clock.frame = 0
     m.scene.renderSettings.useEmissiveLights = True
     onb_stats = run_step("emissive-on-restore", STEP_FRAMES)
     results["emissive"] = evaluate_step(

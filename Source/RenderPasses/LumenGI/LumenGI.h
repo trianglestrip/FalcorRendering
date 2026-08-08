@@ -210,13 +210,21 @@ private:
     // ------------------------------------------------------------------------------------------
     ///< Cache lighting pass GPU resources. Created lazily by ensureCacheLightingResources();
     ///< pPass is scene-scoped (recreated on setScene/geometry rebuild through
-    ///< invalidateCaptureResources()); the buffers and the visibility atlas are atlas-lifetime.
+    ///< invalidateCaptureResources()); the buffers and the atlases are atlas-lifetime.
     struct
     {
         ref<ComputePass> pPass;          ///< LumenSurfaceCacheLighting.cs.slang, entry "main".
         ref<Buffer> pPageToCard;         ///< gLumenPageToCard (uint32, pageCount+1), SRV; pageID -> cardIndex.
         ref<Buffer> pRenderList;         ///< gLumenRenderList (uint32, pageCount), SRV; resident pages to light this frame.
         ref<Texture> pVisibilityAtlas;   ///< gLumenVisibilityAtlas (R16F), UAV + SRV; per-texel confidence.
+        ///< S3-B2 multi-bounce feedback double buffer (RGBA16F, RGB = indirect radiance).
+        ///< Each frame the shader writes gIndirectCurr = pIndirect[indirectCurrIndex] and
+        ///< reads gIndirectPrev = pIndirect[1 - indirectCurrIndex]; the host flips the index
+        ///< after every dispatch (feedback on or off) so the buffer written this frame becomes
+        ///< the previous frame's input next frame.
+        ref<Texture> pIndirect[2];
+        ref<Texture> pBounceCount;       ///< gBounceCountAtlas (R32Uint), UAV; per-texel bounce cap counter.
+        uint32_t indirectCurrIndex = 0;  ///< Double-buffer slot written this frame (flipped after each dispatch).
     } mCacheLighting;
 
     ///< Host mirror cardIndex -> page generation at the last capture command (size = card
@@ -285,6 +293,16 @@ private:
     DebugMode mDebugMode = DebugMode::None;
     bool mUseSurfaceCache = false;
     bool mUseCacheLighting = false;
+
+    // ------------------------------------------------------------------------------------------
+    // S3-B2: multi-bounce feedback configuration (mirrored into the
+    // LumenSurfaceCacheLightingCB feedback fields each dispatch; see the shader
+    // module header for the frozen recurrence and the LumenGI.cpp CB mirror).
+    // ------------------------------------------------------------------------------------------
+    bool mCacheLightingFeedbackEnabled = false;  ///< cacheLightingFeedback (default off -> single bounce).
+    float mCacheLightingFeedbackStrength = 1.0f; ///< cacheLightingFeedbackStrength (default 1.0).
+    uint32_t mCacheLightingFeedbackMaxBounces = 4u; ///< cacheLightingFeedbackMaxBounces (default 4).
+
     bool mUseScreenTrace = false;
     bool mUseScreenProbes = false;
     bool mUseTemporalFilter = false;

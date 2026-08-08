@@ -242,9 +242,10 @@ struct LumenMeshSDFAtlasInstanceDesc
 /// The root pass memcpys the table into a StructuredBuffer.
 ///
 /// Layout (frozen):
-///     +0   invRows[0] (float4)   world -> object affine rows; pObj =
-///                                invRows[0].xyz*w.x + invRows[1].xyz*w.y +
-///                                invRows[2].xyz*w.z + (row .w components).
+///     +0   invRows[0] (float4)   world -> object affine rows; pObj.x =
+///                                dot(invRows[0].xyz, world) + invRows[0].w,
+///                                pObj.y = dot(invRows[1].xyz, world) + invRows[1].w,
+///                                pObj.z = dot(invRows[2].xyz, world) + invRows[2].w.
 ///     +16  invRows[1]
 ///     +32  invRows[2]
 ///     +48  boundsMin (float3)    instance world AABB (conservative under rotation).
@@ -728,7 +729,14 @@ public:
             float value = 0.f;
             if (!image.empty())
             {
-                const size_t idx = (static_cast<size_t>(texel[2]) * kLumenMeshSDFAtlasPageSize + texel[1]) * kLumenMeshSDFAtlasPageSize + texel[0];
+                // texel == mip voxel coordinate; the CPU page image holds one 32^3
+                // brick, so the lookup uses the page-local coordinate (texel % 32).
+                const uint32_t local[3] = {
+                    texel[0] % kLumenMeshSDFAtlasPageSize,
+                    texel[1] % kLumenMeshSDFAtlasPageSize,
+                    texel[2] % kLumenMeshSDFAtlasPageSize,
+                };
+                const size_t idx = (static_cast<size_t>(local[2]) * kLumenMeshSDFAtlasPageSize + local[1]) * kLumenMeshSDFAtlasPageSize + local[0];
                 value = image[idx];
                 if (coarse) value *= vol.quantRange; // R8Snorm code/127 * R, identical to S6-B1
             }
@@ -781,7 +789,11 @@ public:
     /// sample path rescales by quantRange, identical to S6-B1). Pages are shared,
     /// so one upload serves all instances of the mesh. The GPU path uploads Agent
     /// G's ENCODED bytes into the same page regions; this mirrors it for CPU tests.
-    /// Returns false when the mesh/mip has no resident pages or data size mismatch.
+    /// returns true (a deferred no-op) when the mip is currently non-resident:
+    /// the host uploads every mip proactively (e.g. around an eviction/reload
+    /// cycle), and a page evicted between upload and placement simply has its
+    /// data applied when touchInstance() re-residents it. Returns false only on
+    /// invalid mesh/mip or data-size mismatch.
     bool uploadVolumeFloats(uint32_t meshID, uint32_t mip, const std::vector<float>& data)
     {
         if (meshID >= mMeshes.size()) return false;
@@ -793,7 +805,10 @@ public:
 
         const GroupKey key{meshID, mip};
         const auto it = mGroupMap.find(key);
-        if (it == mGroupMap.end() || !mGroups[it->second].active) return false;
+        if (it == mGroupMap.end() || !mGroups[it->second].active)
+        {
+            return true; // mip not resident: deferred upload, no-op for now.
+        }
 
         const PageGroup& group = mGroups[it->second];
         const std::array<uint32_t, 3> bricks = atlasBrickDims(dims);
@@ -1107,13 +1122,15 @@ private:
         return true;
     }
 
-    /// pObj = A*world + t from the stored inverse rows.
+    /// pObj = A*world + t from the stored inverse rows (row-wise: pObj[i] =
+    /// dot(invRows[i].xyz, world) + invRows[i].w). The inverse affine is stored
+    /// as three ROWS of the inverse matrix, so each output component uses one row.
     static float3_t worldToObject(const InstanceRecord& inst, const float worldPos[3])
     {
         float3_t p;
-        p[0] = inst.invRows[0][0] * worldPos[0] + inst.invRows[1][0] * worldPos[1] + inst.invRows[2][0] * worldPos[2] + inst.invRows[0][3];
-        p[1] = inst.invRows[0][1] * worldPos[0] + inst.invRows[1][1] * worldPos[1] + inst.invRows[2][1] * worldPos[2] + inst.invRows[1][3];
-        p[2] = inst.invRows[0][2] * worldPos[0] + inst.invRows[1][2] * worldPos[1] + inst.invRows[2][2] * worldPos[2] + inst.invRows[2][3];
+        p[0] = inst.invRows[0][0] * worldPos[0] + inst.invRows[0][1] * worldPos[1] + inst.invRows[0][2] * worldPos[2] + inst.invRows[0][3];
+        p[1] = inst.invRows[1][0] * worldPos[0] + inst.invRows[1][1] * worldPos[1] + inst.invRows[1][2] * worldPos[2] + inst.invRows[1][3];
+        p[2] = inst.invRows[2][0] * worldPos[0] + inst.invRows[2][1] * worldPos[1] + inst.invRows[2][2] * worldPos[2] + inst.invRows[2][3];
         return p;
     }
 

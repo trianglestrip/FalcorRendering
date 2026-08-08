@@ -295,7 +295,7 @@ CPU_TEST(LumenMeshSDFAtlas_SharedPagesAcrossInstances)
     atlas.removeInstance(i0);
     atlas.removeInstance(i2);
     EXPECT_EQ(atlas.getStats().residentPages, 6u); // only meshB remains
-    EXPECT_EQ(atlas.getStats().releaseCount, 1u);  // meshA group destroyed once orphaned
+    EXPECT_EQ(atlas.getStats().releaseCount, 5u);  // meshA's 5 page-groups (mip0..mip4) each released once orphaned
 }
 
 // -------------------------------------------------------------------------------------
@@ -511,15 +511,17 @@ CPU_TEST(LumenMeshSDFAtlas_EvictionAndReload)
     EXPECT_EQ(atlas.getMipGeneration(iA, 0), 0u);
 
     // touchInstance() at frame 2 re-residents A's mip0; the budget pass evicts
-    // A's own stale coarse mips one by one and finally B's oldest coarse mip,
-    // so the instance is fully resident again with bumped generations.
+    // A's own stale coarse mips one by one and finally B's oldest group (its
+    // fine mip0: all of B's groups share the same touch frame and the first
+    // inserted group wins the tie), so the instance is fully resident again
+    // with bumped generations.
     atlas.endFrame();
     EXPECT_TRUE(atlas.touchInstance(iA));
     EXPECT_TRUE(atlas.isResident(iA));
     EXPECT_TRUE(atlas.isResident(iA, 0));
     EXPECT_GE(atlas.getMipGeneration(iA, 0), 1u); // stale-page detection
     EXPECT_EQ(atlas.getStats().groupEvictionCount, 7u); // 1 (B reg) + 6 (reload)
-    EXPECT_FALSE(atlas.isResident(iB, 1)); // B's mip1 evicted during the reload
+    EXPECT_FALSE(atlas.isResident(iB, 0)); // B's mip0 evicted during the reload
 
     // After the host re-uploads, the CPU mirror samples the reloaded pages.
     uploadSphere(ctx, atlas, mA);

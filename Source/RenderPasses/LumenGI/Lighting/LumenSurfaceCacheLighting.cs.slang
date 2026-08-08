@@ -26,7 +26,7 @@
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  ***************************************************************************/
 
-/** Surface Cache direct lighting compute pass (S3-B1, Agent J).
+/** Surface Cache direct lighting compute pass (S3-B1, Agent J; S3-B2 feedback).
 
     Lights the captured Surface Cache pages: one threadgroup of
     16 x 16 threads (= one kLumenSurfaceCacheTileSize page) per page. Each
@@ -41,6 +41,18 @@
     LumenGILighting.slang / LumenGILightSampling.slang (Agent B); the BSDF
     is the atlas Lambert model f = albedo/pi, evaluated against the decoded
     shading normal.
+
+    S3-B2 adds the multi-bounce feedback on top of the direct term: each
+    texel reads the previous frame's indirect radiance (host double-buffer
+    bound as gIndirectPrev, or the radiance atlas A channel as a fallback),
+    applies the recurrence indirect_curr = albedo * (direct + strength *
+    indirect_prev) with an energy clamp and a bounce cap, adds it to the
+    direct radiance, and writes the current indirect into gIndirectCurr plus
+    the radiance atlas A channel. When the feedback is disabled (CB bit 0) or
+    gIndirectPrev is unbound, the pass is byte-for-byte the S3-B1 single-bounce
+    direct lighting. See the LumenSurfaceCacheLightingData.slang module header
+    for the frozen recurrence and layout, and the derivation comment near the
+    feedback block in main() below.
 
     Dispatch contract:
       - Render-list mode (default): dispatch (gRenderPageCount, 1, 1);
@@ -57,6 +69,7 @@
       - envMapSampler      unbound  -> uniform-sphere sampling of
                                        gScene.envMap (unbiased, high variance).
       - emissiveSampler    unbound  -> emissive next-event = miss constant 0.
+      - gIndirectPrev      unbound  -> S3-B2 feedback off (single bounce).
       - LUMEN_GI_CACHE_LIGHTING_SHADOWS = 0 -> unshadowed direct lighting.
       - fallback texels (alpha-test / unsupported) -> no radiance write
         (capture cleared the page); confidence written as 0 so the texel
@@ -73,7 +86,11 @@
         (the latter only when LUMEN_GI_CACHE_LIGHTING_SHADOWS = 1).
       - envMapSampler / emissiveSampler bound as in the PathTracer pass.
       - CB fields filled per dispatch; gSamplesPerTexel from
-        LumenCacheLightingQuality.
+        LumenCacheLightingQuality; the S3-B2 feedback fields (enable, strength,
+        maxBounces) from the host properties.
+      - S3-B2 feedback (when enabled): gIndirectPrev (previous frame output),
+        gIndirectCurr (this frame output) and gBounceCountAtlas bound; the host
+        flips the double-buffer after every dispatch.
       - gLumenGICounters cleared before dispatch, read back after.
 */
 
@@ -124,6 +141,15 @@
 #endif
 #ifndef is_valid_gLumenVisibilityAtlas
 #define is_valid_gLumenVisibilityAtlas 1
+#endif
+#ifndef is_valid_gIndirectPrev
+#define is_valid_gIndirectPrev 0
+#endif
+#ifndef is_valid_gIndirectCurr
+#define is_valid_gIndirectCurr 0
+#endif
+#ifndef is_valid_gBounceCountAtlas
+#define is_valid_gBounceCountAtlas 0
 #endif
 #ifndef is_valid_gLumenGICounters
 #define is_valid_gLumenGICounters 0
@@ -275,11 +301,14 @@ void lumenCacheReconstructPosition(
 }
 
 /** Debug view color for the cache lighting output (only called when
-    gDebugTexture is bound and gDebugMode is non-zero).
+    gDebugTexture is bound and gDebugMode is non-zero). `radiance` is the
+    final atlas RGB (direct + S3-B2 indirect); `indirect` is the feedback term
+    (0 when the feedback is off).
 */
 float4 lumenCacheDebugColor(
     const uint debugMode,
-    const float3 direct,
+    const float3 radiance,
+    const float3 indirect,
     const float3 analyticAverage,
     const float3 emissiveAverage,
     const float3 environmentAverage,
@@ -291,7 +320,9 @@ float4 lumenCacheDebugColor(
     switch (debugMode)
     {
     case kLumenDebugDirectLighting:
-        return float4(direct, 1.f);
+        return float4(radiance, 1.f);
+    case kLumenDebugIndirectOnly:
+        return float4(min(indirect, float3(kLumenGIMaxRadiance)), 1.f);
     case kLumenDebugAnalyticOnly:
         return float4(min(analyticAverage, float3(kLumenGIMaxRadiance)), 1.f);
     case kLumenDebugEmissiveOnly:
@@ -303,7 +334,7 @@ float4 lumenCacheDebugColor(
     case kLumenDebugFireflyMask:
         return firefly ? float4(1.f, 0.f, 0.f, 1.f) : float4(0.f, 1.f, 0.f, 1.f);
     default:
-        return float4(direct, 1.f);
+        return float4(radiance, 1.f);
     }
 }
 
@@ -551,11 +582,143 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
     const float confidence = float(visibleSampleCount) * invSampleCount * opacity;
 
     // ------------------------------------------------------------------
+    // S3-B2: multi-bounce feedback (recurrence frozen here + in the data module).
+    //
+    //   indirect_curr = albedo * (direct + strength * indirect_prev)
+    //   radiance      = direct + indirect_curr
+    //
+    // Derivation: treat the previous frame's accumulated indirect as an
+    // incoming radiance field and reflect it with the surface albedo. For a
+    // texel driven by a constant direct signal D with albedo a and feedback
+    // strength s (factor r = a*s), every frame adds one more power of r:
+    //
+    //   indirect_k = a*D + r*indirect_{k-1} = a*D * (1 + r + ... + r^{k-1})
+    //   radiance_k = D * (1 + r + ... + r^k)
+    //
+    // so the loop telescopes onto the analytic white-furnace equilibrium
+    // radiance = D / (1 - r) as k -> inf when r < 1. The bounce cap below
+    // stops the accumulation at gCacheLightingFeedbackMaxBounces terms
+    // (indirect saturates and no longer grows, judged from the previous
+    // frame's counter), which keeps r >= 1 texels (e.g. an albedo-1 emissive
+    // panel) bounded as well. Every term is additionally clamped to
+    // kLumenGIMaxRadiance (energy clamp; exposure-independent, so the result
+    // does not depend on the camera/exposure).
+    //
+    // is_valid guard: feedback requires the previous-indirect buffer. When it
+    // is unbound (or the enable bit is 0) the pass degrades to the plain
+    // single-bounce direct result, identical to the S3-B1 behavior.
+    const bool cacheFeedbackEnabled = (gCacheLightingFeedbackEnabled != 0u) && is_valid(gIndirectPrev);
+    float3 indirect = float3(0.f);
+    if (cacheFeedbackEnabled)
+    {
+        // Previous indirect: the double-buffered atlas when the host binds it;
+        // otherwise fall back to the radiance atlas A channel. The capture
+        // pass clears A to zero on every (re)capture, so the A == 0 test below
+        // also detects freshly captured texels and restarts their accumulation
+        // instead of re-feeding stale pre-capture indirect.
+        float3 indirectPrev = is_valid(gIndirectPrev)
+            ? gIndirectPrev[texel].rgb
+            : float3(gRadianceAtlas[texel].a);
+
+        const float3 albedoC = max(albedo, float3(0.f));
+        const float strength = max(gCacheLightingFeedbackStrength, 0.f);
+        const uint maxBounces = max(1u, gCacheLightingFeedbackMaxBounces);
+
+        uint prevBounces = is_valid(gBounceCountAtlas) ? gBounceCountAtlas[texel] : 0u;
+        if (gRadianceAtlas[texel].a == 0.f)
+        {
+            // Capture-reset: the page was re-captured this frame; restart the
+            // accumulation from the single bounce and clear the bounce count.
+            indirectPrev = float3(0.f);
+            prevBounces = 0u;
+        }
+
+        if (prevBounces < maxBounces)
+        {
+            indirect = albedoC * (direct + strength * indirectPrev);
+            // Energy clamp (kLumenGIMaxRadiance, exposure-independent).
+            indirect = min(indirect, float3(kLumenGIMaxRadiance));
+        }
+        else
+        {
+            // Bounce cap reached: indirect saturates at the previous value and
+            // no longer grows (judged from the previous frame's counter).
+            indirect = min(indirectPrev, float3(kLumenGIMaxRadiance));
+        }
+
+        // Analytic saturation bound for hosts that cannot bind the counter
+        // atlas: after maxBounces bounces indirect cannot exceed the closed
+        // form a*D*(r^B-1)/(r-1) (== B*a*D when r == 1), which is exactly the
+        // value the counter-based cap freezes at for a constant direct. This
+        // keeps the feedback safe even without the counter resource, for r < 1
+        // (converging series) and r > 1 (diverging series) alike.
+        {
+            const float3 r = albedoC * strength;
+            [unroll]
+            for (uint c = 0u; c < 3u; ++c)
+            {
+                const float rc = r[c];
+                const float dc = albedoC[c] * max(direct[c], 0.f);
+                const float cap = (abs(rc - 1.f) < 1e-3f)
+                    ? float(maxBounces) * dc
+                    : dc * (pow(rc, float(maxBounces)) - 1.f) / (rc - 1.f);
+                indirect[c] = min(indirect[c], cap);
+            }
+        }
+
+        if (any(isnan(indirect)) || any(isinf(indirect)))
+        {
+            indirect = float3(0.f);
+            ++nanInfCount;
+        }
+        if (any(indirect < 0.f))
+        {
+            indirect = max(indirect, float3(0.f));
+            ++negativeCount;
+        }
+
+        if (is_valid(gBounceCountAtlas))
+            gBounceCountAtlas[texel] = prevBounces + (prevBounces < maxBounces ? 1u : 0u);
+        if (is_valid(gIndirectCurr))
+            gIndirectCurr[texel] = float4(indirect, 0.f);
+    }
+    else
+    {
+        // Feedback off (or no previous-indirect buffer): single-bounce result.
+        // Clear the feedback history so the double-buffer and the bounce
+        // counter self-clean and re-enabling starts from the single bounce.
+        if (is_valid(gIndirectCurr))
+            gIndirectCurr[texel] = float4(0.f);
+        if (is_valid(gBounceCountAtlas))
+            gBounceCountAtlas[texel] = 0u;
+    }
+
+    // Final atlas radiance: direct + indirect (single bounce when the feedback
+    // is off), energy-clamped to the ceiling.
+    float3 radiance = direct;
+    if (cacheFeedbackEnabled)
+    {
+        radiance = direct + indirect;
+        if (any(isnan(radiance)) || any(isinf(radiance)))
+        {
+            radiance = float3(0.f);
+            ++nanInfCount;
+        }
+        if (any(radiance > float3(kLumenGIMaxRadiance)))
+        {
+            radiance = min(radiance, float3(kLumenGIMaxRadiance));
+            ++fireflyCount;
+            texelFirefly = true;
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Outputs
     // ------------------------------------------------------------------
-    // Radiance atlas: RGB = direct; A = indirect radiance (S3-B2), preserved.
-    const float4 previousRadiance = gRadianceAtlas[texel];
-    gRadianceAtlas[texel] = float4(direct, previousRadiance.a);
+    // Radiance atlas: RGB = total radiance (direct + indirect); A = scalar
+    // indirect-radiance proxy (luminance) written by the S3-B2 feedback, or 0
+    // when the feedback is off. The capture pass clears both on re-capture.
+    gRadianceAtlas[texel] = float4(radiance, dot(indirect, float3(0.2126f, 0.7152f, 0.0722f)));
 
     if (is_valid(gLumenVisibilityAtlas))
         gLumenVisibilityAtlas[texel] = confidence;
@@ -564,7 +727,8 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
     {
         gDebugTexture[texel] = lumenCacheDebugColor(
             gDebugMode,
-            direct,
+            radiance,
+            indirect,
             analyticSum * invSampleCount,
             emissiveSum * invSampleCount,
             environmentSum * invSampleCount,
