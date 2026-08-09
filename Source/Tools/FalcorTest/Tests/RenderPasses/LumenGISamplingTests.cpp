@@ -552,23 +552,23 @@ CPU_TEST(LumenGISampling_SharedLayout_DebugModeValues)
 {
     // LumenGIData.slang constants must match the C++ DebugMode enum values
     // (the host casts mDebugMode into the shader's CB as a uint).
-    EXPECT_EQ(static_cast<uint32_t>(LumenGI::DebugMode::None), kLumenDebugNoneMirror);
-    EXPECT_EQ(static_cast<uint32_t>(LumenGI::DebugMode::Normal), kLumenDebugNormalMirror);
-    EXPECT_EQ(static_cast<uint32_t>(LumenGI::DebugMode::LinearDepth), kLumenDebugLinearDepthMirror);
-    EXPECT_EQ(static_cast<uint32_t>(LumenGI::DebugMode::Motion), kLumenDebugMotionMirror);
-    EXPECT_EQ(static_cast<uint32_t>(LumenGI::DebugMode::MaterialID), kLumenDebugMaterialIDMirror);
-    EXPECT_EQ(static_cast<uint32_t>(LumenGI::DebugMode::Confidence), kLumenDebugConfidenceMirror);
+    EXPECT_EQ(static_cast<uint32_t>(LumenGIPass::DebugMode::None), kLumenDebugNoneMirror);
+    EXPECT_EQ(static_cast<uint32_t>(LumenGIPass::DebugMode::Normal), kLumenDebugNormalMirror);
+    EXPECT_EQ(static_cast<uint32_t>(LumenGIPass::DebugMode::LinearDepth), kLumenDebugLinearDepthMirror);
+    EXPECT_EQ(static_cast<uint32_t>(LumenGIPass::DebugMode::Motion), kLumenDebugMotionMirror);
+    EXPECT_EQ(static_cast<uint32_t>(LumenGIPass::DebugMode::MaterialID), kLumenDebugMaterialIDMirror);
+    EXPECT_EQ(static_cast<uint32_t>(LumenGIPass::DebugMode::Confidence), kLumenDebugConfidenceMirror);
 }
 
 CPU_TEST(LumenGISampling_SharedLayout_DebugModeNames)
 {
     // String mirrors used by Properties serialization must stay stable.
-    EXPECT_EQ(enumToString(LumenGI::DebugMode::None), "None");
-    EXPECT_EQ(enumToString(LumenGI::DebugMode::Normal), "Normal");
-    EXPECT_EQ(enumToString(LumenGI::DebugMode::LinearDepth), "LinearDepth");
-    EXPECT_EQ(enumToString(LumenGI::DebugMode::Motion), "Motion");
-    EXPECT_EQ(enumToString(LumenGI::DebugMode::MaterialID), "MaterialID");
-    EXPECT_EQ(enumToString(LumenGI::DebugMode::Confidence), "Confidence");
+    EXPECT_EQ(enumToString(LumenGIPass::DebugMode::None), "None");
+    EXPECT_EQ(enumToString(LumenGIPass::DebugMode::Normal), "Normal");
+    EXPECT_EQ(enumToString(LumenGIPass::DebugMode::LinearDepth), "LinearDepth");
+    EXPECT_EQ(enumToString(LumenGIPass::DebugMode::Motion), "Motion");
+    EXPECT_EQ(enumToString(LumenGIPass::DebugMode::MaterialID), "MaterialID");
+    EXPECT_EQ(enumToString(LumenGIPass::DebugMode::Confidence), "Confidence");
 }
 
 } // namespace Falcor

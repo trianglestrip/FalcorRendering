@@ -48,8 +48,7 @@ using namespace Falcor;
     independently so that a validated earlier stage remains available as a fallback.
 */
 class LumenGIPass : public RenderPass
-{
-public:
+{public:
     FALCOR_PLUGIN_CLASS(LumenGIPass, "LumenGI", "Real-time diffuse global illumination.");
 
     static ref<LumenGIPass> create(ref<Device> pDevice, const Properties& props) { return make_ref<LumenGIPass>(pDevice, props); }
