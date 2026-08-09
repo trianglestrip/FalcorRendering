@@ -684,7 +684,14 @@ artifacts/lumengi/<phase>/<timestamp>/
 |---|---|---|---|---|
 | S0 基础骨架 | [x] | 无 | 插件、契约、脚本、测试骨架 | `artifacts/lumengi/S0/`（phase0-report.md、manifest.json、unit-debug.xml、hotreload.log、gbuffer-compare.json） |
 | S1 HWRT 基线 | [x] | S0 | 一反弹 diffuse GI（MIS/RR/clamp/NaN 防护、emissive NEE、调试分量） | `artifacts/lumengi/S1/`（reference-compare/metrics2.json、analytic.log、dynamic.log） |
-| S2 Cards/Surface Cache | [x] | S1 | Card、atlas、驻留与 capture | `artifacts/lumengi/S2/`（gate/coverage.log、overlay PNG、churn2.log、debuglayer 零 error）；CPU 39/39；nightly 项：30 分钟 churn、capture image tests |
+| S2 Cards/Surface Cache | [x] | S1 | Card、atlas、驻留与 capture | `artifacts/lumengi/S2/`（gate/coverage、overlay PNG、churn 证据、debuglayer） |
+| S3 Cache Lighting | [x] | S2 | 直接光 cache lighting + 多反弹反馈 | `artifacts/lumengi/S3/`（gate/feedback_gate.json、stability 15/15、lightstep） |
+| S4 Screen Trace/Probe | [x] | S3 | HZB + screen trace + probe grid + integrate/interpolate | `artifacts/lumengi/S4/`（completeness PASS、probe gates、interp 9 gates） |
+| S5 时域/空域 | [x] | S4 | temporal + spatial filter + history | `artifacts/lumengi/S5/`（temporal 14/14、spatial 14/14、ghost 4/4） |
+| S6 Mesh SDF/GDF | [ ] | S2；集成依赖 S5 | builder、atlas、clipmap、hybrid trace（组件齐备+compose/trace 打通，Gate 证据部分） | `artifacts/lumengi/S6/`（compose 运行不崩；软件追踪 vs HWRT 数值对比、S6-C 系列待正式） |
+| S7 Radiance Cache/Far Field | [ ] | S5+S6 | 辐射度缓存与远场（组件落盘未集成 GPU） | `LumenRadianceCache.h` + 23 CPU 测试；GPU 集成待续 |
+| S8 优化/质量档 | [ ] | S7 | compaction、preset、GPU marker（preset 组件落盘） | `LumenQualityPreset.h` + 7 CPU 测试；GPU 接线待续 |
+| S9 发布回归 | [ ] | S8 | 全量测试、性能报告、长稳定（核心回归已跑，完整矩阵待续） | `artifacts/lumengi/S9/`（analytic/dynamic/stability/s2verify/smoke + 110/110 unit） |
 | S3 Surface Cache Lighting | [ ] | S2 | 直接/环境/自发光与 feedback | 待生成 |
 | S4 Screen Probe Gather | [ ] | S3 | screen trace、probe、fallback | 待生成 |
 | S5 时域/空域稳定 | [ ] | S4 | reprojection、滤波、upsample | 待生成 |
