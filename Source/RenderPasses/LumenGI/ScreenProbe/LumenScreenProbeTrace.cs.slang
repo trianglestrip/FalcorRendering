@@ -211,6 +211,21 @@ float2 lumenProbeWorldToPixel(const float3 worldPos)
     return lumenProbeProjectToPixel(tv, gCameraFocalPx, gPrincipalPoint);
 }
 
+/** Decode the GBuffer normWRoughnessMaterialID normal. GBufferRT writes the guide
+    normal OCT-ENCODED (ndir_to_oct_unorm) into the RGB10A2 xy channels; decoding it
+    as a plain n*0.5+0.5 RGB (as the pre-S4.3 host did) produces a wrong, non-unit
+    vector on every real GBuffer. Mirrors LumenGIDebug.cs.slang's oct_to_ndir_unorm
+    (self-contained so the module also compiles standalone).
+*/
+float3 lumenProbeDecodeNormal(const float2 octXY)
+{
+    const float2 p = octXY * 2.f - 1.f;
+    float3 n = float3(p.xy, 1.f - abs(p.x) - abs(p.y));
+    if (n.z < 0.f)
+        n.xy = (1.f - abs(n.yx)) * select(n.xy >= 0.f, 1.f, -1.f);
+    return normalize(n);
+}
+
 /** Radiance at a hit: S4.2 degradation = reuse the S1 per-pixel indirect
     radiance (gDiffuseRadianceHitDist RGB). S4.3 replaces this with the surface
     cache radiance lookup (LumenScreenProbeGather/A3-B3).
@@ -450,9 +465,9 @@ void updateProbe(const uint probeIndex)
         meta.worldPos = lumenProbeUnprojectToWorld(probePixel, z);
 #if is_valid_gNormalRoughnessMaterialID
         const float4 gb = gNormalRoughnessMaterialID[pixel];
-        float3 n = gb.xyz * 2.f - 1.f;
+        float3 n = lumenProbeDecodeNormal(gb.xy);
         meta.normalW = any(isnan(n)) ? float3(0.f, 1.f, 0.f) : normalize(n);
-        meta.materialID = uint(gb.w * 255.f + 0.5f);
+        meta.materialID = uint(round(saturate(gb.w) * 3.f));
 #else
         meta.normalW = float3(0.f, 1.f, 0.f);
         meta.materialID = 0u;

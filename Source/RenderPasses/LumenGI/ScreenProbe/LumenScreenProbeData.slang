@@ -129,6 +129,19 @@ static const uint kLumenScreenProbeCounterCount = 8u;
 static const uint kLumenScreenProbeMetaFlagActive = 1u << 0;  ///< linearZ at the probe > 0.
 static const uint kLumenScreenProbeMetaFlagDirty = 1u << 1;   ///< Depth moved by > gDepthChangeThreshold since last update.
 
+// LumenScreenProbeMeta.materialID: the GBuffer normWRoughnessMaterialID A channel carries a
+// 2-bit material ID (0..3). kLumenScreenProbeMaterialIDNone marks an unknown/unset material
+// (impossible with a valid 2-bit GBuffer ID; reserved for the interpolation material gate).
+static const uint kLumenScreenProbeMaterialIDNone = 0xFFFFFFFFu;
+
+/** Probe index for a clamped grid coordinate (used by the S4-B3 interpolate pass).
+    Row-major: index = gridPos.y * gridDim.x + gridPos.x (identical to the host's grid math).
+ */
+uint lumenScreenProbeIndex(const uint2 gridPos, const uint gridDimX)
+{
+    return gridPos.y * gridDimX + gridPos.x;
+}
+
 // LumenProbeHit.flags
 static const uint kLumenProbeHitFlagNone = 0u;
 static const uint kLumenProbeHitFlagScreenHit = 1u << 0;           ///< Screen-first march confirmed a surface crossing.
@@ -219,7 +232,8 @@ cbuffer LumenScreenProbeCB
     uint    gPad4;              // +164
     uint    gPad5;              // +168
     uint    gPad6;              // +172
-};  // 192 bytes.
+    uint    gWeightMode;        // +176 S4.3 integrate weight mode (kLumenScreenProbeWeightMode*, 0 = cosine hemisphere default). Host-bound per dispatch; all pre-S4.3 offsets preserved.
+};  // 192 bytes (gWeightMode sits in the previously-padded tail).
 
 /** Input / output resources. Optional ones are guarded by is_valid_* defines
     (all default 0). gProbeTLAS is only declared in the non-scene fallback mode.

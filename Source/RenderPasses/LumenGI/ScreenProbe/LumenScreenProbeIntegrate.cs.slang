@@ -26,12 +26,11 @@
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  ***************************************************************************/
 
-/** S4-B3: probe directional integration (Agent Z2).
+/** S4-B3: probe directional integration (Agent Z2, aligned to the Z1 S4.2 layout).
  *
  *  One thread per probe. Each thread reduces the probe's per-direction hit
- *  records (LumenScreenProbeHit, written by Z1's S4-B2 trace / S4-A3 hit
- *  lighting) into a single diffuse irradiance estimate per probe
- *  (LumenScreenProbeRadiance), which the S4-B3 interpolate pass consumes.
+ *  records (LumenProbeHit, written by Z1's S4-B2 trace) into a single diffuse
+ *  irradiance estimate per probe, which the S4-B3 interpolate pass consumes.
  *
  *  ============================================================================
  *  INTEGRATION WEIGHT FORMULA (the contract this pass implements)
@@ -42,12 +41,13 @@
  *  where Ω is the sphere around the probe (directions below the probe plane
  *  contribute zero for an opaque surface).
  *
- *  Z1 generates the direction set by low-discrepancy / blue-noise sampling.
- *  Three standard distributions are supported, selected by gWeightMode; the
- *  per-direction weight is
+ *  Z1 generates the direction set by low-discrepancy / blue-noise sampling in
+ *  the probe's COSINE-WEIGHTED hemisphere (lumenProbeSampleDirection in
+ *  LumenScreenProbeTrace.cs.slang). Three standard distributions are supported,
+ *  selected by gWeightMode; the per-direction weight is
  *        W_i = W0 · s_i · f(ω_i)
- *  with s_i the per-direction stratification weight from
- *  LumenScreenProbeDirection.directionW.w (1.0 for an equal-area set) and
+ *  with s_i the per-direction stratification weight (1.0 for the equal-area
+ *  set Z1 traces; no direction buffer exists, so s_i = 1) and
  *
  *    Mode 0  cosine-weighted hemisphere  (default; pdf ∝ max(ω·n,0)/π):
  *        W0 = π / N,   f(ω_i) = 1
@@ -60,67 +60,66 @@
  *    Mode 2  uniform sphere               (pdf = 1/(4π), includes
  *        W0 = 4π / N,  f(ω_i) = max(ω_i·n, 0)      below-horizon samples)
  *
- *  where N = number of TRACED directions (popcount of the direction mask).
- *  Renormalizing over the traced count keeps the estimate consistent when
- *  S4-A2 adaptive masks skip directions; with the default all-traced set this
- *  is exactly N = kLumenScreenProbeDirections. (The conditional-pdf of a
- *  partial trace is approximated by the uniform 1/N subsample; S4-C3 regression
- *  validates the mask != all case.)
+ *  where N = gDirectionsPerProbe (all directions are traced under the Z1 budget
+ *  path, so N is the traced count). Modes 1/2 are statistical mismatches to the
+ *  cosine-weighted sample set and are kept only for diagnostics; mode 0 is the
+ *  Z1-consistent default.
  *
  *  The final estimator is
  *        E = Σ_i W_i · clamp(Li_i, 0, kLumenScreenProbeMaxRadiance)
- *  over directions whose hit record is valid (flag bit0) and finite. Traced
- *  directions that missed (flag bit1, Li = 0) contribute zero but still scale
- *  the confidence via the valid-hit fraction, so a probe that lost many
+ *  over directions whose hit record is valid (screen hit or HWRT hit) and
+ *  finite. Traced directions that missed (Li = 0) contribute zero but still
+ *  scale the confidence via the valid-hit fraction, so a probe that lost many
  *  directions reports lower confidence instead of a darkened irradiance.
  *
  *  CONFIDENCE
  *        conf = (Σ_i W_i · hitConfidence_i) / (Σ_i W_i)   // over valid hits
- *        conf *= validHitCount / tracedCount              // miss penalty
+ *        conf *= validHitCount / N                         // miss penalty
  *
  *  ============================================================================
- *  INPUT / OUTPUT CONTRACT (host wiring, S4 root integration)
+ *  ALIGNMENT WITH THE Z1 S4.2 LAYOUT (LumenScreenProbeData.slang, frozen)
  *  ============================================================================
- *  cbuffer LumenScreenProbeIntegrateCB (bound by name):
- *      uint  gProbeCount;  // number of probes = probeCols * probeRows
- *      uint  gFrameIndex;  // frame index (diagnostics / future set validation)
- *      uint  gWeightMode;  // kLumenScreenProbeWeightMode* (0 default)
- *      uint  gPad;
- *
- *  Resources (all guarded by is_valid_* defines; every field the shader reads
- *  has an is_valid guard so unbound optional inputs compile and no-op):
- *      StructuredBuffer<LumenScreenProbeMeta>      gProbeMeta;      // required
- *      StructuredBuffer<LumenScreenProbeHit>       gProbeHits;      // required
- *      StructuredBuffer<LumenScreenProbeDirection> gProbeDirections;// required
- *      RWStructuredBuffer<LumenScreenProbeRadiance> gProbeRadiance; // required output
+ *  The Z2 draft assumed per-probe gridState/maskState metadata, a per-direction
+ *  StructuredBuffer<LumenScreenProbeDirection> indexed set*N+dir, and a
+ *  StructuredBuffer<LumenScreenProbeRadiance> output. Z1 landed a DIFFERENT
+ *  contract, which this pass now follows (以 Z1 实际为准):
+ *    * LumenScreenProbeMeta  (64 B): active/normalW/materialID/depth/... -- the
+ *      pass keys validity on `active` and reads `normalW` (oct-decoded by the
+ *      Z1 trace) for the mode 1/2 cosTheta.
+ *    * LumenProbeHit (32 B): the pass reads `flags` (kLumenProbeHitFlag*),
+ *      `radiance` (float3), `confidence`; hit index = probe*gMaxHitRecordStride+dir
+ *      (gMaxHitRecordStride = kLumenScreenProbeMaxDirectionsPerProbe, NOT the
+ *      runtime gDirectionsPerProbe -- this was the Z2->Z1 index fix).
+ *    * No direction buffer: Z1 generates directions on the fly and never stores
+ *      them. This pass RECOMPUTES each direction with the exact
+ *      lumenProbeSampleDirection formula (a pure function of probeIndex,
+ *      dirIndex, frameIndex, gSeed, meta.normalW) so the weights match the
+ *      traced set without a buffer.
+ *    * gProbeRadiance is RWTexture2D<float4> (Z1 contract): RGB = E,
+ *      A = confidence, written sparsely at uint2(meta.screenPos) -- the same
+ *      texel Z1's finalizeMain writes its naive average to.
+ *    * The integrate CB is the SHARED LumenScreenProbeCB (host fills every
+ *      field for the trace passes; S4.3 adds gWeightMode at the tail, +176).
  *
  *  Dispatch: one thread per probe, [numthreads(64,1,1)], thread count
- *  ceil(gProbeCount / 64). The host clears gProbeRadiance before dispatch so
- *  early-out probes (invalid / untraced) leave a deterministic zero record.
+ *  ceil(gProbeCount / 64). The pass writes EVERY probe's texel (active ->
+ *  integrated value, inactive/untraced -> zero) so the radiance texture is
+ *  deterministic without a host clear.
  *
- *  Deterministic: pure function of the input buffers; no randomness, no
- *  shared memory, one thread writes exactly one output record.
- *
- *  ALIGNMENT POINTS WITH Z1 (S4-B2 trace): the probe/hit/direction records
- *  are defined in LumenScreenProbeData.slang with every field marked
- *  ALIGN(Z1); those three structs are the Z2 assumptions for the trace
- *  output layout and may be renamed/reshuffled by the root integration when
- *  Z1 lands. The radiance output below is Z2-owned and frozen.
+ *  Deterministic: pure function of the input buffers; no randomness, no shared
+ *  memory, one thread writes exactly one texel.
  */
 
 #include "LumenScreenProbeData.slang"
 
 // Optional-resource guards. Falcor specializes is_valid_<name> when it binds
-// the resource; local defaults keep the module compilable standalone and
-// every read is guarded so an unbound resource is never dereferenced.
+// the resource; local defaults keep the module compilable standalone and every
+// read is guarded so an unbound resource is never dereferenced.
 #ifndef is_valid_gProbeMeta
 #define is_valid_gProbeMeta 0
 #endif
-#ifndef is_valid_gProbeHits
-#define is_valid_gProbeHits 0
-#endif
-#ifndef is_valid_gProbeDirections
-#define is_valid_gProbeDirections 0
+#ifndef is_valid_gProbeHitRecords
+#define is_valid_gProbeHitRecords 0
 #endif
 #ifndef is_valid_gProbeRadiance
 #define is_valid_gProbeRadiance 0
@@ -144,18 +143,69 @@ static const uint kLumenScreenProbeWeightModeCosineHemisphere = 0u;
 static const uint kLumenScreenProbeWeightModeUniformHemisphere = 1u;
 static const uint kLumenScreenProbeWeightModeUniformSphere = 2u;
 
-cbuffer LumenScreenProbeIntegrateCB
-{
-    uint gProbeCount;   ///< Number of probes (probeCols * probeRows); guards the dispatch.
-    uint gFrameIndex;   ///< Frame index (diagnostics; reserved for direction-set validation).
-    uint gWeightMode;   ///< kLumenScreenProbeWeightMode* (0 = cosine hemisphere, the default).
-    uint gPad;
-};
+// -------------------------------------------------------------------------------------
+// Direction sampling (MIRROR of lumenProbeSampleDirection in LumenScreenProbeTrace.cs.slang;
+// kept local so this module compiles standalone. The trace does not store directions, so the
+// integrate pass recomputes them deterministically to recover cosTheta for modes 1/2).
+// -------------------------------------------------------------------------------------
 
-StructuredBuffer<LumenScreenProbeMeta> gProbeMeta;
-StructuredBuffer<LumenScreenProbeHit> gProbeHits;
-StructuredBuffer<LumenScreenProbeDirection> gProbeDirections;
-RWStructuredBuffer<LumenScreenProbeRadiance> gProbeRadiance;
+/** Standard 32-bit integer hash (Wang). Identical to lumenProbeHash in the trace. */
+uint lumenProbeIntegrateHash(uint x)
+{
+    x = (x ^ 61u) ^ (x >> 16u);
+    x = x * 9u + 0x85ebca6bu;
+    x = x ^ (x >> 13u);
+    x = x * 0xc2b2ae35u;
+    x = x ^ (x >> 16u);
+    return x;
+}
+
+/** Two independent hash outputs of the probe index, normalized to [0, 1). */
+float2 lumenProbeIntegrateHash2(const uint probeIndex)
+{
+    const uint a = lumenProbeIntegrateHash(probeIndex);
+    const uint b = lumenProbeIntegrateHash(a ^ 0x9e3779b9u);
+    return float2(float(a) * (1.0 / 4294967296.0), float(b) * (1.0 / 4294967296.0));
+}
+
+/** Base-2 Van der Corput radical inverse (identical to the trace). */
+float lumenProbeIntegrateRadicalInverse(const uint i)
+{
+    return float(reversebits(i)) * (1.0 / 4294967296.0);
+}
+
+/** Hammersley 2D point (i of n). */
+float2 lumenProbeIntegrateHammersley(const uint i, const uint n)
+{
+    return float2(float(i % n) / float(n), lumenProbeIntegrateRadicalInverse(i));
+}
+
+/** One world-space direction of probe (probeIndex) for slot dirIndex at frame
+    frameIndex (identical formula to lumenProbeSampleDirection in the trace).
+*/
+float3 lumenProbeIntegrateSampleDirection(
+    const uint probeIndex,
+    const uint dirIndex,
+    const uint frameIndex,
+    const float3 normalW
+)
+{
+    const uint n = max(1u, gDirectionsPerProbe);
+    const uint rot = (probeIndex * 2654435761u + frameIndex * 1140071481u + gSeed) % n;
+    const uint j = (dirIndex + rot) % n;
+    float2 u = frac(lumenProbeIntegrateHammersley(j, n) + lumenProbeIntegrateHash2(probeIndex) * (1.0 / float(n)));
+
+    const float3 N = any(isnan(normalW)) ? float3(0.f, 1.f, 0.f) : normalize(normalW);
+    const float3 helper = abs(N.z) < 0.999f ? float3(0.f, 0.f, 1.f) : float3(1.f, 0.f, 0.f);
+    const float3 T = normalize(cross(helper, N));
+    const float3 B = cross(N, T);
+
+    const float z = 1.f - u.x;
+    const float s = sqrt(max(0.f, 1.f - z * z));
+    const float phi = 2.f * kLumenScreenProbePI * u.y;
+    const float3 localDir = float3(s * cos(phi), s * sin(phi), z);
+    return normalize(T * localDir.x + B * localDir.y + N * localDir.z);
+}
 
 /** Per-direction integration weight W_i (see header formula block). */
 float lumenScreenProbeDirectionWeight(
@@ -200,76 +250,65 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     if (probeIndex >= gProbeCount)
         return;
 
-    // Zero output record: valid even when this probe is not traced (the host
-    // may still clear the buffer; this keeps the write independent of that).
-    LumenScreenProbeRadiance outRecord = (LumenScreenProbeRadiance)0;
-
-    if (!is_valid(gProbeMeta) || !is_valid(gProbeHits) || !is_valid(gProbeDirections) || !is_valid(gProbeRadiance))
-    {
-        gProbeRadiance[probeIndex] = outRecord;
-        return;
-    }
+    if (!is_valid(gProbeMeta) || !is_valid(gProbeHitRecords) || !is_valid(gProbeRadiance))
+        return; // Unconfigured pass: never dereference an unbound resource.
 
     const LumenScreenProbeMeta meta = gProbeMeta[probeIndex];
 
-    // Untraced probe: leave a zero record (host clears / or consume zero).
-    if (meta.gridState.w == 0u || meta.gridState.x == kLumenScreenProbeInvalidID)
+    // Output texel: the probe tile center (the Z1 finalize pass writes the same
+    // texel; tile centers always lie inside the frame by construction).
+    const int2 outPixel = int2(meta.screenPos);
+    if (outPixel.x < 0 || outPixel.y < 0 || outPixel.x >= int(gFrameDim.x) || outPixel.y >= int(gFrameDim.y))
+        return;
+
+    // Inactive probe (no surface): deterministic zero record.
+    if (meta.active == 0u)
     {
-        gProbeRadiance[probeIndex] = outRecord;
+        gProbeRadiance[outPixel] = float4(0.f, 0.f, 0.f, 0.f);
         return;
     }
 
-    const float3 probeNormal = normalize(meta.normalW.xyz);
-    const uint directionSet = meta.gridState.z;
-    const uint mask = meta.maskState.x & kLumenScreenProbeDirectionMaskAll;
-    const uint tracedCount = lumenScreenProbePopcount(mask);
-    if (tracedCount == 0u)
-    {
-        gProbeRadiance[probeIndex] = outRecord;
-        return;
-    }
+    const float3 probeNormal = normalize(meta.normalW);
+    const uint n = max(1u, gDirectionsPerProbe);
+    const uint tracedCount = n;
 
     float3 accRadiance = float3(0.f);
     float accConfidence = 0.f;
-    float accDistance = 0.f;
     float accWeight = 0.f;
     uint validHitCount = 0u;
 
-    for (uint dir = 0u; dir < kLumenScreenProbeDirections; ++dir)
+    for (uint dir = 0u; dir < n; ++dir)
     {
-        if ((mask & (1u << dir)) == 0u)
-            continue; // Direction not traced (adaptive mask): not part of the estimator.
+        // Hit record index: probe * FIXED STRIDE + dir (Z1 trace contract; the stride is
+        // kLumenScreenProbeMaxDirectionsPerProbe, not the runtime gDirectionsPerProbe).
+        const LumenProbeHit hit = gProbeHitRecords[probeIndex * gMaxHitRecordStride + dir];
+        if ((hit.flags & (kLumenProbeHitFlagScreenHit | kLumenProbeHitFlagHWRTHit)) == 0u)
+            continue; // Traced but no radiance (screen miss / fallback miss): Li = 0, lowers confidence via hit fraction.
 
-        const LumenScreenProbeHit hit = gProbeHits[probeIndex * kLumenScreenProbeDirections + dir];
-        const uint flags = uint(hit.hitInfo.w);
-        if ((flags & kLumenScreenProbeHitFlagValid) == 0u)
-            continue; // Traced but no radiance (screen miss without fallback): Li = 0, lowers confidence via hit fraction.
-
-        const LumenScreenProbeDirection d = gProbeDirections[directionSet * kLumenScreenProbeDirections + dir];
-        const float3 dirW = normalize(d.directionW.xyz);
-
-        const float3 li = lumenScreenProbeSanitizeRadiance(hit.radiance.rgb);
+        const float3 li = lumenScreenProbeSanitizeRadiance(hit.radiance);
         if (!any(li > float3(0.f)))
             continue; // Zero / sanitized radiance: same as a miss for the estimator and confidence.
         ++validHitCount;
 
+        // Recompute the traced direction (identical formula to the trace) for the mode 1/2
+        // cosTheta; mode 0 is direction-independent (constant π/N weight).
+        const float3 dirW = lumenProbeIntegrateSampleDirection(probeIndex, dir, gFrameIndex, probeNormal);
         const float cosTheta = dot(dirW, probeNormal);
-        const float weight = lumenScreenProbeDirectionWeight(cosTheta, d.directionW.w, gWeightMode, tracedCount);
+        const float weight = lumenScreenProbeDirectionWeight(cosTheta, 1.f, gWeightMode, tracedCount);
         if (weight <= 0.f)
             continue;
 
         accRadiance += weight * li;
-        accConfidence += weight * saturate(hit.radiance.a);
-        accDistance += weight * max(hit.hitInfo.x, 0.f);
+        accConfidence += weight * saturate(hit.confidence);
         accWeight += weight;
     }
 
-    if (accWeight > 0.f)
-    {
-        const float confidence = (accConfidence / accWeight) * (float(validHitCount) / float(tracedCount));
-        outRecord.radiance = float4(lumenScreenProbeSanitizeRadiance(accRadiance / accWeight), confidence);
-        outRecord.stats = float4(accDistance / accWeight, float(validHitCount) / float(tracedCount), 0.f, 0.f);
-    }
-
-    gProbeRadiance[probeIndex] = outRecord;
+    // E = Σ W_i · clamp(Li) (incident irradiance). conf weighted by the valid-hit fraction.
+    const float confidence = (accWeight > 0.f)
+        ? (accConfidence / accWeight) * (float(validHitCount) / float(tracedCount))
+        : 0.f;
+    const float3 irradiance = (accWeight > 0.f)
+        ? lumenScreenProbeSanitizeRadiance(accRadiance)
+        : float3(0.f);
+    gProbeRadiance[outPixel] = float4(irradiance, confidence);
 }

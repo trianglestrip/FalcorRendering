@@ -291,11 +291,18 @@ private:
         ref<ComputePass> pUpdate;    ///< LumenScreenProbeTrace.cs.slang, entry "updateMain" (1 thread / probe).
         ref<ComputePass> pTrace;     ///< entry "traceMain" (1 thread / (probe, direction)).
         ref<ComputePass> pFinalize;  ///< entry "finalizeMain" (1 thread / probe).
+        ref<ComputePass> pIntegrate; ///< LumenScreenProbeIntegrate.cs.slang, entry "main" (S4.3, 1 thread / probe).
+        ref<ComputePass> pInterpolate; ///< LumenScreenProbeInterpolate.cs.slang, entry "main" (S4.3, 8x8 threads).
         ref<Buffer> pMetadata;       ///< gProbeMeta StructuredBuffer<LumenScreenProbe::Meta> (64 B), UAV + SRV.
         ref<Buffer> pHitRecords;     ///< gProbeHitRecords StructuredBuffer<LumenScreenProbe::Hit> (32 B), UAV + SRV.
         ref<Buffer> pCounters;       ///< gProbeCounters StructuredBuffer<LumenScreenProbe::Counters> (32 B), UAV.
         ref<Buffer> pCountersReadback; ///< ReadBack mirror of pCounters for the host stats.
         ref<Texture> pHZBNative;     ///< gHZBMips native floor-halved R32F mip chain (probe march; built per frame).
+        ///< S4.3 internal integrated-probe radiance (RGBA16F, full-res, sparse writes at the
+        ///< probe tile-center texel): RGB = integrated incident irradiance E, A = confidence.
+        ///< Written by pIntegrate, read by pInterpolate. Distinct from the graph "probeRadiance"
+        ///< output (Z1's finalize naive average, consumed by run_probe.py).
+        ref<Texture> pRadiance;
         uint32_t probeCount = 0;     ///< Probe count the buffers were sized for (0 = not created).
         uint2 resourceDim = {0, 0};  ///< Frame dims the resources were built for.
         bool counterReadbackPending = false;
@@ -306,11 +313,30 @@ private:
     ///< tests/lumengi/run_screenprobe.py and the S4-C2 distribution tests (Agent C).
     static constexpr const char* kProbeRadiance = "probeRadiance";
 
+    ///< Scriptable S4.3 interpolate RESULT channel (S5-B1 temporal filter INPUT contract):
+    ///< full-res RGBA16F, RGB = incident irradiance E (composite multiplies by albedo/pi),
+    ///< A = confidence in [0, 1] (0 = sky / no valid tap). Probed by
+    ///< tests/lumengi/run_probe_interp.py (V1/V2) and consumed by the S5-B1 filter.
+    static constexpr const char* kProbeInterpolated = "probeInterpolated";
+
     ///< S4.2 probe configuration. Directions per probe default 16 (fixed hit-record stride
     ///< 32); maxProbesPerFrame default 0 = all probes every frame (updateInterval 1).
     uint32_t mProbeDirectionsPerProbe = LumenScreenProbe::kDefaultDirectionsPerProbe;
     uint32_t mProbeMaxProbesPerFrame = 0u;
     LumenScreenProbe::Stats mScreenProbeStats; ///< Last completed dispatch read-back.
+
+    ///< S4.3 integrate weight mode (gWeightMode in the shared probe CB): 0 = cosine-weighted
+    ///< hemisphere (the only Z1-consistent mode; the trace samples a cosine-weighted set).
+    uint32_t mProbeIntegrateWeightMode = 0u;
+
+    ///< S4.3 interpolate weight parameters (LumenScreenProbeInterpolateCB). Defaults are the
+    ///< Z2 task-spec values: depth dead-zone 0.02 m, depth falloff 4.0 /m, normal exponent 8.0,
+    ///< material-mismatch weight 0.05, degraded-sample confidence scale 0.25.
+    float mProbeInterpDepthThreshold = 0.02f;
+    float mProbeInterpDepthSigmaInv = 4.0f;
+    float mProbeInterpNormalExponent = 8.0f;
+    float mProbeInterpMaterialMismatchWeight = 0.05f;
+    float mProbeInterpFallbackConfidenceScale = 0.25f;
 
     ///< Scriptable S3 gate channel name: exposes the internal radiance atlas (RGB = direct,
     ///< linear) at atlas resolution for tests/lumengi/run_cachelighting.py (Agent N).

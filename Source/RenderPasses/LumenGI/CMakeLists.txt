@@ -25,6 +25,8 @@ target_sources(LumenGI PRIVATE
     ScreenProbe/LumenScreenProbe.h
     ScreenProbe/LumenScreenProbeData.slang
     ScreenProbe/LumenScreenProbeTrace.cs.slang
+    ScreenProbe/LumenScreenProbeIntegrate.cs.slang
+    ScreenProbe/LumenScreenProbeInterpolate.cs.slang
 )
 
 target_copy_shaders(LumenGI RenderPasses/LumenGI)

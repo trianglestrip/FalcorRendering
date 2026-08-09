@@ -39,6 +39,8 @@ const char kCacheLightingShaderFile[] = "RenderPasses/LumenGI/Lighting/LumenSurf
 const char kHZBBuildShaderFile[] = "RenderPasses/LumenGI/ScreenTrace/LumenHZBBuild.cs.slang";
 const char kScreenTraceShaderFile[] = "RenderPasses/LumenGI/ScreenTrace/LumenScreenTrace.cs.slang";
 const char kScreenProbeShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeTrace.cs.slang";
+const char kScreenProbeIntegrateShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeIntegrate.cs.slang";
+const char kScreenProbeInterpolateShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeInterpolate.cs.slang";
 
 ///< S4-A1 screen-trace direction input (frozen shader contract: gRayDirection is a view-space
 ///< direction texture, sampled per pixel and normalized; forward rays must have d.z < 0). The
@@ -149,6 +151,7 @@ const ChannelList kOutputChannels = {
     { "cardCoverage",                  "gCardCoverage",                  "Surface cache page coverage (allocated / total pages)", true, ResourceFormat::R32Float },
     { "screenTrace",                   "gScreenTraceResult",             "S4 screen-space trace: RGB=hitUV/distance, A=confidence or -(reason+1)", true, ResourceFormat::RGBA16Float },
     { "probeRadiance",                 "gProbeRadiance",                 "S4.2 screen probe grid: RGB=avg radiance at the probe, A=hit fraction (sparse)", true, ResourceFormat::RGBA16Float },
+    { "probeInterpolated",             "gGIOutput",                      "S4.3 probe interpolate: RGB=incident irradiance E, A=confidence in [0,1]. S5-B1 temporal-filter input.", true, ResourceFormat::RGBA16Float },
     // clang-format on
 };
 
@@ -693,6 +696,8 @@ void LumenGI::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mScreenProbes.pUpdate = nullptr;
     mScreenProbes.pTrace = nullptr;
     mScreenProbes.pFinalize = nullptr;
+    mScreenProbes.pIntegrate = nullptr;
+    mScreenProbes.pInterpolate = nullptr;
     if (pRenderContext)
     {
         for (const ref<Texture>& pIndirect : mCacheLighting.pIndirect)
@@ -738,6 +743,8 @@ void LumenGI::onHotReload(HotReloadFlags reloaded)
         mScreenProbes.pUpdate = nullptr;
         mScreenProbes.pTrace = nullptr;
         mScreenProbes.pFinalize = nullptr;
+        mScreenProbes.pIntegrate = nullptr;
+        mScreenProbes.pInterpolate = nullptr;
         resetHistory();
     }
 }
@@ -1782,6 +1789,20 @@ void LumenGI::createScreenProbePrograms()
     mScreenProbes.pUpdate = createPass("updateMain");
     mScreenProbes.pTrace = createPass("traceMain");
     mScreenProbes.pFinalize = createPass("finalizeMain");
+
+    // S4.3 integrate + interpolate: pure compute over the frozen data contract
+    // (LumenScreenProbeData.slang). They import no scene modules and trace no rays, so they
+    // are created WITHOUT the scene shader modules / type conformances / gScene binding.
+    // LUMEN_GI_PROBE_SCENE_TRACE=1 skips the data module's #if !LUMEN_GI_PROBE_SCENE_TRACE
+    // gProbeTLAS declaration (no TLAS is ever bound to these passes).
+    const auto createProbeCompute = [&](const char* shaderFile, const char* entry)
+    {
+        DefineList defines;
+        defines.add("LUMEN_GI_PROBE_SCENE_TRACE", "1");
+        return ComputePass::create(mpDevice, shaderFile, entry, defines);
+    };
+    mScreenProbes.pIntegrate = createProbeCompute(kScreenProbeIntegrateShaderFile, "main");
+    mScreenProbes.pInterpolate = createProbeCompute(kScreenProbeInterpolateShaderFile, "main");
 }
 
 void LumenGI::ensureScreenProbeResources(RenderContext* pRenderContext)
@@ -1790,7 +1811,8 @@ void LumenGI::ensureScreenProbeResources(RenderContext* pRenderContext)
         return;
 
     const uint32_t probeCount = LumenScreenProbe::probeCount(mFrameDim);
-    if (!mScreenProbes.pTrace || !mScreenProbes.pUpdate || !mScreenProbes.pFinalize)
+    if (!mScreenProbes.pTrace || !mScreenProbes.pUpdate || !mScreenProbes.pFinalize ||
+        !mScreenProbes.pIntegrate || !mScreenProbes.pInterpolate)
         createScreenProbePrograms();
     if (!mScreenProbes.pTrace)
         return; // scene not ready.
@@ -1830,6 +1852,16 @@ void LumenGI::ensureScreenProbeResources(RenderContext* pRenderContext)
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
         mScreenProbes.pHZBNative->setName("LumenGI::ScreenProbe::HZBNative"); // R32F native mip chain, frame-scoped.
+
+        // S4.3 internal integrated-probe radiance (gProbeRadiance for the integrate/interpolate
+        // passes). Full-res RGBA16F, sparse writes at the probe tile-center texel: RGB = incident
+        // irradiance E, A = confidence. DISTINCT from the graph "probeRadiance" output (Z1's
+        // finalize naive average); it is the integrate -> interpolate intermediate.
+        mScreenProbes.pRadiance = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mScreenProbes.pRadiance->setName("LumenGI::ScreenProbe::RadianceInternal"); // RGBA16F, frame-scoped.
 
         // Prefill the static probe positions (tile centers). Everything else is zero
         // (the update pass resamples active/depth/normal/worldPos every frame).
@@ -1889,7 +1921,9 @@ void LumenGI::runScreenProbeTrace(RenderContext* pRenderContext, const RenderDat
 
     ensureScreenProbeResources(pRenderContext);
     if (!mScreenProbes.pUpdate || !mScreenProbes.pTrace || !mScreenProbes.pFinalize ||
-        !mScreenProbes.pMetadata || !mScreenProbes.pHitRecords || mScreenProbes.probeCount == 0)
+        !mScreenProbes.pIntegrate || !mScreenProbes.pInterpolate ||
+        !mScreenProbes.pMetadata || !mScreenProbes.pHitRecords || !mScreenProbes.pRadiance ||
+        mScreenProbes.probeCount == 0)
     {
         return;
     }
@@ -1906,14 +1940,16 @@ void LumenGI::runScreenProbeTrace(RenderContext* pRenderContext, const RenderDat
     if ((uint64_t)probeCount * directionsPerProbe > kMaxDispatchThreadsX)
         directionsPerProbe = std::max<uint32_t>(1u, (uint32_t)(kMaxDispatchThreadsX / probeCount));
 
-    // Optional inputs, gate the per-frame is_valid defines (the screenTrace output and the
-    // probeRadiance output are graph-allocated; the rest are always present).
+    // Optional inputs, gate the per-frame is_valid defines (the screenTrace output, the
+    // probeRadiance output and the S4.3 probeInterpolated output are graph-allocated; the
+    // rest are always present).
     const bool hasScreenTrace = renderData.getTexture("screenTrace") != nullptr;
     const bool hasProbeRadiance = renderData.getTexture("probeRadiance") != nullptr;
+    const bool hasProbeInterpolated = renderData.getTexture("probeInterpolated") != nullptr;
     const bool hasNormal = renderData.getTexture("normWRoughnessMaterialID") != nullptr;
     const bool hasDiffuseRadiance = renderData.getTexture("diffuseRadianceHitDist") != nullptr;
 
-    // Per-frame program specialization (all three passes share the same shader + defines).
+    // Per-frame program specialization (all three trace passes share the same shader + defines).
     bool programChanged = false;
     for (const ref<ComputePass>& pPass :
          {mScreenProbes.pUpdate, mScreenProbes.pTrace, mScreenProbes.pFinalize})
@@ -1925,11 +1961,31 @@ void LumenGI::runScreenProbeTrace(RenderContext* pRenderContext, const RenderDat
         programChanged |= pProgram->addDefine("is_valid_gNormalRoughnessMaterialID", hasNormal ? "1" : "0");
         programChanged |= pProgram->addDefine("is_valid_gProbeRadiance", hasProbeRadiance ? "1" : "0");
     }
+
+    // S4.3 integrate/interpolate passes: all inputs are internal + always bound, so their
+    // is_valid defines are pinned to 1 (gProbeRadiance here is the INTERNAL pRadiance texture,
+    // independent of the graph "probeRadiance" channel). gGIOutput is the graph-optional
+    // "probeInterpolated" output; the passes are skipped entirely when it is not allocated.
+    if (hasProbeInterpolated && hasNormal)
+    {
+        for (const ref<ComputePass>& pPass : {mScreenProbes.pIntegrate, mScreenProbes.pInterpolate})
+        {
+            ref<Program> pProgram = pPass->getProgram();
+            programChanged |= pProgram->addDefine("is_valid_gProbeMeta", "1");
+            programChanged |= pProgram->addDefine("is_valid_gProbeHitRecords", "1");
+            programChanged |= pProgram->addDefine("is_valid_gProbeRadiance", "1");
+            programChanged |= pProgram->addDefine("is_valid_gLinearZ", "1");
+            programChanged |= pProgram->addDefine("is_valid_gNormalRoughnessMaterialID", "1");
+            programChanged |= pProgram->addDefine("is_valid_gGIOutput", "1");
+        }
+    }
     if (programChanged)
     {
         mScreenProbes.pUpdate->setVars(nullptr);
         mScreenProbes.pTrace->setVars(nullptr);
         mScreenProbes.pFinalize->setVars(nullptr);
+        mScreenProbes.pIntegrate->setVars(nullptr);
+        mScreenProbes.pInterpolate->setVars(nullptr);
     }
 
     // Camera parameters (S4-A1 conventions: focal in pixels, principal = frame center, and the
@@ -2002,6 +2058,7 @@ void LumenGI::runScreenProbeTrace(RenderContext* pRenderContext, const RenderDat
         cb["gEnvFallbackRadiance"] = float3(0.f);
         cb["gDebugMode"] = static_cast<uint32_t>(mDebugMode);
         cb["gProbeCount"] = probeCount;
+        cb["gWeightMode"] = mProbeIntegrateWeightMode; // S4.3 integrate weight mode (0 = cosine hemisphere).
 
         // Resources (shared by all three entry points).
         var["gLinearZ"] = pLinearZ;
@@ -2042,6 +2099,69 @@ void LumenGI::runScreenProbeTrace(RenderContext* pRenderContext, const RenderDat
     mScreenProbes.pTrace->execute(pRenderContext, traceThreads, 1, 1);
 
     mScreenProbes.pFinalize->execute(pRenderContext, updateThreads, 1, 1);
+
+    // ---- S4.3: probe integrate + interpolate (S4-B3) ---------------------------------
+    // Gate: the graph must allocate the "probeInterpolated" output (and the normal input is
+    // present -- the interpolate pass needs it for the normal/material weights). The radiance
+    // intermediate is the INTERNAL pRadiance texture (not the graph "probeRadiance" channel).
+    if (hasProbeInterpolated && hasNormal)
+    {
+        const ref<Texture> pGIOutput = renderData.getTexture("probeInterpolated");
+
+        // Shared CB + shared inputs for the S4.3 passes (mirror the trace bindings; gProbeRadiance
+        // is the internal integrate output). No scene block: these passes have no scene imports.
+        const auto bindProbeCompute = [&](const ref<ComputePass>& pPass)
+        {
+            ShaderVar var = pPass->getRootVar();
+            ShaderVar cb = var["LumenScreenProbeCB"];
+            cb["gFrameDim"] = mFrameDim;
+            cb["gFrameIndex"] = mFrameIndex;
+            cb["gDirectionsPerProbe"] = directionsPerProbe;
+            cb["gProbeGridDims"] = uint2(gridX, (probeCount + gridX - 1u) / gridX);
+            cb["gMaxHitRecordStride"] = LumenScreenProbe::kMaxDirectionsPerProbe;
+            cb["gUpdateInterval"] = interval;
+            cb["gSeed"] = LumenScreenProbe::kSeed;
+            cb["gCameraFocalPx"] = focalLengthPx;
+            cb["gPrincipalPoint"] = float2(0.5f * (float)mFrameDim.x, 0.5f * (float)mFrameDim.y);
+            cb["gInvFrameDim"] = float2(1.f / (float)mFrameDim.x, 1.f / (float)mFrameDim.y);
+            cb["gCameraPosW"] = camPos;
+            cb["gCameraRightW"] = camRight;
+            cb["gCameraUpW"] = camUp;
+            cb["gCameraForwardW"] = camForward;
+            cb["gProbeCount"] = probeCount;
+            cb["gWeightMode"] = mProbeIntegrateWeightMode;
+            var["gLinearZ"] = pLinearZ;
+            if (hasNormal)
+                var["gNormalRoughnessMaterialID"] = renderData.getTexture("normWRoughnessMaterialID");
+            var["gProbeMeta"] = mScreenProbes.pMetadata;
+            var["gProbeHitRecords"] = mScreenProbes.pHitRecords;
+            var["gProbeRadiance"] = mScreenProbes.pRadiance;
+        };
+
+        bindProbeCompute(mScreenProbes.pIntegrate);
+        mScreenProbes.pIntegrate->execute(pRenderContext, updateThreads, 1, 1);
+
+        // Interpolate: bind the interpolate CB (its own cbuffer with the 5 weight params) plus
+        // the shared CB + resources, then dispatch ceil(frameDim / 8) x ceil(frameDim / 8) threads.
+        bindProbeCompute(mScreenProbes.pInterpolate);
+        {
+            ShaderVar var = mScreenProbes.pInterpolate->getRootVar();
+            ShaderVar cb = var["LumenScreenProbeInterpolateCB"];
+            // gFrameDim is read from the shared LumenScreenProbeCB (bound above); the
+            // interpolate CB carries only the grid dim + the 5 weight parameters.
+            cb["gProbeGridDim"] = uint2(gridX, (probeCount + gridX - 1u) / gridX);
+            cb["gDepthThreshold"] = mProbeInterpDepthThreshold;              // meters; depthW dead zone (default 0.02).
+            cb["gDepthSigmaInv"] = mProbeInterpDepthSigmaInv;               // 1/meters; falloff beyond the zone (default 4.0).
+            cb["gNormalExponent"] = mProbeInterpNormalExponent;             // pow on the normal dot (default 8.0).
+            cb["gMaterialMismatchWeight"] = mProbeInterpMaterialMismatchWeight; // material gate residual (default 0.05).
+            cb["gFallbackConfidenceScale"] = mProbeInterpFallbackConfidenceScale; // degraded-sample confidence scale (default 0.25).
+            cb["gPad"] = float2(0.f);
+            var["gGIOutput"] = pGIOutput;
+        }
+        const uint32_t interpThreadsX = ((mFrameDim.x + 7u) / 8u) * 8u;
+        const uint32_t interpThreadsY = ((mFrameDim.y + 7u) / 8u) * 8u;
+        mScreenProbes.pInterpolate->execute(pRenderContext, interpThreadsX, interpThreadsY, 1);
+    }
 
     if (mScreenProbes.pCounters && mScreenProbes.pCountersReadback)
     {
