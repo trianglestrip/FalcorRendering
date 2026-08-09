@@ -1090,10 +1090,8 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
         runSpatialFilter(pRenderContext, renderData);
 
     // S6: Mesh SDF / Global Distance Field pipeline. Active ONLY when explicitly enabled
-    // (mUseGDF). The TraceMode::MeshSDF/Hybrid values remain a UI/API placeholder that falls
-    // back to the HWRT path (todo.md: the software path is not implemented yet) so toggling
-    // them never runs the half-integrated GDF compose pass (which currently lacks the atlas
-    // resource bindings and aborts at dispatch with E_INVALIDARG). Every frame when enabled:
+    // (mUseGDF). When mUseGDF is off, TraceMode::MeshSDF/Hybrid falls back to the HWRT path
+    // exactly like before. Every frame when enabled:
     //   * the camera anchor is pushed into the CPU clipmap (GDF scroll bookkeeping),
     //   * resident Mesh SDF instances are composed into the GDF clipmap textures
     //     (LumenGDFCompose.cs.slang) over the dirty regions only,
@@ -1102,25 +1100,22 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
     //     HardwareRT-with-GDF mode it writes the optional "gdfTrace" diagnostic channel only.
     if (mUseGDF)
     {
-        // S6-in-progress guard: the compose pass reads the mesh-SDF atlas resources that the
-        // host wiring does not create yet; dispatching with them unbound aborts E_INVALIDARG.
-        // Skip the whole S6 path until the full data pipeline is wired.
-        if (mSDF.pFineAtlas && mSDF.pCoarseAtlas && mSDF.pPageTable && mSDF.pVolumes && mSDF.pAtlasInstances)
+        // S6: Mesh SDF / Global Distance Field pipeline. ensureMeshSDFScene() builds the
+        // scene -> cache -> builder -> volume -> atlas -> instance table chain on first use;
+        // ensureGDFResources() creates the GDF clipmap + mesh-SDF atlas GPU resources and the
+        // compose/trace passes (and uploads the atlas pages); runGDFCompose() composes the
+        // clipmap dirty regions; runGDFSphereTrace() runs the screen trace (TraceMode::MeshSDF
+        // writes the S1 outputs). The whole path self-guards: a scene with no registered
+        // resident instances simply composes empty GDF levels.
+        if (!mSDF.pScene)
+            ensureMeshSDFScene();
+        if (mSDF.pScene)
         {
-            if (!mSDF.pScene)
-                ensureMeshSDFScene();
-            if (mSDF.pScene)
-            {
-                ensureGDFResources(pRenderContext);
-                runGDFCompose(pRenderContext);
-                runGDFSphereTrace(pRenderContext, renderData);
-                readbackGDFTraceStats(pRenderContext);
-                mSDF.pScene->endFrame();
-            }
-        }
-        else
-        {
-            logWarning("LumenGI: GDF pipeline skipped (mesh-SDF atlas resources not wired yet; S6 integration pending).");
+            ensureGDFResources(pRenderContext);
+            runGDFCompose(pRenderContext);
+            runGDFSphereTrace(pRenderContext, renderData);
+            readbackGDFTraceStats(pRenderContext);
+            mSDF.pScene->endFrame();
         }
     }
 
@@ -3454,12 +3449,12 @@ void LumenGIPass::ensureGDFResources(RenderContext* pRenderContext)
     if (!mSDF.pFineAtlas || mSDF.pFineAtlas->getWidth() != texels)
     {
         mSDF.pFineAtlas = mpDevice->createTexture3D(
-            texels, texels, texels, ResourceFormat::R16Float, 1, nullptr,
+            texels, texels, texels, ResourceFormat::R32Float, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
         mSDF.pFineAtlas->setName("LumenGIPass::MSDFFineAtlas");
         mSDF.pCoarseAtlas = mpDevice->createTexture3D(
-            texels, texels, texels, ResourceFormat::R8Snorm, 1, nullptr,
+            texels, texels, texels, ResourceFormat::R32Float, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
         mSDF.pCoarseAtlas->setName("LumenGIPass::MSDFCoarseAtlas");
@@ -3469,10 +3464,17 @@ void LumenGIPass::ensureGDFResources(RenderContext* pRenderContext)
             sizeof(uint32_t), s6::kLumenMeshSDFAtlasMaxInstances * s6::kLumenMeshSDFMaxMipCount,
             ResourceBindFlags::ShaderResource
         );
-    if (!mSDF.pVolumes)
-        mSDF.pVolumes = mpDevice->createStructuredBuffer(
-            sizeof(s6::LumenMeshSDFVolumeDescriptor), 256, ResourceBindFlags::ShaderResource
-        );
+    {
+        // Volume descriptors buffer sized to the deduplicated mesh count (grown lazily so a
+        // large scene never overflows the upload). 256 is the fixed minimum.
+        const uint32_t volumeCount = std::max<uint32_t>(mSDF.pScene->instanceTable().meshCount(), 256u);
+        if (!mSDF.pVolumes || mSDF.pVolumes->getElementCount() < volumeCount)
+        {
+            mSDF.pVolumes = mpDevice->createStructuredBuffer(
+                sizeof(s6::LumenMeshSDFVolumeDescriptor), volumeCount, ResourceBindFlags::ShaderResource
+            );
+        }
+    }
     if (!mSDF.pAtlasInstances)
         mSDF.pAtlasInstances = mpDevice->createStructuredBuffer(
             sizeof(s6::LumenMeshSDFAtlasInstance), s6::kLumenMeshSDFAtlasMaxInstances,
@@ -3537,16 +3539,6 @@ void LumenGIPass::runGDFCompose(RenderContext* pRenderContext)
     namespace s6gdf = LumenGI::GlobalDistanceField;
     if (!mSDF.pScene || !mSDF.gdf || !mSDF.pCompose)
         return;
-
-    // S6-in-progress guard: the compose pass currently reads the mesh-SDF atlas resources
-    // (gFineAtlas / gCoarseAtlas / gPageTable / gVolumes / gInstances) that the host wiring
-    // does not create yet. Dispatching with them unbound aborts with D3D12 E_INVALIDARG.
-    // Skip the dispatch (and the dependent trace) until the full S6 data pipeline is wired.
-    if (!mSDF.pFineAtlas || !mSDF.pCoarseAtlas || !mSDF.pPageTable || !mSDF.pVolumes || !mSDF.pAtlasInstances)
-    {
-        logWarning("LumenGI: GDF compose skipped (mesh-SDF atlas resources not wired yet; S6 integration pending).");
-        return;
-    }
 
     // Push the camera anchor into the clipmap (scroll bookkeeping; static levels never scroll).
     const Falcor::float3 camPos = mpScene->getCamera()->getPosition();
@@ -3646,6 +3638,13 @@ void LumenGIPass::runGDFCompose(RenderContext* pRenderContext)
         return; // no dirty voxels this frame (static camera, no instance changes).
 
     // Bind the compose pass.
+    logInfo(
+        "S6 compose bind: P={} texels={} levelCount={} R={} inst={} vol={} fine={} coarse={} pt={} volBuf={} instBuf={} levels={}",
+        mSDF.atlasPagesPerSide, mSDF.atlasPagesPerSide, levelCount, R, mSDF.pScene ? mSDF.pScene->instanceTable().instanceCount() : 0u,
+        mSDF.pScene ? mSDF.pScene->instanceTable().meshCount() : 0u, mSDF.pFineAtlas ? 1u : 0u,
+        mSDF.pCoarseAtlas ? 1u : 0u, mSDF.pPageTable ? 1u : 0u, mSDF.pVolumes ? 1u : 0u,
+        mSDF.pAtlasInstances ? 1u : 0u, (uint32_t)mSDF.levels.size()
+    );
     ShaderVar var = mSDF.pCompose->getRootVar();
     ShaderVar cb = var["LumenGDFComposeCB"];
     ShaderVar clip = cb["gClipmap"];
@@ -3660,24 +3659,27 @@ void LumenGIPass::runGDFCompose(RenderContext* pRenderContext)
     const s6gdf::index3 scroll = mSDF.gdf->scrollFromCameraMove();
     clip["scroll"] = int3(scroll.x, scroll.y, scroll.z);
 
-    // FIXME(S6-diag): strip to CB + UAV array only.
-    // var["gGDFLevelTable"] = mSDF.pLevelTable;
-    // var["gGDFInstances"] = mSDF.pGDFInstances;
-    // var["gGDFDirtyRegions"] = mSDF.pDirtyRegions;
+    var["gGDFLevelTable"] = mSDF.pLevelTable;
+    var["gGDFInstances"] = mSDF.pGDFInstances;
+    var["gGDFDirtyRegions"] = mSDF.pDirtyRegions;
     // Fill EVERY slot of the gGDFLevels[kLumenGDFMaxLevels] array (repeat the last level) so no
     // descriptor is left invalid: D3D12 validates the whole UAV array at dispatch and a null
     // entry aborts with E_INVALIDARG. Only [0, levelCount) is ever accessed by the shader.
-    // Assignment (not setUav) is the Falcor binding contract for texture arrays (TextureArrays test).
+    // UAV arrays are bound with setUav (assignment binds an SRV descriptor, which a UAV array
+    // rejects at dispatch with E_INVALIDARG).
     for (uint32_t m = 0; m < kLumenGDFMaxLevelsHost; ++m)
-        var["gGDFLevels"][m] = mSDF.levels[std::min<uint32_t>(m, levelCount - 1u)];
-    // var["gFineAtlas"] = mSDF.pFineAtlas;
-    // var["gCoarseAtlas"] = mSDF.pCoarseAtlas;
-    // var["gPageTable"] = mSDF.pPageTable;
-    // var["gVolumes"] = mSDF.pVolumes;
-    // var["gInstances"] = mSDF.pAtlasInstances;
-    // var["gAtlasInstanceCount"] = mSDF.pScene->instanceTable().instanceCount();
-    // var["gAtlasVolumeCount"] = mSDF.pScene->instanceTable().meshCount();
-    // var["gAtlasPagesPerSide"] = mSDF.atlasPagesPerSide;
+        var["gGDFLevels"][m].setUav(mSDF.levels[std::min<uint32_t>(m, levelCount - 1u)]->getUAV(0, 1));
+    // S6-B2 atlas bindings (SRV): fine/coarse atlas textures, page table, volume descriptors
+    // and the instance table, plus the atlas-geometry scalars. Created + uploaded every frame
+    // the atlas data is dirty in ensureGDFResources()/uploadMeshSDFAtlas().
+    var["gFineAtlas"] = mSDF.pFineAtlas;
+    var["gCoarseAtlas"] = mSDF.pCoarseAtlas;
+    var["gPageTable"] = mSDF.pPageTable;
+    var["gVolumes"] = mSDF.pVolumes;
+    var["gInstances"] = mSDF.pAtlasInstances;
+    var["gAtlasInstanceCount"] = mSDF.pScene->instanceTable().instanceCount();
+    var["gAtlasVolumeCount"] = mSDF.pScene->instanceTable().meshCount();
+    var["gAtlasPagesPerSide"] = mSDF.atlasPagesPerSide;
 
     // Dispatch: (ceil(maxRegionDimsX / 8), regionCount, ceil(maxRegionDimsYZ / 8)) with
     // numthreads(8, 1, 8); the shader bounds-checks every thread against its region.
@@ -3690,9 +3692,13 @@ void LumenGIPass::runGDFCompose(RenderContext* pRenderContext)
         maxDx = std::max(maxDx, std::max(dx, 1u));
         maxDyz = std::max(maxDyz, std::max(dyz, 1u));
     }
-    logInfo("S6 compose dispatch: x={} y={} z={} (regions={}, maxDx={}, maxDyz={})", ((maxDx + 7u) / 8u) * 8u, static_cast<uint32_t>(regions.size()), ((maxDyz + 7u) / 8u) * 8u, regions.size(), maxDx, maxDyz);
-    // FIXME(S6-diag): minimal dispatch to isolate E_INVALIDARG (binding vs dims).
-    mSDF.pCompose->execute(pRenderContext, 8u, 1u, 8u);
+    logInfo("S6 compose dispatch: x={} y={} z={} (regions={}, maxDx={}, maxDyz={})", (maxDx + 7u) / 8u, static_cast<uint32_t>(regions.size()), (maxDyz + 7u) / 8u, regions.size(), maxDx, maxDyz);
+    mSDF.pCompose->execute(
+        pRenderContext,
+        (maxDx + 7u) / 8u,
+        static_cast<uint32_t>(regions.size()),
+        (maxDyz + 7u) / 8u
+    );
 
     mSDF.sceneStats = mSDF.pScene->getStats();
 }
@@ -3774,8 +3780,8 @@ void LumenGIPass::runGDFSphereTrace(RenderContext* pRenderContext, const RenderD
 
     mSDF.pTrace->execute(
         pRenderContext,
-        ((mFrameDim.x + 7u) / 8u) * 8u,
-        ((mFrameDim.y + 7u) / 8u) * 8u,
+        (mFrameDim.x + 7u) / 8u,
+        (mFrameDim.y + 7u) / 8u,
         1
     );
 
