@@ -96,6 +96,11 @@ SCREEN_TRACE_CHANNEL = "screenTrace"
 # hybrid mode; keep it off here by default.
 USE_SURFACE_CACHE = bool(os.environ.get("LUMEN_SCREENTRACE_USE_SURFACE_CACHE", "") == "1")
 
+# The S4-A1 screen-trace pass only runs when the LumenGI "useScreenTrace" property
+# is set (default false). This gate script turns it on by default so the output
+# channel is actually produced after the S4-A1 integration.
+USE_SCREEN_TRACE = bool(os.environ.get("LUMEN_SCREENTRACE_USE_SCREEN_TRACE", "") != "0")
+
 # S4_TODO[tolerance]: placeholder relative tolerance for the screen-trace vs
 # HWRT hit-distance comparison. See header note; freeze with root before gating.
 HIT_DIST_REL_TOL = 0.25
@@ -163,6 +168,7 @@ def create_lumen_graph(mark_screentrace):
                 "traceMode": "HardwareRT",
                 "qualityPreset": "High",
                 "useSurfaceCache": USE_SURFACE_CACHE,
+                "useScreenTrace": USE_SCREEN_TRACE,
             },
         ),
         "LumenGI",
@@ -201,15 +207,18 @@ def _setup_scene(scene_path):
 def probe_screentrace(scene_path):
     """Try to render with the S4 channel marked. Returns (available, graph).
 
-    Pre-S4 the channel does not exist and graph compile fails on the first
-    render; we rebuild the graph without it, render once, and report
-    available=False so the gates become SKIP (never a crash).
+    Pre-S4 the channel does not exist: graph.markOutput('LumenGI.screenTrace')
+    throws immediately (field validation), so the whole probe body -- including
+    create_lumen_graph -- must be inside the try. On failure we rebuild the graph
+    without the channel, render once, and report available=False so the gates
+    become SKIP (never a crash).
     """
-    graph = create_lumen_graph(mark_screentrace=True)
-    m.addGraph(graph)
-    m.setActiveGraph(graph)
-    _setup_scene(scene_path)
+    graph = None
     try:
+        graph = create_lumen_graph(mark_screentrace=True)
+        m.addGraph(graph)
+        m.setActiveGraph(graph)
+        _setup_scene(scene_path)
         m.clock.frame = 1
         m.renderFrame()
         return True, graph
@@ -219,7 +228,11 @@ def probe_screentrace(scene_path):
             "(pre-S4 integration expected); channel absent -> %s"
             % (SCREEN_TRACE_CHANNEL, str(exc))
         )
-        m.removeGraph(graph)
+        if graph is not None:
+            try:
+                m.removeGraph(graph)
+            except Exception:
+                pass
         graph = create_lumen_graph(mark_screentrace=False)
         m.addGraph(graph)
         m.setActiveGraph(graph)
@@ -355,6 +368,7 @@ def main(scene_path, out_json):
         "scene": scene_path,
         "resolution": list(RESOLUTION),
         "useSurfaceCache": USE_SURFACE_CACHE,
+        "useScreenTrace": USE_SCREEN_TRACE,
         "screentrace_channel": SCREEN_TRACE_CHANNEL if available else None,
         "screentrace_available": available,
     }
@@ -385,8 +399,9 @@ def main(scene_path, out_json):
 
 
 # --- entry point (mirrors the sibling scripts: read config, run, exit) --------
-# Guarded so the decode/reference functions can be imported by unit tests
-# without executing the Falcor pipeline (Falcor runs this file as __main__).
-if __name__ == "__main__":
-    main(SCENE, OUT_JSON)
-    exit()
+# NOTE (Agent W, S4-A1): Falcor's embedded Python executes the script with
+# __name__ == 'builtins', so an `if __name__ == "__main__":` guard never runs
+# (the pass would silently do nothing and Mogwai would stay open). Call main()
+# unconditionally like the other working run_*.py scripts.
+main(SCENE, OUT_JSON)
+exit()

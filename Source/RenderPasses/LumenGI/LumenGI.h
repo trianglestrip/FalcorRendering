@@ -34,6 +34,7 @@
 #include "Rendering/Lights/EnvMapSampler.h"
 #include "LumenGIStats.h"
 #include "Capture/LumenCaptureScheduler.h" // Brings in Cards/LumenCardScene.h and SurfaceCache/LumenSurfaceCache.h.
+#include "ScreenTrace/LumenHZB.h" // S4-A1 HZB chain host component (mip dims / dispatch params).
 
 using namespace Falcor;
 
@@ -166,6 +167,14 @@ private:
     ///< command stream) plus the page cache residency/generation. Returns the render list size.
     uint32_t buildCacheLightingRenderData();
 
+    // ------------------------------------------------------------------------------------------
+    // S4: hierarchical screen-space trace host (S4-A1: HZB build + screen trace dispatch)
+    // ------------------------------------------------------------------------------------------
+    void createHZBBuildProgram();
+    void createScreenTraceProgram();
+    void ensureScreenTraceResources(RenderContext* pRenderContext);
+    void runScreenTrace(RenderContext* pRenderContext, const RenderData& renderData);
+
     ///< gSamplesPerTexel preset mapping: Low/Medium/High/Reference -> 1/2/4/8
     ///< (LumenCacheLightingQuality in LumenSurfaceCacheLightingData.slang).
     uint32_t cacheLightingSamplesPerTexel() const;
@@ -245,6 +254,22 @@ private:
     bool mCacheLightingCounterReadbackPending = false;
     LumenGIFrameCounters mCacheLightingCounters; ///< Read back cache-lighting counter values (last completed dispatch).
     uint32_t mLastCacheLightingPageCount = 0;    ///< Pages lit by the last dispatch (0 = none).
+
+    // ------------------------------------------------------------------------------------------
+    // S4: hierarchical screen-space trace host (S4-A1: HZB build + screen trace dispatch)
+    // ------------------------------------------------------------------------------------------
+    ///< Screen-trace pass GPU resources, created lazily by ensureScreenTraceResources().
+    ///< pPasses are plain compute (no scene block): the HZB build reads GBufferRT.linearZ,
+    ///< the screen trace reads linearZ + the internal HZB chain + the fixed direction texture
+    ///< and writes the optional "screenTrace" graph output (RGBA16F).
+    struct
+    {
+        ref<ComputePass> pHZBBuild; ///< LumenHZBBuild.cs.slang, entry "main" (one dispatch per mip).
+        ref<ComputePass> pTrace;    ///< LumenScreenTrace.cs.slang, entry "main" (8x8 threads).
+        std::vector<ref<Texture>> pHZBMips; ///< Independent R32F textures, one per ceil-halving level (D3D12 mip chains are floor-sized).
+        ref<Texture> pRayDirection; ///< RGBA32F view-space ray direction (S4-A1 direction input; see .cpp).
+        uint2 resourceDim = {0, 0}; ///< Frame dims the resources were built for; recreated on resize.
+    } mScreenTrace;
 
     ///< Scriptable S3 gate channel name: exposes the internal radiance atlas (RGB = direct,
     ///< linear) at atlas resolution for tests/lumengi/run_cachelighting.py (Agent N).

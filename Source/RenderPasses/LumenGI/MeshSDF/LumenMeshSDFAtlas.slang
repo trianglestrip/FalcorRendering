@@ -50,9 +50,11 @@
 //
 //  SAMPLING MATH (canonical; mirrors LumenMeshSDFAtlas.h)
 //  -------------------------------------------------------------------------------------
-//  Instance transform is the INVERSE affine (world -> object):
-//      pObj = invRow0.xyz*w.x + invRow1.xyz*w.y + invRow2.xyz*w.z
-//           + float3(invRow0.w, invRow1.w, invRow2.w)
+//  Instance transform is the INVERSE affine (world -> object), applied ROW-WISE exactly
+//  like the CPU mirror (LumenMeshSDFAtlas.h::worldToObject):
+//      pObj.x = dot(invRow0.xyz, world) + invRow0.w
+//      pObj.y = dot(invRow1.xyz, world) + invRow1.w
+//      pObj.z = dot(invRow2.xyz, world) + invRow2.w
 //  The volume lives in OUTPUT space (Agent G's .msdf contract):
 //      pOut = pObj * normalizationScale
 //      u    = (pOut - bboxMin) * invVoxelSize - 0.5      (mip-0 continuous coords)
@@ -126,9 +128,10 @@ enum class LumenMeshSDFAtlasMissReason : uint
 // -------------------------------------------------------------------------------------
 // 84 bytes under Slang scalar layout == C layout. The root pass memcpys the C++
 //  table into a StructuredBuffer. Frozen offsets:
-//      +0 invRows[0].xyzw      world -> object affine rows; pObj =
-//                              invRow0.xyz*w.x + invRow1.xyz*w.y + invRow2.xyz*w.z
-//                              + (row .w components as translation).
+//      +0 invRows[0].xyzw      world -> object affine rows; the inverse affine is applied
+//                              ROW-WISE (matches LumenMeshSDFAtlas.h): pObj.x =
+//                              dot(invRow0.xyz, world) + invRow0.w, pObj.y = dot(invRow1.xyz,
+//                              world) + invRow1.w, pObj.z = dot(invRow2.xyz, world) + invRow2.w.
 //      +16 invRows[1], +32 invRows[2]
 //      +48 boundsMin.xyz, +60 boundsMax.xyz (world AABB)
 //      +72 meshID (uint; 0xFFFFFFFF = dead slot -> NoInstance)
@@ -204,11 +207,23 @@ uint3 lumenMeshSDFAtlasMipDims(LumenMeshSDFVolumeDescriptor vol, uint mip)
     return dims;
 }
 
-/// World -> object via the stored inverse affine rows.
+/// World -> object via the stored inverse affine rows. The inverse affine is stored as
+/// three ROWS of the inverse matrix (pObj.x = dot(invRow0.xyz, world) + invRow0.w, ...),
+/// so each output component consumes exactly ONE row - byte-identical to the CPU mirror
+/// LumenMeshSDFAtlas.h::worldToObject.
+/// FIXED: this function previously applied the inverse by COLUMNS (invRow0.xyz*w.x +
+/// invRow1.xyz*w.y + invRow2.xyz*w.z), i.e. it computed M^T*world + t instead of M*world
+/// + t. For a rotated instance the result was the transpose of the intended mapping, so
+/// atlas samples of rotated instances were mirrored/reflected; for the axis-aligned
+/// identity-like matrices used by the CPU unit tests the two coincide, which is why the
+/// bug went unnoticed. Keep the formula below in sync with the .h.
 float3 lumenMeshSDFAtlasWorldToObject(LumenMeshSDFAtlasInstance inst, float3 worldPos)
 {
-    return inst.invRow0.xyz * worldPos.x + inst.invRow1.xyz * worldPos.y +
-           inst.invRow2.xyz * worldPos.z + float3(inst.invRow0.w, inst.invRow1.w, inst.invRow2.w);
+    return float3(
+        dot(inst.invRow0.xyz, worldPos),
+        dot(inst.invRow1.xyz, worldPos),
+        dot(inst.invRow2.xyz, worldPos))
+        + float3(inst.invRow0.w, inst.invRow1.w, inst.invRow2.w);
 }
 
 /// Continuous mip-0 voxel coords (voxel-center convention, S6-B1); voxel i sits at

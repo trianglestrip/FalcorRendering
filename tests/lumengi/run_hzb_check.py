@@ -9,12 +9,13 @@ an observation path and this script runs the check. Until then it PROBES for
 the observation channel and SKIPs (never crashes).
 
 HZB CONTRACT (LumenHZB.h / LumenHZBBuild.cs.slang, frozen):
-  * mip m dims  = max(frameDim >> m, 1x1)   (FLOOR halving).
+  * mip m dims  = max(ceil(dim / 2^m), 1x1)   (CEIL halving, S4-A1 fixed by root; every mip
+    fully covers its parent so the max chain is conservative for hierarchical tracing).
   * mip 0       = full-resolution linear depth == GBufferRT.linearZ.x.
   * mip m+1 (x, y) = MAX of mip m texels
         (2x, 2y), (2x+1, 2y), (2x, 2y+1), (2x+1, 2y+1),
     with out-of-range coordinates CLAMPED to the source dims - 1 (edge texel
-    duplicated). mipCount = 1 + floor(log2(max(width, height))).
+    duplicated). mipCount = 1 + ceil(log2(max(width, height))).
 
   The CPU mirror buildChainCPU/buildMipCPU in LumenHZB.h is the bit-identical
   reference; build_hzb_reference() below re-implements exactly that in numpy
@@ -102,16 +103,16 @@ def write_json(path, payload):
 
 
 def hzb_mip_dim(full_dim, mip):
-    """max(fullDim >> mip, 1) - LumenHZB::mipDimension."""
-    return max(full_dim >> mip, 1)
+    """max(ceil(fullDim / 2^mip), 1) - LumenHZB::mipDimension (ceil-halving, frozen S4-A1)."""
+    return max((full_dim + (1 << mip) - 1) >> mip, 1)
 
 
 def hzb_mip_count(width, height):
-    """1 + floor(log2(max(width, height))) - LumenHZB::mipCount."""
+    """1 + ceil(log2(max(width, height))) - LumenHZB::mipCount (ceil-halving)."""
     dim = max(width, height)
     count = 1
     while dim > 1:
-        dim >>= 1
+        dim = (dim + 1) // 2
         count += 1
     return count
 
@@ -213,12 +214,18 @@ def _setup_scene(scene_path):
 
 
 def probe_hzb(scene_path):
-    """Probe the HZB observation channel. Returns (available, graph)."""
-    graph = create_lumen_graph(mark_hzb=True)
-    m.addGraph(graph)
-    m.setActiveGraph(graph)
-    _setup_scene(scene_path)
+    """Probe the HZB observation channel. Returns (available, graph).
+
+    graph.markOutput('LumenGI.hzb') throws immediately when the channel is
+    absent, so the whole probe body (including create_lumen_graph) is inside the
+    try; on failure we rebuild without the channel and render once (SKIP path).
+    """
+    graph = None
     try:
+        graph = create_lumen_graph(mark_hzb=True)
+        m.addGraph(graph)
+        m.setActiveGraph(graph)
+        _setup_scene(scene_path)
         m.clock.frame = 1
         m.renderFrame()
         return True, graph
@@ -227,7 +234,11 @@ def probe_hzb(scene_path):
             "HZBCHECK WARNING HZB observation channel 'LumenGI.%s' not available "
             "(pre-S4-A1 integration expected); channel absent -> %s" % (HZB_CHANNEL, str(exc))
         )
-        m.removeGraph(graph)
+        if graph is not None:
+            try:
+                m.removeGraph(graph)
+            except Exception:
+                pass
         graph = create_lumen_graph(mark_hzb=False)
         m.addGraph(graph)
         m.setActiveGraph(graph)
@@ -356,7 +367,7 @@ def main(scene_path, out_json):
 
     all_pass = structural_ok and all(r["passed"] for r in mip_rows)
     verdicts = []
-    verdicts.append(("HZB structural (mipCount == 1+floor(log2 max dim))", "PASS" if structural_ok else "FAIL"))
+    verdicts.append(("HZB structural (mipCount == 1+ceil(log2 max dim))", "PASS" if structural_ok else "FAIL"))
     verdicts.append(("HZB mip0 == linearZ.x (max-abs <= %g)" % HZB_TOL, "PASS" if mip0_row["passed"] else "FAIL"))
     verdicts.append(
         (
@@ -377,8 +388,8 @@ def main(scene_path, out_json):
 
 
 # --- entry point ---------------------------------------------------------------
-# Guarded so the pure reference functions can be imported by unit tests without
-# executing the Falcor pipeline (Falcor runs this file as __main__).
-if __name__ == "__main__":
-    main(SCENE, OUT_JSON)
-    exit()
+# NOTE (Agent W, S4-A1): Falcor's embedded Python executes the script with
+# __name__ == 'builtins', so an `if __name__ == "__main__":` guard never runs.
+# Call main() unconditionally like the other working run_*.py scripts.
+main(SCENE, OUT_JSON)
+exit()

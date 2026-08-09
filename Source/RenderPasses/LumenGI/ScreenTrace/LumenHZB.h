@@ -75,11 +75,14 @@ namespace Falcor
  * [numthreads(16, 16, 1)]).
  *
  * Host texture creation (for the S4-A1 integration; shown here only as the
- * contract, this class does not depend on Device):
- *   Texture::create2D(width, height, ResourceFormat::R32Float, mipCount,
- *                     1, 1, nullptr,
- *                     ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess)
- * Bind gHZBTarget = pTexture->getUAV(mip), gHZBSource = pTexture->getSRV(mip-1),
+ * contract, this class does not depend on Device). One INDEPENDENT texture per
+ * level (ceil-halving dims; D3D12 native mip chains are floor-sized and cannot
+ * hold a ceil chain):
+ *   for mip in [0, mipCount):
+ *     Texture::create2D(mipDimension(w, mip), mipDimension(h, mip),
+ *                       ResourceFormat::R32Float, 1, 1, nullptr,
+ *                       ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess)
+ * Bind gHZBTarget = pLevel[mip]->getUAV(0, 1), gHZBSource = pLevel[mip-1]->getSRV(0, 1),
  * gLinearZSource = the GBufferRT linearZ texture.
  *
  * Thread safety: stateless; all methods are const/static and safe to call

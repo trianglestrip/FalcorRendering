@@ -36,11 +36,13 @@
  * - gLinearZ is the full-resolution RG32F texture from GBufferRT:
  *   .x = linear depth in meters, .y = depth slope (derivative of z w.r.t.
  *   the dominant screen axis, used for conservative thickness).
- * - gHZB is a Texture2D<float> mip chain. Mip 0 is the full-resolution
- *   linear depth (same data as gLinearZ.x, but sampled through the HZB
- *   sampler object so mip levels are consistent). Each mip m+1 texel
- *   stores the MAXIMUM linear depth of the corresponding 2x2 block in
- *   mip m. The host builds it with a downsampling compute pass (S4-A1).
+ * - gHZBMips is an array of independent R32F textures, one per level. Mip 0
+ *   is the full-resolution linear depth, each subsequent level stores the
+ *   MAXIMUM linear depth of a 2x2 block of the previous level. Levels use
+ *   ceil-halving dimensions (max((d + 2^m - 1) >> m, 1)) so every level fully
+ *   covers its parent and the max chain is conservative; independent
+ *   textures are required because D3D12 native mip chains are floor-sized.
+ *   The host builds them with the LumenHZBBuild compute pass (S4-A1).
  * - gRayDirection is an RGBA16F texture holding the VIEW-SPACE ray
  *   direction (positive z toward the camera, i.e. a forward GI ray has
  *   negative z). The host derives it from gViewW / camera matrices.
@@ -97,7 +99,7 @@ cbuffer LumenScreenTraceCB
 
 /** Input resources (optional ones are guarded by is_valid_* defines). */
 Texture2D<float2>   gLinearZ;
-Texture2D<float>    gHZB;
+Texture2D<float>    gHZBMips[16];
 Texture2D<float4>   gRayDirection;
 RWTexture2D<float4> gScreenTraceResult;
 

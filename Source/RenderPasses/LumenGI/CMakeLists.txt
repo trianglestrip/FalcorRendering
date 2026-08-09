@@ -20,6 +20,8 @@ target_sources(LumenGI PRIVATE
     Capture/LumenCardCapture.3d.slang
     ScreenTrace/LumenScreenTraceData.slang
     ScreenTrace/LumenScreenTrace.cs.slang
+    ScreenTrace/LumenHZB.h
+    ScreenTrace/LumenHZBBuild.cs.slang
 )
 
 target_copy_shaders(LumenGI RenderPasses/LumenGI)

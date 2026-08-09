@@ -70,8 +70,8 @@
 
 #include "LumenScreenTraceData.slang"
 
-#ifndef is_valid_gHZB
-#define is_valid_gHZB 0
+#ifndef is_valid_gHZBMips
+#define is_valid_gHZBMips 0
 #endif
 #ifndef is_valid_gRayDirection
 #define is_valid_gRayDirection 0
@@ -92,7 +92,7 @@ float hzbSampleMaxDepth(uint2 p, uint mip)
     const uint2 scale = uint2(1u << min(mip, 31u), 1u << min(mip, 31u));
     const uint2 mipSize = max((gFrameDim + scale - 1u) / scale, uint2(1u, 1u));
     const uint2 cell = clamp(p / scale, uint2(0u, 0u), mipSize - 1u);
-    return gHZB.Load(int3(cell, int(mip))).x;
+    return gHZBMips[mip].Load(int3(cell, 0)).x;
 }
 
 /** Project a view-space point onto pixel coordinates (float, texel space). */
@@ -123,7 +123,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         return;
     }
 
-    if (!is_valid(gHZB) || !is_valid(gLinearZ))
+    if (!is_valid(gHZBMips) || !is_valid(gLinearZ))
     {
         writeMiss(pixel, kLumenScreenTraceMissReasonOutOfScreen);
         return;

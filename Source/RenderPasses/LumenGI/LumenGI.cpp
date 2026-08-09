@@ -36,6 +36,24 @@ const char kShaderFile[] = "RenderPasses/LumenGI/LumenGIDebug.cs.slang";
 const char kTraceShaderFile[] = "RenderPasses/LumenGI/Tracing/LumenHardwareTrace.rt.slang";
 const char kCaptureShaderFile[] = "RenderPasses/LumenGI/Capture/LumenCardCapture.3d.slang";
 const char kCacheLightingShaderFile[] = "RenderPasses/LumenGI/Lighting/LumenSurfaceCacheLighting.cs.slang";
+const char kHZBBuildShaderFile[] = "RenderPasses/LumenGI/ScreenTrace/LumenHZBBuild.cs.slang";
+const char kScreenTraceShaderFile[] = "RenderPasses/LumenGI/ScreenTrace/LumenScreenTrace.cs.slang";
+
+///< S4-A1 screen-trace direction input (frozen shader contract: gRayDirection is a view-space
+///< direction texture, sampled per pixel and normalized; forward rays must have d.z < 0). The
+///< S4 MVP uses the task-endorsed "fixed direction" option: one constant view-space direction
+///< for every pixel, filled once per resize on the CPU. S4.2 probe direction sampling replaces
+///< this with per-pixel directions (world normals / cosine hemisphere).
+const float3 kScreenTraceRayDirection = float3(0.5f, 0.35f, -1.0f);
+
+///< Frozen S4-B1 screen-trace algorithm defaults, mirrors of the kLumenScreenTrace*Default
+///< constants in LumenScreenTraceData.slang (the shader lets the host override every one
+///< through the CB; keep these in sync with the shader).
+constexpr uint32_t kLumenScreenTraceMaxStepsHost = 64u;
+constexpr float kLumenScreenTraceMinThicknessHost = 0.001f; ///< Meters.
+constexpr float kLumenScreenTraceThicknessScaleHost = 2.0f;
+constexpr float kLumenScreenTraceStepEpsilonHost = 1e-4f;   ///< Texel-space forward bias.
+constexpr uint32_t kLumenScreenTraceMaxMipHost = 12u;
 
 const uint32_t kTracePayloadSizeBytes = 24u;
 const uint32_t kTraceRecursionDepth = 1u;
@@ -126,6 +144,7 @@ const ChannelList kOutputChannels = {
     { "bentNormal",                    "gBentNormal",                    "Optional world-space bent normal", true, ResourceFormat::RGBA16Float },
     { "debugOutput",                   "gDebugOutput",                   "Selected LumenGI diagnostic output", false, ResourceFormat::RGBA16Float },
     { "cardCoverage",                  "gCardCoverage",                  "Surface cache page coverage (allocated / total pages)", true, ResourceFormat::R32Float },
+    { "screenTrace",                   "gScreenTraceResult",             "S4 screen-space trace: RGB=hitUV/distance, A=confidence or -(reason+1)", true, ResourceFormat::RGBA16Float },
     // clang-format on
 };
 
@@ -419,6 +438,13 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     // output (atlas-sized) so tests/lumengi can read the cache-direct radiance directly.
     exportCacheDirectRadiance(pRenderContext, renderData);
 
+    // S4: hierarchical screen-space trace (S4-A1). Builds the HZB chain from GBufferRT.linearZ
+    // and dispatches the screen trace into the optional "screenTrace" output. Reads only
+    // renderData["linearZ"] (a GBuffer input), so it is independent of the trace/cache paths
+    // and can run any time after the GBuffer pass; placing it here keeps S1/S2/S3 untouched.
+    if (mUseScreenTrace)
+        runScreenTrace(pRenderContext, renderData);
+
     if (!mpDebugPass)
         createDebugPass();
 
@@ -660,6 +686,8 @@ void LumenGI::onHotReload(HotReloadFlags reloaded)
         mTracer.pBindingTable = nullptr;
         mTracer.pVars = nullptr;
         invalidateCaptureResources();
+        mScreenTrace.pHZBBuild = nullptr;
+        mScreenTrace.pTrace = nullptr;
         resetHistory();
     }
 }
@@ -1530,4 +1558,148 @@ void LumenGI::exportCacheDirectRadiance(RenderContext* pRenderContext, const Ren
         // No atlas (surface cache off): keep the channel well-defined (zero) instead of stale.
         pRenderContext->clearRtv(pCacheDirect->getRTV().get(), float4(0.f));
     }
+}
+
+// ------------------------------------------------------------------------------------------
+// S4: hierarchical screen-space trace host (S4-A1)
+// ------------------------------------------------------------------------------------------
+
+void LumenGI::createHZBBuildProgram()
+{
+    mScreenTrace.pHZBBuild = ComputePass::create(mpDevice, kHZBBuildShaderFile, "main");
+}
+
+void LumenGI::createScreenTraceProgram()
+{
+    // The screen trace shader gates its inputs through the is_valid_g* defines (default 0);
+    // all three resources are bound every dispatch, so all three are forced on.
+    DefineList defines;
+    defines.add("is_valid_gHZBMips", "1");
+    defines.add("is_valid_gLinearZ", "1");
+    defines.add("is_valid_gRayDirection", "1");
+    mScreenTrace.pTrace = ComputePass::create(mpDevice, kScreenTraceShaderFile, "main", defines);
+}
+
+void LumenGI::ensureScreenTraceResources(RenderContext* pRenderContext)
+{
+    if (any(mFrameDim == uint2(0u, 0u)))
+        return;
+
+    const bool sizeChanged = any(mScreenTrace.resourceDim != mFrameDim);
+    if (!mScreenTrace.pHZBBuild)
+        createHZBBuildProgram();
+    if (!mScreenTrace.pTrace)
+        createScreenTraceProgram();
+
+    // HZB levels (frozen contract in LumenHZB.h / LumenHZBBuild.cs.slang): one independent
+    // R32Float texture per level (ceil-halving dims), mip 0 = full-res linear depth, level m+1
+    // = 2x2 max of level m. Independent textures are required: D3D12 native mip chains are
+    // floor-sized and cannot hold a ceil-halving chain. Each level is SRV + UAV bound.
+    if (mScreenTrace.pHZBMips.empty() || sizeChanged)
+    {
+        mScreenTrace.pHZBMips.clear();
+        const LumenHZB::CreateParams createParams = LumenHZB::makeCreateParams(mFrameDim.x, mFrameDim.y);
+        FALCOR_ASSERT(createParams.isValid());
+        for (uint32_t mip = 0; mip < createParams.mipCount; ++mip)
+        {
+            ref<Texture> pLevel = mpDevice->createTexture2D(
+                LumenHZB::mipDimension(mFrameDim.x, mip), LumenHZB::mipDimension(mFrameDim.y, mip),
+                ResourceFormat::R32Float, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+            pLevel->setName("LumenGI::ScreenTrace::HZB::" + std::to_string(mip)); // R32F level, SRV + UAV.
+            mScreenTrace.pHZBMips.push_back(pLevel);
+        }
+    }
+
+    // S4-A1 direction input: the shader samples gRayDirection per pixel (there is no CB
+    // direction field), so a direction texture is required. MVP = one constant view-space
+    // direction per pixel (kScreenTraceRayDirection), built once per resize on the CPU. The
+    // doc contract says RGBA16F; RGBA32F is used here so the CPU fill is lossless and format-
+    // independent -- the shader's Texture2D<float4> binds either. S4.2 probe direction
+    // sampling replaces this with per-pixel (normal / cosine-hemisphere) directions.
+    if (!mScreenTrace.pRayDirection || sizeChanged)
+    {
+        const float3 dir = normalize(kScreenTraceRayDirection);
+        const std::vector<float4> data((size_t)mFrameDim.x * mFrameDim.y, float4(dir, 1.f));
+        mScreenTrace.pRayDirection = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA32Float, 1, 1, data.data(),
+            ResourceBindFlags::ShaderResource
+        );
+        mScreenTrace.pRayDirection->setName("LumenGI::ScreenTrace::RayDirection"); // RGBA32F view-space dir, per-resize.
+    }
+
+    mScreenTrace.resourceDim = mFrameDim;
+}
+
+void LumenGI::runScreenTrace(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    const ref<Texture> pLinearZ = renderData.getTexture("linearZ");
+    const ref<Texture> pResult = renderData.getTexture("screenTrace");
+    if (!pLinearZ || !pResult || !mpScene)
+        return; // linearZ is a required input; the screenTrace output is optional per the graph.
+
+    ensureScreenTraceResources(pRenderContext);
+    if (!mScreenTrace.pHZBBuild || !mScreenTrace.pTrace || mScreenTrace.pHZBMips.empty() || !mScreenTrace.pRayDirection)
+        return;
+
+    // ---- 1. HZB build: one dispatch per level, ascending order (LumenHZB::makeAllDispatchParams).
+    // Level 0 reads GBufferRT.linearZ (RG32F, .x = linear depth); level m > 0 reads level m-1
+    // (2x2 max). Every dispatch rebinds the CB + source SRV / target UAV views, exactly as
+    // documented in LumenHZBBuild.cs.slang and LumenHZB.h.
+    const LumenHZB::CreateParams createParams = LumenHZB::makeCreateParams(mFrameDim.x, mFrameDim.y);
+    FALCOR_ASSERT(createParams.isValid());
+    const std::vector<LumenHZB::DispatchParams> dispatches = LumenHZB::makeAllDispatchParams(createParams);
+    ShaderVar hzbVar = mScreenTrace.pHZBBuild->getRootVar();
+    ShaderVar hzbCb = hzbVar["LumenHZBBuildCB"];
+    for (const LumenHZB::DispatchParams& d : dispatches)
+    {
+        hzbCb["gSourceMipSize"] = uint2(d.sourceWidth, d.sourceHeight);
+        hzbCb["gTargetMipSize"] = uint2(d.targetWidth, d.targetHeight);
+        hzbCb["gSourceIsLinearZ"] = d.sourceIsLinearZ ? 1u : 0u;
+        hzbCb["gPad"] = 0u;
+        if (d.sourceIsLinearZ)
+            hzbVar["gLinearZSource"] = pLinearZ;
+        else
+            hzbVar["gHZBSource"].setSrv(mScreenTrace.pHZBMips[d.mip - 1]->getSRV(0, 1));
+        hzbVar["gHZBTarget"].setUav(mScreenTrace.pHZBMips[d.mip]->getUAV(0, 1));
+        // ComputePass::execute takes THREAD counts; 16x16 threads per group -> exactly the
+        // groupsX x groupsY thread groups the frozen LumenHZB dispatch contract requires.
+        mScreenTrace.pHZBBuild->execute(
+            pRenderContext, d.groupsX * LumenHZB::kBuildThreads, d.groupsY * LumenHZB::kBuildThreads, 1
+        );
+    }
+
+    // ---- 2. Screen trace. gCameraFocalPx / gPrincipalPoint are pixel-space (texel coords),
+    // matching the shader's view-space origin (p.x + 0.5 - principal) / focal * z0. Falcor's
+    // camera has no principal-point offset, so the principal point is the frame center.
+    const ref<Camera>& pCamera = mpScene->getCamera();
+    const float focalLengthPx = pCamera->getFocalLength() * (float)mFrameDim.y / pCamera->getFrameHeight();
+
+    ShaderVar var = mScreenTrace.pTrace->getRootVar();
+    ShaderVar cb = var["LumenScreenTraceCB"];
+    cb["gFrameDim"] = mFrameDim;
+    cb["gMaxSteps"] = kLumenScreenTraceMaxStepsHost;
+    cb["gStartMip"] = 0u;
+    cb["gMinThickness"] = kLumenScreenTraceMinThicknessHost;
+    cb["gThicknessScale"] = kLumenScreenTraceThicknessScaleHost;
+    cb["gStepEpsilon"] = kLumenScreenTraceStepEpsilonHost;
+    cb["gCameraFocalPx"] = focalLengthPx;
+    cb["gPrincipalPoint"] = float2(0.5f * (float)mFrameDim.x, 0.5f * (float)mFrameDim.y);
+    cb["gInvFrameDim"] = float2(1.f / (float)mFrameDim.x, 1.f / (float)mFrameDim.y);
+    cb["gMaxMip"] = std::min<uint32_t>(kLumenScreenTraceMaxMipHost, createParams.mipCount - 1u);
+    cb["gPad"] = 0u;
+    var["gLinearZ"] = pLinearZ;
+    // Bind the HZB level array (16-slot array; only mipCount levels are valid).
+    for (uint32_t mip = 0; mip < (uint32_t)mScreenTrace.pHZBMips.size(); ++mip)
+        var["gHZBMips"][mip] = mScreenTrace.pHZBMips[mip];
+    var["gRayDirection"] = mScreenTrace.pRayDirection;
+    var["gScreenTraceResult"] = pResult;
+    mScreenTrace.pTrace->execute(pRenderContext, mFrameDim.x, mFrameDim.y, 1);
+
+    // Miss-reason statistics: deliberately NO separate stats texture/buffer. The per-pixel miss
+    // reason is already encoded in gScreenTraceResult.a (A = -(reason + 1) on miss, confidence
+    // in (0,1] on hit), so the "miss-reason total == rays launched" gate (task.md S4 gate #2) is
+    // aggregated host-side from the optional screenTrace output by tests/lumengi/run_screentrace.py
+    // (G2: hits + misses == W*H). A GPU histogram would need a new shader (out of scope here).
 }
