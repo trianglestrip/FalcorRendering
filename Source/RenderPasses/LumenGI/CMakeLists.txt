@@ -22,6 +22,9 @@ target_sources(LumenGI PRIVATE
     ScreenTrace/LumenScreenTrace.cs.slang
     ScreenTrace/LumenHZB.h
     ScreenTrace/LumenHZBBuild.cs.slang
+    ScreenProbe/LumenScreenProbe.h
+    ScreenProbe/LumenScreenProbeData.slang
+    ScreenProbe/LumenScreenProbeTrace.cs.slang
 )
 
 target_copy_shaders(LumenGI RenderPasses/LumenGI)

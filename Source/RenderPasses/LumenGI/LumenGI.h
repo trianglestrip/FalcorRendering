@@ -35,6 +35,7 @@
 #include "LumenGIStats.h"
 #include "Capture/LumenCaptureScheduler.h" // Brings in Cards/LumenCardScene.h and SurfaceCache/LumenSurfaceCache.h.
 #include "ScreenTrace/LumenHZB.h" // S4-A1 HZB chain host component (mip dims / dispatch params).
+#include "ScreenProbe/LumenScreenProbe.h" // S4.2 screen probe grid host component (grid math / budget / stats).
 
 using namespace Falcor;
 
@@ -175,6 +176,15 @@ private:
     void ensureScreenTraceResources(RenderContext* pRenderContext);
     void runScreenTrace(RenderContext* pRenderContext, const RenderData& renderData);
 
+    // ------------------------------------------------------------------------------------------
+    // S4.2: screen probe grid host (S4-A2/B2: probe placement + direction sampling + screen-first
+    // trace + HWRT fallback). Runs after the screen trace (consumes its HZB chain).
+    // ------------------------------------------------------------------------------------------
+    void createScreenProbePrograms();
+    void ensureScreenProbeResources(RenderContext* pRenderContext);
+    void runScreenProbeTrace(RenderContext* pRenderContext, const RenderData& renderData);
+    void readbackScreenProbeCounters(RenderContext* pRenderContext);
+
     ///< gSamplesPerTexel preset mapping: Low/Medium/High/Reference -> 1/2/4/8
     ///< (LumenCacheLightingQuality in LumenSurfaceCacheLightingData.slang).
     uint32_t cacheLightingSamplesPerTexel() const;
@@ -270,6 +280,37 @@ private:
         ref<Texture> pRayDirection; ///< RGBA32F view-space ray direction (S4-A1 direction input; see .cpp).
         uint2 resourceDim = {0, 0}; ///< Frame dims the resources were built for; recreated on resize.
     } mScreenTrace;
+
+    // ------------------------------------------------------------------------------------------
+    // S4.2: screen probe grid GPU resources (S4-A2/B2, Agent Z1). Created lazily by
+    // ensureScreenProbeResources(), frame-dim-scoped (buffers sized to the probe grid; recreated
+    // on resize). The passes compile LumenScreenProbeTrace.cs.slang (three entry points).
+    // ------------------------------------------------------------------------------------------
+    struct
+    {
+        ref<ComputePass> pUpdate;    ///< LumenScreenProbeTrace.cs.slang, entry "updateMain" (1 thread / probe).
+        ref<ComputePass> pTrace;     ///< entry "traceMain" (1 thread / (probe, direction)).
+        ref<ComputePass> pFinalize;  ///< entry "finalizeMain" (1 thread / probe).
+        ref<Buffer> pMetadata;       ///< gProbeMeta StructuredBuffer<LumenScreenProbe::Meta> (64 B), UAV + SRV.
+        ref<Buffer> pHitRecords;     ///< gProbeHitRecords StructuredBuffer<LumenScreenProbe::Hit> (32 B), UAV + SRV.
+        ref<Buffer> pCounters;       ///< gProbeCounters StructuredBuffer<LumenScreenProbe::Counters> (32 B), UAV.
+        ref<Buffer> pCountersReadback; ///< ReadBack mirror of pCounters for the host stats.
+        ref<Texture> pHZBNative;     ///< gHZBMips native floor-halved R32F mip chain (probe march; built per frame).
+        uint32_t probeCount = 0;     ///< Probe count the buffers were sized for (0 = not created).
+        uint2 resourceDim = {0, 0};  ///< Frame dims the resources were built for.
+        bool counterReadbackPending = false;
+    } mScreenProbes;
+
+    ///< Scriptable S4.2 probe gate channel: probe grid radiance (RGB avg radiance, A hit
+    ///< fraction) at frame resolution, sparse per-probe writes. Exposed for
+    ///< tests/lumengi/run_screenprobe.py and the S4-C2 distribution tests (Agent C).
+    static constexpr const char* kProbeRadiance = "probeRadiance";
+
+    ///< S4.2 probe configuration. Directions per probe default 16 (fixed hit-record stride
+    ///< 32); maxProbesPerFrame default 0 = all probes every frame (updateInterval 1).
+    uint32_t mProbeDirectionsPerProbe = LumenScreenProbe::kDefaultDirectionsPerProbe;
+    uint32_t mProbeMaxProbesPerFrame = 0u;
+    LumenScreenProbe::Stats mScreenProbeStats; ///< Last completed dispatch read-back.
 
     ///< Scriptable S3 gate channel name: exposes the internal radiance atlas (RGB = direct,
     ///< linear) at atlas resolution for tests/lumengi/run_cachelighting.py (Agent N).

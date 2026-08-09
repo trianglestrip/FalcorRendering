@@ -38,6 +38,7 @@ const char kCaptureShaderFile[] = "RenderPasses/LumenGI/Capture/LumenCardCapture
 const char kCacheLightingShaderFile[] = "RenderPasses/LumenGI/Lighting/LumenSurfaceCacheLighting.cs.slang";
 const char kHZBBuildShaderFile[] = "RenderPasses/LumenGI/ScreenTrace/LumenHZBBuild.cs.slang";
 const char kScreenTraceShaderFile[] = "RenderPasses/LumenGI/ScreenTrace/LumenScreenTrace.cs.slang";
+const char kScreenProbeShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeTrace.cs.slang";
 
 ///< S4-A1 screen-trace direction input (frozen shader contract: gRayDirection is a view-space
 ///< direction texture, sampled per pixel and normalized; forward rays must have d.z < 0). The
@@ -74,6 +75,8 @@ const char kCacheLightingFeedbackStrength[] = "cacheLightingFeedbackStrength";
 const char kCacheLightingFeedbackMaxBounces[] = "cacheLightingFeedbackMaxBounces";
 const char kUseScreenTrace[] = "useScreenTrace";
 const char kUseScreenProbes[] = "useScreenProbes";
+const char kProbeDirectionsPerProbe[] = "probeDirectionsPerProbe";
+const char kProbeMaxProbesPerFrame[] = "probeMaxProbesPerFrame";
 const char kUseTemporalFilter[] = "useTemporalFilter";
 const char kUseSpatialFilter[] = "useSpatialFilter";
 const char kUseRadianceCache[] = "useRadianceCache";
@@ -145,6 +148,7 @@ const ChannelList kOutputChannels = {
     { "debugOutput",                   "gDebugOutput",                   "Selected LumenGI diagnostic output", false, ResourceFormat::RGBA16Float },
     { "cardCoverage",                  "gCardCoverage",                  "Surface cache page coverage (allocated / total pages)", true, ResourceFormat::R32Float },
     { "screenTrace",                   "gScreenTraceResult",             "S4 screen-space trace: RGB=hitUV/distance, A=confidence or -(reason+1)", true, ResourceFormat::RGBA16Float },
+    { "probeRadiance",                 "gProbeRadiance",                 "S4.2 screen probe grid: RGB=avg radiance at the probe, A=hit fraction (sparse)", true, ResourceFormat::RGBA16Float },
     // clang-format on
 };
 
@@ -220,6 +224,10 @@ void LumenGI::parseProperties(const Properties& props)
             mUseScreenTrace = value;
         else if (key == kUseScreenProbes)
             mUseScreenProbes = value;
+        else if (key == kProbeDirectionsPerProbe)
+            mProbeDirectionsPerProbe = std::clamp<uint32_t>(value, 1u, LumenScreenProbe::kMaxDirectionsPerProbe);
+        else if (key == kProbeMaxProbesPerFrame)
+            mProbeMaxProbesPerFrame = value;
         else if (key == kUseTemporalFilter)
             mUseTemporalFilter = value;
         else if (key == kUseSpatialFilter)
@@ -249,6 +257,8 @@ Properties LumenGI::getProperties() const
     props[kCacheLightingFeedbackMaxBounces] = mCacheLightingFeedbackMaxBounces;
     props[kUseScreenTrace] = mUseScreenTrace;
     props[kUseScreenProbes] = mUseScreenProbes;
+    props[kProbeDirectionsPerProbe] = mProbeDirectionsPerProbe;
+    props[kProbeMaxProbesPerFrame] = mProbeMaxProbesPerFrame;
     props[kUseTemporalFilter] = mUseTemporalFilter;
     props[kUseSpatialFilter] = mUseSpatialFilter;
     props[kUseRadianceCache] = mUseRadianceCache;
@@ -442,8 +452,17 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     // and dispatches the screen trace into the optional "screenTrace" output. Reads only
     // renderData["linearZ"] (a GBuffer input), so it is independent of the trace/cache paths
     // and can run any time after the GBuffer pass; placing it here keeps S1/S2/S3 untouched.
-    if (mUseScreenTrace)
+    // S4.2 probes consume the HZB chain (and optionally the screenTrace output as a prefilter),
+    // so the screen trace also runs when only the probes are enabled.
+    if (mUseScreenTrace || mUseScreenProbes)
         runScreenTrace(pRenderContext, renderData);
+
+    // S4.2: screen probe gather (S4-A2/B2). Consumes the HZB chain built above (and, when the
+    // graph allocates them, the screenTrace output as a prefilter) plus the S1 per-pixel
+    // diffuseRadianceHitDist for the screen-radiance reuse; writes the probe hit records and
+    // the optional "probeRadiance" grid. Runs after the screen trace every frame.
+    if (mUseScreenProbes)
+        runScreenProbeTrace(pRenderContext, renderData);
 
     if (!mpDebugPass)
         createDebugPass();
@@ -621,6 +640,28 @@ void LumenGI::renderUI(Gui::Widgets& widget)
         group.slider("Feedback max bounces", mCacheLightingFeedbackMaxBounces, 1u, 32u);
     }
 
+    if (auto group = widget.group("Screen probes", mUseScreenProbes))
+    {
+        const LumenScreenProbe::Stats& st = mScreenProbeStats;
+        group.text("Probes: " + std::to_string(st.probeCount));
+        group.slider("Directions / probe", mProbeDirectionsPerProbe, 1u, LumenScreenProbe::kMaxDirectionsPerProbe);
+        group.slider("Max probes / frame (0 = all)", mProbeMaxProbesPerFrame, 0u, 65536u);
+        const uint32_t interval = LumenScreenProbe::updateInterval(st.probeCount, mProbeMaxProbesPerFrame);
+        group.text("Update interval: " + std::to_string(interval) + " frames (expected ~" +
+                   std::to_string(LumenScreenProbe::expectedProbesPerFrame(st.probeCount, interval)) + "/frame)");
+        group.text(
+            "Last frame: screenHits " + std::to_string(st.screenHits) +
+            ", fallback (hit/miss/unavail) " + std::to_string(st.fallbackHits) + "/" +
+            std::to_string(st.fallbackMisses) + "/" + std::to_string(st.fallbackUnavailable) +
+            ", traced " + std::to_string(st.directionsTraced) +
+            " (screen hit rate " + std::to_string(st.screenHitRate()) + ")"
+        );
+        group.text(
+            "Inactive " + std::to_string(st.inactiveProbes) + ", budget-skipped " +
+            std::to_string(st.budgetSkipped)
+        );
+    }
+
     if (dirty)
     {
         mOptionsChanged = true;
@@ -646,6 +687,12 @@ void LumenGI::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     // bounce counter are atlas-lifetime; clearing them here (plus the capture pass zeroing the
     // radiance atlas A channel on every re-capture) guarantees a fresh single-bounce start.
     mCacheLighting.indirectCurrIndex = 0;
+    // S4.2: the probe passes carry the scene defines/type conformances (scene-mode raytracing)
+    // and must be recreated on scene/geometry rebuilds; the probe buffers are frame-scoped and
+    // deliberately kept (their contents are rebuilt every frame).
+    mScreenProbes.pUpdate = nullptr;
+    mScreenProbes.pTrace = nullptr;
+    mScreenProbes.pFinalize = nullptr;
     if (pRenderContext)
     {
         for (const ref<Texture>& pIndirect : mCacheLighting.pIndirect)
@@ -688,6 +735,9 @@ void LumenGI::onHotReload(HotReloadFlags reloaded)
         invalidateCaptureResources();
         mScreenTrace.pHZBBuild = nullptr;
         mScreenTrace.pTrace = nullptr;
+        mScreenProbes.pUpdate = nullptr;
+        mScreenProbes.pTrace = nullptr;
+        mScreenProbes.pFinalize = nullptr;
         resetHistory();
     }
 }
@@ -1702,4 +1752,300 @@ void LumenGI::runScreenTrace(RenderContext* pRenderContext, const RenderData& re
     // in (0,1] on hit), so the "miss-reason total == rays launched" gate (task.md S4 gate #2) is
     // aggregated host-side from the optional screenTrace output by tests/lumengi/run_screentrace.py
     // (G2: hits + misses == W*H). A GPU histogram would need a new shader (out of scope here).
+}
+
+// ------------------------------------------------------------------------------------------
+// S4.2: screen probe gather host (S4-A2/B2)
+// ------------------------------------------------------------------------------------------
+
+void LumenGI::createScreenProbePrograms()
+{
+    FALCOR_ASSERT(mpScene);
+
+    // Compute programs over LumenScreenProbeTrace.cs.slang. The three entry points share the
+    // frozen data module (LumenScreenProbeData.slang); each gets its own ComputePass. The
+    // shader compiles in the scene mode (LUMEN_GI_PROBE_SCENE_TRACE = 1) so the HWRT fallback
+    // uses SceneRayQuery<0> against gScene (bound below exactly like the cache-lighting pass);
+    // the scene defines + type conformances are required for the scene module imports.
+    const auto createPass = [&](const char* entry)
+    {
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addShaderLibrary(kScreenProbeShaderFile).csEntry(entry);
+        desc.addTypeConformances(mpScene->getTypeConformances());
+        DefineList defines;
+        defines.add(mpScene->getSceneDefines());
+        defines.add("LUMEN_GI_PROBE_SCENE_TRACE", "1");
+        return ComputePass::create(mpDevice, desc, defines, /*createVars=*/true);
+    };
+
+    mScreenProbes.pUpdate = createPass("updateMain");
+    mScreenProbes.pTrace = createPass("traceMain");
+    mScreenProbes.pFinalize = createPass("finalizeMain");
+}
+
+void LumenGI::ensureScreenProbeResources(RenderContext* pRenderContext)
+{
+    if (any(mFrameDim == uint2(0u, 0u)))
+        return;
+
+    const uint32_t probeCount = LumenScreenProbe::probeCount(mFrameDim);
+    if (!mScreenProbes.pTrace || !mScreenProbes.pUpdate || !mScreenProbes.pFinalize)
+        createScreenProbePrograms();
+    if (!mScreenProbes.pTrace)
+        return; // scene not ready.
+
+    if (!mScreenProbes.pMetadata || !mScreenProbes.pHitRecords || mScreenProbes.probeCount != probeCount)
+    {
+        // gProbeMeta: LumenScreenProbe::Meta (64 B) per probe. gProbeHitRecords:
+        // LumenScreenProbe::Hit (32 B) per (probe, direction), fixed stride
+        // kMaxDirectionsPerProbe so the record indexing is independent of the runtime
+        // directions-per-probe. Both UAV + SRV (the trace reads and writes them).
+        mScreenProbes.pMetadata = mpDevice->createStructuredBuffer(
+            sizeof(LumenScreenProbe::Meta), probeCount,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mScreenProbes.pMetadata->setName("LumenGI::ScreenProbe::Metadata"); // LumenScreenProbe::Meta, 64 B, frame-scoped.
+        mScreenProbes.pHitRecords = mpDevice->createStructuredBuffer(
+            sizeof(LumenScreenProbe::Hit), (size_t)probeCount * LumenScreenProbe::kMaxDirectionsPerProbe,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mScreenProbes.pHitRecords->setName("LumenGI::ScreenProbe::HitRecords"); // LumenScreenProbe::Hit, 32 B, frame-scoped.
+        mScreenProbes.pCounters = mpDevice->createStructuredBuffer(
+            sizeof(LumenScreenProbe::Counters), 1u,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mScreenProbes.pCounters->setName("LumenGI::ScreenProbe::Counters");
+        mScreenProbes.pCountersReadback = mpDevice->createStructuredBuffer(
+            sizeof(LumenScreenProbe::Counters), 1u, ResourceBindFlags::None, MemoryType::ReadBack
+        );
+        mScreenProbes.pCountersReadback->setName("LumenGI::ScreenProbe::CountersReadback");
+
+        // Native floor-halved R32F mip chain for the probe march (gHZBMips): a real D3D12 mip
+        // chain is floor-sized, and the probe shader indexes it with explicit mip levels
+        // (Load(int3(cell, mip))). Built every frame by the HZB build pass with floor dims.
+        const uint32_t hzbMipCount = LumenHZB::makeCreateParams(mFrameDim.x, mFrameDim.y).mipCount;
+        mScreenProbes.pHZBNative = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::R32Float, 1, hzbMipCount, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mScreenProbes.pHZBNative->setName("LumenGI::ScreenProbe::HZBNative"); // R32F native mip chain, frame-scoped.
+
+        // Prefill the static probe positions (tile centers). Everything else is zero
+        // (the update pass resamples active/depth/normal/worldPos every frame).
+        std::vector<LumenScreenProbe::Meta> metas(probeCount);
+        const uint2 gridDims = LumenScreenProbe::probeGridDims(mFrameDim);
+        for (uint32_t i = 0; i < probeCount; ++i)
+        {
+            const uint2 gridPos = uint2(i % gridDims.x, i / gridDims.x);
+            metas[i].screenPos = LumenScreenProbe::probeScreenPos(gridPos);
+        }
+        mScreenProbes.pMetadata->setBlob(metas.data(), 0, metas.size() * sizeof(LumenScreenProbe::Meta));
+        pRenderContext->clearUAV(mScreenProbes.pHitRecords->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mScreenProbes.pCounters->getUAV().get(), uint4(0));
+
+        mScreenProbes.probeCount = probeCount;
+        mScreenProbes.resourceDim = mFrameDim;
+    }
+}
+
+void LumenGI::readbackScreenProbeCounters(RenderContext* pRenderContext)
+{
+    if (!mScreenProbes.counterReadbackPending || !mScreenProbes.pCountersReadback)
+        return;
+    const LumenScreenProbe::Counters* pCounters =
+        static_cast<const LumenScreenProbe::Counters*>(mScreenProbes.pCountersReadback->map());
+    if (pCounters)
+    {
+        mScreenProbeStats.probeCount = mScreenProbes.probeCount;
+        mScreenProbeStats.directionsPerProbe = mProbeDirectionsPerProbe;
+        const uint32_t interval = LumenScreenProbe::updateInterval(mScreenProbes.probeCount, mProbeMaxProbesPerFrame);
+        mScreenProbeStats.updateInterval = interval;
+        mScreenProbeStats.expectedProbesPerFrame =
+            LumenScreenProbe::expectedProbesPerFrame(mScreenProbes.probeCount, interval);
+        mScreenProbeStats.screenHits = pCounters->screenHits;
+        mScreenProbeStats.fallbackAttempts = pCounters->fallbackAttempts;
+        mScreenProbeStats.fallbackHits = pCounters->fallbackHits;
+        mScreenProbeStats.fallbackMisses = pCounters->fallbackMisses;
+        mScreenProbeStats.fallbackUnavailable = pCounters->fallbackUnavailable;
+        mScreenProbeStats.inactiveProbes = pCounters->inactiveProbes;
+        mScreenProbeStats.budgetSkipped = pCounters->budgetSkipped;
+        mScreenProbeStats.directionsTraced = pCounters->directionsTraced;
+        mScreenProbes.pCountersReadback->unmap();
+    }
+    mScreenProbes.counterReadbackPending = false;
+}
+
+void LumenGI::runScreenProbeTrace(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    if (!mpScene)
+        return;
+    const ref<Texture> pLinearZ = renderData.getTexture("linearZ");
+    if (!pLinearZ || mScreenTrace.pHZBMips.empty())
+        return; // linearZ (required input) or the HZB chain (S4-A1, built by runScreenTrace) missing.
+
+    // Read back the previous dispatch's counters (one-frame lag, same as the other paths).
+    readbackScreenProbeCounters(pRenderContext);
+
+    ensureScreenProbeResources(pRenderContext);
+    if (!mScreenProbes.pUpdate || !mScreenProbes.pTrace || !mScreenProbes.pFinalize ||
+        !mScreenProbes.pMetadata || !mScreenProbes.pHitRecords || mScreenProbes.probeCount == 0)
+    {
+        return;
+    }
+
+    const uint32_t probeCount = mScreenProbes.probeCount;
+    const uint32_t gridX = LumenScreenProbe::probeGridDims(mFrameDim).x;
+    uint32_t directionsPerProbe =
+        std::clamp<uint32_t>(mProbeDirectionsPerProbe, 1u, LumenScreenProbe::kMaxDirectionsPerProbe);
+    const uint32_t interval = LumenScreenProbe::updateInterval(probeCount, mProbeMaxProbesPerFrame);
+
+    // D3D12 dispatch cap: 65535 thread groups in X (64 threads/group). Only reachable for
+    // extreme frames (8K+ at the max direction count); clamp defensively.
+    constexpr uint64_t kMaxDispatchThreadsX = 65535ull * 64ull;
+    if ((uint64_t)probeCount * directionsPerProbe > kMaxDispatchThreadsX)
+        directionsPerProbe = std::max<uint32_t>(1u, (uint32_t)(kMaxDispatchThreadsX / probeCount));
+
+    // Optional inputs, gate the per-frame is_valid defines (the screenTrace output and the
+    // probeRadiance output are graph-allocated; the rest are always present).
+    const bool hasScreenTrace = renderData.getTexture("screenTrace") != nullptr;
+    const bool hasProbeRadiance = renderData.getTexture("probeRadiance") != nullptr;
+    const bool hasNormal = renderData.getTexture("normWRoughnessMaterialID") != nullptr;
+    const bool hasDiffuseRadiance = renderData.getTexture("diffuseRadianceHitDist") != nullptr;
+
+    // Per-frame program specialization (all three passes share the same shader + defines).
+    bool programChanged = false;
+    for (const ref<ComputePass>& pPass :
+         {mScreenProbes.pUpdate, mScreenProbes.pTrace, mScreenProbes.pFinalize})
+    {
+        ref<Program> pProgram = pPass->getProgram();
+        programChanged |= pProgram->addDefine("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
+        programChanged |= pProgram->addDefine("is_valid_gScreenTraceResult", hasScreenTrace ? "1" : "0");
+        programChanged |= pProgram->addDefine("is_valid_gDiffuseRadianceHitDist", hasDiffuseRadiance ? "1" : "0");
+        programChanged |= pProgram->addDefine("is_valid_gNormalRoughnessMaterialID", hasNormal ? "1" : "0");
+        programChanged |= pProgram->addDefine("is_valid_gProbeRadiance", hasProbeRadiance ? "1" : "0");
+    }
+    if (programChanged)
+    {
+        mScreenProbes.pUpdate->setVars(nullptr);
+        mScreenProbes.pTrace->setVars(nullptr);
+        mScreenProbes.pFinalize->setVars(nullptr);
+    }
+
+    // Camera parameters (S4-A1 conventions: focal in pixels, principal = frame center, and the
+    // camera world basis (view +x = right, +y = up, +z = forward toward the camera) for the
+    // probe direction conversion / unprojection / projection).
+    const ref<Camera>& pCamera = mpScene->getCamera();
+    const float focalLengthPx = pCamera->getFocalLength() * (float)mFrameDim.y / pCamera->getFrameHeight();
+    const float3 camPos = pCamera->getPosition();
+    const float3 camForward = normalize(camPos - pCamera->getTarget()); // view +z (toward the camera).
+    const float3 camRight = normalize(cross(pCamera->getUpVector(), camForward));
+    const float3 camUp = cross(camForward, camRight);
+
+    // Build the probe HZB into pHZBNative: a native floor-halved R32F mip chain (mip 0 = copy
+    // of linearZ.x, mip m+1 = 2x2 max of mip m, edge-clamped), dispatched with the S4-A1 HZB
+    // build pass using floor dims. The probe march indexes it with explicit mip levels.
+    if (mScreenTrace.pHZBBuild && mScreenProbes.pHZBNative)
+    {
+        const uint32_t hzbMips = mScreenProbes.pHZBNative->getMipCount();
+        ShaderVar hzbVar = mScreenTrace.pHZBBuild->getRootVar();
+        ShaderVar hzbCb = hzbVar["LumenHZBBuildCB"];
+        hzbCb["gSourceMipSize"] = mFrameDim;
+        hzbCb["gTargetMipSize"] = mFrameDim;
+        hzbCb["gSourceIsLinearZ"] = 1u;
+        hzbCb["gPad"] = 0u;
+        hzbVar["gLinearZSource"] = pLinearZ;
+        hzbVar["gHZBTarget"].setUav(mScreenProbes.pHZBNative->getUAV(0, 1));
+        mScreenTrace.pHZBBuild->execute(
+            pRenderContext, ((mFrameDim.x + 15u) / 16u) * 16u, ((mFrameDim.y + 15u) / 16u) * 16u, 1
+        );
+        for (uint32_t mip = 1u; mip < hzbMips; ++mip)
+        {
+            const uint2 srcDims = uint2(std::max(mFrameDim.x >> (mip - 1u), 1u), std::max(mFrameDim.y >> (mip - 1u), 1u));
+            const uint2 dstDims = uint2(std::max(mFrameDim.x >> mip, 1u), std::max(mFrameDim.y >> mip, 1u));
+            hzbCb["gSourceMipSize"] = srcDims;
+            hzbCb["gTargetMipSize"] = dstDims;
+            hzbCb["gSourceIsLinearZ"] = 0u;
+            hzbCb["gPad"] = 0u;
+            hzbVar["gHZBSource"].setSrv(mScreenProbes.pHZBNative->getSRV(mip - 1u, 1));
+            hzbVar["gHZBTarget"].setUav(mScreenProbes.pHZBNative->getUAV(mip, 1));
+            mScreenTrace.pHZBBuild->execute(
+                pRenderContext, ((dstDims.x + 15u) / 16u) * 16u, ((dstDims.y + 15u) / 16u) * 16u, 1
+            );
+        }
+    }
+
+    const auto bindPass = [&](const ref<ComputePass>& pPass, const char* entry)
+    {
+        ShaderVar var = pPass->getRootVar();
+        ShaderVar cb = var["LumenScreenProbeCB"];
+        cb["gFrameDim"] = mFrameDim;
+        cb["gFrameIndex"] = mFrameIndex;
+        cb["gDirectionsPerProbe"] = directionsPerProbe;
+        cb["gProbeGridDims"] = uint2(gridX, (probeCount + gridX - 1u) / gridX);
+        cb["gMaxHitRecordStride"] = LumenScreenProbe::kMaxDirectionsPerProbe;
+        cb["gMinThickness"] = LumenScreenProbe::kMinThickness;
+        cb["gThicknessScale"] = LumenScreenProbe::kThicknessScale;
+        cb["gMaxMarchSteps"] = LumenScreenProbe::kMaxMarchSteps;
+        cb["gStepEpsilon"] = LumenScreenProbe::kStepEpsilon;
+        cb["gCameraFocalPx"] = focalLengthPx;
+        cb["gPrincipalPoint"] = float2(0.5f * (float)mFrameDim.x, 0.5f * (float)mFrameDim.y);
+        cb["gInvFrameDim"] = float2(1.f / (float)mFrameDim.x, 1.f / (float)mFrameDim.y);
+        cb["gUpdateInterval"] = interval;
+        cb["gSeed"] = LumenScreenProbe::kSeed;
+        cb["gDepthChangeThreshold"] = LumenScreenProbe::kDepthChangeThreshold;
+        cb["gMaxMip"] = std::min<uint32_t>(LumenScreenProbe::kMaxMip, mScreenProbes.pHZBNative ? mScreenProbes.pHZBNative->getMipCount() - 1u : 0u);
+        cb["gCameraPosW"] = camPos;
+        cb["gCameraRightW"] = camRight;
+        cb["gCameraUpW"] = camUp;
+        cb["gCameraForwardW"] = camForward;
+        cb["gEnvFallbackRadiance"] = float3(0.f);
+        cb["gDebugMode"] = static_cast<uint32_t>(mDebugMode);
+        cb["gProbeCount"] = probeCount;
+
+        // Resources (shared by all three entry points).
+        var["gLinearZ"] = pLinearZ;
+        if (mScreenProbes.pHZBNative)
+            var["gHZBMips"] = mScreenProbes.pHZBNative;
+        if (hasNormal)
+            var["gNormalRoughnessMaterialID"] = renderData.getTexture("normWRoughnessMaterialID");
+        if (hasDiffuseRadiance)
+            var["gDiffuseRadianceHitDist"] = renderData.getTexture("diffuseRadianceHitDist");
+        if (hasScreenTrace)
+            var["gScreenTraceResult"] = renderData.getTexture("screenTrace");
+        var["gProbeMeta"] = mScreenProbes.pMetadata;
+        var["gProbeHitRecords"] = mScreenProbes.pHitRecords;
+        var["gProbeCounters"] = mScreenProbes.pCounters;
+        if (hasProbeRadiance)
+            var["gProbeRadiance"] = renderData.getTexture("probeRadiance");
+
+        // Scene block + raytracing data for the scene-mode fallback (cache-lighting pattern).
+        mpScene->bindShaderData(var["gScene"]);
+        mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"], 0u);
+    };
+    bindPass(mScreenProbes.pUpdate, "updateMain");
+    bindPass(mScreenProbes.pTrace, "traceMain");
+    bindPass(mScreenProbes.pFinalize, "finalizeMain");
+
+    // Counters cleared before the dispatch; copied to the readback buffer after.
+    if (mScreenProbes.pCounters)
+        pRenderContext->clearUAV(mScreenProbes.pCounters->getUAV().get(), uint4(0));
+
+    // Dispatch order: update (metadata) -> trace (directions) -> finalize (probe radiance).
+    // 64-thread groups; the thread counts are multiples of 64 (probeCount and
+    // probeCount * directions, both rounded up).
+    const uint32_t updateThreads = ((probeCount + 63u) / 64u) * 64u;
+    mScreenProbes.pUpdate->execute(pRenderContext, updateThreads, 1, 1);
+
+    const uint64_t traceTotal = (uint64_t)probeCount * directionsPerProbe;
+    const uint32_t traceThreads = (uint32_t)((traceTotal + 63u) / 64u) * 64u;
+    mScreenProbes.pTrace->execute(pRenderContext, traceThreads, 1, 1);
+
+    mScreenProbes.pFinalize->execute(pRenderContext, updateThreads, 1, 1);
+
+    if (mScreenProbes.pCounters && mScreenProbes.pCountersReadback)
+    {
+        pRenderContext->copyResource(mScreenProbes.pCountersReadback.get(), mScreenProbes.pCounters.get());
+        mScreenProbes.counterReadbackPending = true;
+    }
 }
