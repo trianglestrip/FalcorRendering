@@ -185,6 +185,13 @@ private:
     void runScreenProbeTrace(RenderContext* pRenderContext, const RenderData& renderData);
     void readbackScreenProbeCounters(RenderContext* pRenderContext);
 
+    // ------------------------------------------------------------------------------------------
+    // S5: temporal filter host (S5-A1 history double buffer + S5-B1 pass wiring)
+    // ------------------------------------------------------------------------------------------
+    void createTemporalFilterProgram();
+    void ensureTemporalFilterResources(RenderContext* pRenderContext);
+    void runTemporalFilter(RenderContext* pRenderContext, const RenderData& renderData);
+
     ///< gSamplesPerTexel preset mapping: Low/Medium/High/Reference -> 1/2/4/8
     ///< (LumenCacheLightingQuality in LumenSurfaceCacheLightingData.slang).
     uint32_t cacheLightingSamplesPerTexel() const;
@@ -337,6 +344,54 @@ private:
     float mProbeInterpNormalExponent = 8.0f;
     float mProbeInterpMaterialMismatchWeight = 0.05f;
     float mProbeInterpFallbackConfidenceScale = 0.25f;
+
+    // ------------------------------------------------------------------------------------------
+    // S5: temporal filter host (S5-A1 history double buffer + S5-B1 pass wiring)
+    // ------------------------------------------------------------------------------------------
+    ///< Scriptable S5 gate channel (temporalFiltered): full-res RGBA16F, RGB = temporally filtered
+    ///< incident irradiance E, A = NEW history length (capped). This is the S5 main output; probed
+    ///< by tests/lumengi/run_temporal*.py (Z6) and consumed by the S5-B2 spatial filter (Z8).
+    static constexpr const char* kTemporalFiltered = "temporalFiltered";
+    ///< gTemporalAlpha (R32F): effective EMA alpha (1 = full reject / reset; cross-check channel).
+    static constexpr const char* kTemporalAlpha = "temporalAlpha";
+    ///< gTemporalConfidence (R32F): updated confidence, the S5-B2 spatial-filter input.
+    static constexpr const char* kTemporalConfidence = "temporalConfidence";
+
+    ///< S5-B1 temporal filter GPU resources. Created lazily by ensureTemporalFilterResources(),
+    ///< frame-dim-scoped (recreated on resize). The pass compiles LumenTemporalFilter.cs.slang.
+    struct
+    {
+        ref<ComputePass> pFilter;         ///< LumenTemporalFilter.cs.slang, entry "main" (8x8 threads).
+        ///< S5-A1 history ping-pong (RGBA16F, .rgb = smoothed irradiance, .a = history length).
+        ///< The pass reads gPrevGI from slot [1-historyCurrIndex] while writing gTemporalOutput to
+        ///< slot [historyCurrIndex] (the two must be distinct resources); the host flips the index
+        ///< after every dispatch so the buffer written this frame is the previous frame's input next.
+        ref<Texture> pHistory[2];
+        ref<Texture> pPrevDepth;          ///< S5-A1 previous-frame linear depth (R32F, blit of linearZ.x).
+        uint32_t historyCurrIndex = 0;    ///< History slot written this frame (flipped after each dispatch).
+        uint2 resourceDim = {0, 0};       ///< Frame dims the resources were built for.
+        ///< Camera cut / resize / scene-change reset: marks the prev double buffer for a hard clear
+        ///< (emitted inside runTemporalFilter where a RenderContext is available). resetHistory()
+        ///< only fires on hard invalidations, never on camera-movement-only updates, so smooth
+        ///< motion reuses history through the motion-vector reprojection.
+        bool historyResetPending = true;
+    } mTemporalFilter;
+
+    ///< S5-B1 tuning (LumenTemporalFilterCB; defaults frozen with Z5's LumenTemporalFilterData.slang).
+    bool mTemporalClampHistory = false;           ///< gClampHistory: AABB-clamp history to the current 3x3 (TAA anti-ghost; off in the S5 MVP -- see S5 report).
+    float mTemporalHistoryAlpha = 0.1f;           ///< gHistoryAlpha: base EMA weight toward the current frame.
+    float mTemporalHistoryLengthCap = 255.f;      ///< gHistoryLengthCap: output history length cap (task gate: no overflow).
+    float mTemporalDepthThreshold = 0.05f;        ///< gDepthThreshold (m): depthW dead zone below which weight = 1.
+    float mTemporalDepthSigmaInv = 8.0f;          ///< gDepthSigmaInv (1/m): depthW exponential falloff beyond the zone.
+    float mTemporalDepthRelativeThreshold = 0.05f; ///< gDepthRelativeThreshold: hard reject on relative depth jump.
+    float mTemporalMaxRejectAlpha = 1.0f;         ///< gMaxRejectAlpha: blend alpha on disocclusion / soft reject.
+    float mMotionLengthThreshold = 0.5f;          ///< gMotionLengthThreshold: hard reject when |mvec| exceeds this (normalized).
+
+    ///< S5-A1 camera-cut detector: when the camera position moved more than this many meters
+    ///< between frames (a jump, not a smooth pan/orbit), the history is hard-reset (the S5-B1
+    ///< filter alone would still re-use coplanar history that reprojects to a matching depth).
+    float mCameraCutDistance = 0.3f;
+    float3 mPrevCameraPosition = float3(1e30f); ///< Last frame's camera position (large sentinel = first frame).
 
     ///< Scriptable S3 gate channel name: exposes the internal radiance atlas (RGB = direct,
     ///< linear) at atlas resolution for tests/lumengi/run_cachelighting.py (Agent N).

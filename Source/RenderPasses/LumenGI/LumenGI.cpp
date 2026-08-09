@@ -41,6 +41,75 @@ const char kScreenTraceShaderFile[] = "RenderPasses/LumenGI/ScreenTrace/LumenScr
 const char kScreenProbeShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeTrace.cs.slang";
 const char kScreenProbeIntegrateShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeIntegrate.cs.slang";
 const char kScreenProbeInterpolateShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeInterpolate.cs.slang";
+const char kTemporalFilterShaderFile[] = "RenderPasses/LumenGI/Temporal/LumenTemporalFilter.cs.slang";
+
+///< S5-B1 LumenTemporalFilterCB fields that are not exposed as tunable members; defaults frozen
+///< with Z5's LumenTemporalFilterData.slang comments (all but the last three are inert while the
+///< corresponding optional validation inputs are unbound).
+constexpr float kTemporalClampBoxMargin = 0.0f;      ///< gClampBoxMargin (fraction of the neighborhood range).
+constexpr float kTemporalNormalCosMin = 0.8f;        ///< gNormalCosMin (no normal input in the MVP).
+constexpr float kTemporalNormalExponent = 8.0f;      ///< gNormalExponent (no normal input in the MVP).
+constexpr float kTemporalMaterialMismatchWeight = 0.05f; ///< gMaterialMismatchWeight (no material input in the MVP).
+constexpr float kTemporalHitDistanceThreshold = 0.5f; ///< gHitDistanceThreshold (m; no hit-distance input in the MVP).
+///< gConfidenceWeight (confidence gating strength in wConf). DEFAULT 0 in the S5 MVP: the S4.3
+///< interpolate confidence is currently dominated by the probe miss penalty (uniformly ~0.03 on
+///< Cornell, see the S5 report) and a weight of 1.0 would make wConf ~0.03 for every pixel, which
+///< pins alpha near gMaxRejectAlpha and disables the temporal accumulation entirely. With gating
+///< off, history trust is driven by the working depth + motion validation; re-enable (1.0) once a
+///< meaningful per-pixel confidence channel lands (S4-B3 fix / S5-B2).
+constexpr float kTemporalConfidenceWeight = 0.0f;
+///< gFireflyMaxRadiance; mirrors the kLumenGIMaxRadiance default in LumenGIData.slang / the
+///< LUMEN_GI_MAX_RADIANCE fallback in LumenTemporalFilterData.slang.
+constexpr float kTemporalFireflyMaxRadiance = 10000.f;
+
+///< Host mirror of cbuffer LumenTemporalFilterCB in LumenTemporalFilterData.slang (frozen 96-byte
+///< layout). The host sets every field by name each dispatch; this struct only documents and
+///< static-asserts the GPU layout so a future root-side copy cannot drift from the shader contract.
+struct LumenTemporalFilterCB
+{
+    uint2 gFrameDim;                // +0  Frame dims in pixels; guards the dispatch.
+    uint32_t gFrameIndex;           // +8  Frame index (diagnostics / reserved).
+    uint32_t gClampHistory;         // +12 != 0: AABB-clamp history RGB to the current 3x3 neighborhood.
+    float gHistoryAlpha;            // +16 Base EMA weight toward the current frame.
+    float gHistoryLengthCap;        // +20 Cap for the output history length.
+    float gClampBoxMargin;          // +24 AABB clamp margin as a fraction of the neighborhood range.
+    float gDepthThreshold;          // +28 Meters; depthW dead zone.
+    float gDepthSigmaInv;           // +32 1/meters; depthW falloff rate.
+    float gDepthRelativeThreshold;  // +36 Hard reject on relative depth jump.
+    float gNormalCosMin;            // +40 Hard reject on normal flip.
+    float gNormalExponent;          // +44 pow on the normal dot.
+    float gMaterialMismatchWeight;  // +48 Material-ID mismatch weight.
+    float gHitDistanceThreshold;    // +52 Meters; hard reject on hit-distance jump.
+    float gConfidenceWeight;        // +56 Confidence gating strength in wConf.
+    float gMaxRejectAlpha;          // +60 Blend alpha on disocclusion / soft reject.
+    float gMotionVectorScale;       // +64 Multiplies the motion vector before reprojection.
+    float gMotionLengthThreshold;   // +68 Hard reject when |mvec| exceeds this (normalized).
+    float gFireflyMaxRadiance;      // +72 Firefly ceiling on the output RGB.
+    float2 gInvFrameDim;            // +76 1 / frame dims.
+    uint32_t gPad0;                 // +84
+    uint32_t gPad1;                 // +88
+    uint32_t gPad2;                 // +92
+}; // 96 bytes.
+static_assert(sizeof(LumenTemporalFilterCB) == 96, "LumenTemporalFilterCB mirror is 96 bytes (16B-aligned, no padding)");
+static_assert(offsetof(LumenTemporalFilterCB, gFrameDim) == 0, "gFrameDim offset");
+static_assert(offsetof(LumenTemporalFilterCB, gFrameIndex) == 8, "gFrameIndex offset");
+static_assert(offsetof(LumenTemporalFilterCB, gClampHistory) == 12, "gClampHistory offset");
+static_assert(offsetof(LumenTemporalFilterCB, gHistoryAlpha) == 16, "gHistoryAlpha offset");
+static_assert(offsetof(LumenTemporalFilterCB, gHistoryLengthCap) == 20, "gHistoryLengthCap offset");
+static_assert(offsetof(LumenTemporalFilterCB, gClampBoxMargin) == 24, "gClampBoxMargin offset");
+static_assert(offsetof(LumenTemporalFilterCB, gDepthThreshold) == 28, "gDepthThreshold offset");
+static_assert(offsetof(LumenTemporalFilterCB, gDepthSigmaInv) == 32, "gDepthSigmaInv offset");
+static_assert(offsetof(LumenTemporalFilterCB, gDepthRelativeThreshold) == 36, "gDepthRelativeThreshold offset");
+static_assert(offsetof(LumenTemporalFilterCB, gNormalCosMin) == 40, "gNormalCosMin offset");
+static_assert(offsetof(LumenTemporalFilterCB, gNormalExponent) == 44, "gNormalExponent offset");
+static_assert(offsetof(LumenTemporalFilterCB, gMaterialMismatchWeight) == 48, "gMaterialMismatchWeight offset");
+static_assert(offsetof(LumenTemporalFilterCB, gHitDistanceThreshold) == 52, "gHitDistanceThreshold offset");
+static_assert(offsetof(LumenTemporalFilterCB, gConfidenceWeight) == 56, "gConfidenceWeight offset");
+static_assert(offsetof(LumenTemporalFilterCB, gMaxRejectAlpha) == 60, "gMaxRejectAlpha offset");
+static_assert(offsetof(LumenTemporalFilterCB, gMotionVectorScale) == 64, "gMotionVectorScale offset");
+static_assert(offsetof(LumenTemporalFilterCB, gMotionLengthThreshold) == 68, "gMotionLengthThreshold offset");
+static_assert(offsetof(LumenTemporalFilterCB, gFireflyMaxRadiance) == 72, "gFireflyMaxRadiance offset");
+static_assert(offsetof(LumenTemporalFilterCB, gInvFrameDim) == 76, "gInvFrameDim offset");
 
 ///< S4-A1 screen-trace direction input (frozen shader contract: gRayDirection is a view-space
 ///< direction texture, sampled per pixel and normalized; forward rays must have d.z < 0). The
@@ -152,6 +221,9 @@ const ChannelList kOutputChannels = {
     { "screenTrace",                   "gScreenTraceResult",             "S4 screen-space trace: RGB=hitUV/distance, A=confidence or -(reason+1)", true, ResourceFormat::RGBA16Float },
     { "probeRadiance",                 "gProbeRadiance",                 "S4.2 screen probe grid: RGB=avg radiance at the probe, A=hit fraction (sparse)", true, ResourceFormat::RGBA16Float },
     { "probeInterpolated",             "gGIOutput",                      "S4.3 probe interpolate: RGB=incident irradiance E, A=confidence in [0,1]. S5-B1 temporal-filter input.", true, ResourceFormat::RGBA16Float },
+    { "temporalFiltered",              "gTemporalOutput",                "S5-B1 temporal filter: RGB=temporally filtered incident irradiance, A=NEW history length (capped). S5 main output.", true, ResourceFormat::RGBA16Float },
+    { "temporalAlpha",                 "gTemporalAlpha",                 "S5-B1 effective EMA alpha (1 = full reject / reset). Accept/reject cross-check.", true, ResourceFormat::R32Float },
+    { "temporalConfidence",            "gTemporalConfidence",            "S5-B1 updated confidence; input to the S5-B2 spatial filter.", true, ResourceFormat::R32Float },
     // clang-format on
 };
 
@@ -332,8 +404,29 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
         {
             createTraceProgram();
         }
-        resetHistory();
+        // S5-A1 reset policy: a camera MOVEMENT alone does NOT reset the temporal history -- the
+        // S5-B1 filter reprojects it along the GBufferRT motion vector and self-resets on
+        // disocclusion (a camera cut produces motion vectors above gMotionLengthThreshold and a
+        // stale prev depth, both of which the filter rejects). Everything else (geometry /
+        // meshes / materials / lights / env map / scene graph / camera switch or property change)
+        // is a hard invalidation and clears the prev history/depth double buffer so every pixel
+        // takes the disocclusion path for one frame.
+        const IScene::UpdateFlags hardInvalidation = mSceneUpdates & ~IScene::UpdateFlags::CameraMoved;
+        if (hardInvalidation != IScene::UpdateFlags::None)
+            resetHistory();
         mSceneUpdates = IScene::UpdateFlags::None;
+    }
+
+    // S5-A1 camera-cut detector: a LARGE camera jump between frames invalidates the temporal
+    // history even though the scene update is CameraMoved-only (which the filter would otherwise
+    // reproject and, for coplanar surfaces, legitimately re-use). Smooth pan/orbit deltas stay
+    // below mCameraCutDistance and keep the history, relying on the motion-vector reprojection.
+    if (mpScene)
+    {
+        const float3 camPos = mpScene->getCamera()->getPosition();
+        if (length(camPos - mPrevCameraPosition) > mCameraCutDistance)
+            resetHistory(); // hard reset: clear the prev history/depth double buffer on the cut frame.
+        mPrevCameraPosition = camPos;
     }
 
     clearOutputs(pRenderContext, renderData);
@@ -466,6 +559,16 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     // the optional "probeRadiance" grid. Runs after the screen trace every frame.
     if (mUseScreenProbes)
         runScreenProbeTrace(pRenderContext, renderData);
+
+    // S5: temporal filter (S5-A1 history host + S5-B1 pass). Consumes the S4.3 interpolated GI
+    // (probeInterpolated), the GBufferRT linearZ/motion and the S5-A1 prev history/depth double
+    // buffer; writes the "temporalFiltered" graph channel (and optionally temporalAlpha /
+    // temporalConfidence). Runs AFTER the interpolate pass (inside runScreenProbeTrace) and
+    // BEFORE the debug pass. The allocation gates (probeInterpolated / temporalFiltered graph
+    // channels) live inside runTemporalFilter; when the filter is off or the channel is absent
+    // the pass is a no-op and the output stays cleared.
+    if (mUseTemporalFilter)
+        runTemporalFilter(pRenderContext, renderData);
 
     if (!mpDebugPass)
         createDebugPass();
@@ -745,6 +848,7 @@ void LumenGI::onHotReload(HotReloadFlags reloaded)
         mScreenProbes.pFinalize = nullptr;
         mScreenProbes.pIntegrate = nullptr;
         mScreenProbes.pInterpolate = nullptr;
+        mTemporalFilter.pFilter = nullptr; // pure compute, no scene deps; recreated lazily.
         resetHistory();
     }
 }
@@ -752,6 +856,12 @@ void LumenGI::onHotReload(HotReloadFlags reloaded)
 void LumenGI::resetHistory()
 {
     mFrameIndex = 0;
+    // S5-A1: mark the prev history/depth double buffer for a hard clear (camera cut / resize /
+    // scene change). The actual clear is emitted inside runTemporalFilter (it needs a
+    // RenderContext, and setScene/onHotReload call this before the buffers exist). Clearing the
+    // prev buffers makes every pixel take the disocclusion path for one frame (prev depth 0 =>
+    // validation weight 0), which is the "history immediately invalid after a cut" gate.
+    mTemporalFilter.historyResetPending = true;
 }
 
 void LumenGI::clearOutputs(RenderContext* pRenderContext, const RenderData& renderData) const
@@ -1913,8 +2023,17 @@ void LumenGI::runScreenProbeTrace(RenderContext* pRenderContext, const RenderDat
     if (!mpScene)
         return;
     const ref<Texture> pLinearZ = renderData.getTexture("linearZ");
-    if (!pLinearZ || mScreenTrace.pHZBMips.empty())
-        return; // linearZ (required input) or the HZB chain (S4-A1, built by runScreenTrace) missing.
+    if (!pLinearZ)
+        return; // linearZ is a required input; without it there is nothing to probe.
+
+    // S4-alignment fix (S5-enabling): the probe path builds its OWN native HZB chain
+    // (mScreenProbes.pHZBNative) directly from linearZ further down, so it only needs the HZB
+    // BUILD PROGRAM -- NOT the S4-A1 screenTrace mip chain, which lives behind the optional
+    // "screenTrace" graph output (runScreenTrace early-returns without that channel). Create the
+    // build pass lazily so probes (and therefore the S4.3 interpolate -> S5-B1 temporal filter)
+    // work even when the graph does not allocate the screenTrace output (e.g. the S5 test graphs).
+    if (!mScreenTrace.pHZBBuild)
+        createHZBBuildProgram();
 
     // Read back the previous dispatch's counters (one-frame lag, same as the other paths).
     readbackScreenProbeCounters(pRenderContext);
@@ -2168,4 +2287,176 @@ void LumenGI::runScreenProbeTrace(RenderContext* pRenderContext, const RenderDat
         pRenderContext->copyResource(mScreenProbes.pCountersReadback.get(), mScreenProbes.pCounters.get());
         mScreenProbes.counterReadbackPending = true;
     }
+}
+
+// ------------------------------------------------------------------------------------------
+// S5: temporal filter host (S5-A1 history double buffer + S5-B1 pass wiring)
+// ------------------------------------------------------------------------------------------
+
+void LumenGI::createTemporalFilterProgram()
+{
+    // S5-B1 temporal filter (LumenTemporalFilter.cs.slang, entry "main"). The REQUIRED inputs are
+    // always bound every dispatch (gLinearZ / gCurrent / gMotionVector / gPrevDepth / gPrevGI /
+    // gTemporalOutput), so their is_valid defines are pinned to 1. The OPTIONAL UAVs
+    // (gTemporalAlpha / gTemporalConfidence) are pinned to 0 here and specialized per-frame in
+    // runTemporalFilter based on graph allocation. The optional VALIDATION inputs (normal +
+    // material, hit distance, separate history length / prev confidence) stay unbound in the MVP:
+    // the S4.3 interpolate pass already weight-validates against depth/normal/material, and the
+    // confidence is carried in gCurrent.a / gPrevGI.a, so the filter's core validations (depth,
+    // motion, confidence) are active without them.
+    DefineList defines;
+    defines.add("is_valid_gLinearZ", "1");
+    defines.add("is_valid_gCurrent", "1");
+    defines.add("is_valid_gMotionVector", "1");
+    defines.add("is_valid_gPrevDepth", "1");
+    defines.add("is_valid_gPrevGI", "1");
+    defines.add("is_valid_gTemporalOutput", "1");
+    defines.add("is_valid_gTemporalAlpha", "0");
+    defines.add("is_valid_gTemporalConfidence", "0");
+    mTemporalFilter.pFilter = ComputePass::create(mpDevice, kTemporalFilterShaderFile, "main", defines);
+}
+
+void LumenGI::ensureTemporalFilterResources(RenderContext* pRenderContext)
+{
+    if (any(mFrameDim == uint2(0u, 0u)))
+        return;
+
+    if (!mTemporalFilter.pFilter)
+        createTemporalFilterProgram();
+
+    const bool sizeChanged = any(mTemporalFilter.resourceDim != mFrameDim);
+    if (!mTemporalFilter.pHistory[0] || !mTemporalFilter.pHistory[1] || !mTemporalFilter.pPrevDepth || sizeChanged)
+    {
+        // S5-A1 history ping-pong: RGBA16F (RGB = smoothed irradiance, A = history length),
+        // full-res, SRV + UAV (the filter reads the previous slot and writes the current slot).
+        // Created zeroed so a fresh start (or a resize) begins with no history.
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            mTemporalFilter.pHistory[i] = mpDevice->createTexture2D(
+                mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+            mTemporalFilter.pHistory[i]->setName(
+                "LumenGI::TemporalFilter::History" + std::string(i == 0 ? "A" : "B")
+            ); // RGBA16F (RGB = irradiance, A = history length), frame-scoped, S5-A1 double buffer.
+            pRenderContext->clearUAV(mTemporalFilter.pHistory[i]->getUAV().get(), float4(0.f));
+        }
+        // S5-A1 previous-frame linear depth: R32F copy of GBufferRT.linearZ.x. The RenderTarget
+        // flag enables the per-frame blit copy (RenderContext::blit writes through an RTV). Cleared
+        // to zero so the very first frame (and any reset) sees prevZ == 0 => validation weight 0.
+        mTemporalFilter.pPrevDepth = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::R32Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess | ResourceBindFlags::RenderTarget
+        );
+        mTemporalFilter.pPrevDepth->setName("LumenGI::TemporalFilter::PrevDepth"); // R32F, frame-scoped.
+        pRenderContext->clearUAV(mTemporalFilter.pPrevDepth->getUAV().get(), float4(0.f));
+
+        mTemporalFilter.historyCurrIndex = 0;
+        mTemporalFilter.resourceDim = mFrameDim;
+        mTemporalFilter.historyResetPending = true; // fresh zeroed buffers == reset state.
+    }
+}
+
+void LumenGI::runTemporalFilter(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    // Allocation gates: gCurrent is the S4.3 interpolate graph output (only produced when the
+    // probe path ran), gTemporalOutput is the S5 graph output this pass feeds. The graph channel
+    // names mirror kOutputChannels, so renderData.getTexture() resolves them by name.
+    const ref<Texture> pCurrent = renderData.getTexture(kProbeInterpolated);
+    const ref<Texture> pOutput = renderData.getTexture(kTemporalFiltered);
+    if (!pCurrent || !pOutput)
+        return;
+
+    const ref<Texture> pLinearZ = renderData.getTexture("linearZ");
+    const ref<Texture> pMotionVector = renderData.getTexture("mvec");
+    if (!pLinearZ || !pMotionVector)
+        return;
+
+    ensureTemporalFilterResources(pRenderContext);
+    if (!mTemporalFilter.pFilter || !mTemporalFilter.pHistory[0] || !mTemporalFilter.pHistory[1] ||
+        !mTemporalFilter.pPrevDepth)
+    {
+        return;
+    }
+
+    // S5-A1: camera cut / resize / scene-change reset (historyResetPending is set by
+    // resetHistory()). Clear both prev buffers so every pixel takes the disocclusion path for one
+    // frame: prevZ == 0 makes the per-tap validation weight 0, so the gather fails and the filter
+    // outputs the current frame with history length 1 ("history immediately invalid after a cut").
+    if (mTemporalFilter.historyResetPending)
+    {
+        for (const ref<Texture>& pHist : mTemporalFilter.pHistory)
+            pRenderContext->clearUAV(pHist->getUAV().get(), float4(0.f));
+        pRenderContext->clearUAV(mTemporalFilter.pPrevDepth->getUAV().get(), float4(0.f));
+        mTemporalFilter.historyResetPending = false;
+    }
+
+    const bool hasAlpha = renderData.getTexture(kTemporalAlpha) != nullptr;
+    const bool hasConfidence = renderData.getTexture(kTemporalConfidence) != nullptr;
+
+    // Per-frame program specialization for the optional UAVs (graph allocation is fixed per graph,
+    // so this changes only once per graph build).
+    ref<Program> pProgram = mTemporalFilter.pFilter->getProgram();
+    bool programChanged = false;
+    programChanged |= pProgram->addDefine("is_valid_gTemporalAlpha", hasAlpha ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gTemporalConfidence", hasConfidence ? "1" : "0");
+    if (programChanged)
+        mTemporalFilter.pFilter->setVars(nullptr);
+
+    // Constant buffer (LumenTemporalFilterCB; every field filled every dispatch, defaults per Z5).
+    ShaderVar var = mTemporalFilter.pFilter->getRootVar();
+    ShaderVar cb = var["LumenTemporalFilterCB"];
+    cb["gFrameDim"] = mFrameDim;
+    cb["gFrameIndex"] = mFrameIndex;
+    cb["gClampHistory"] = mTemporalClampHistory ? 1u : 0u;
+    cb["gHistoryAlpha"] = mTemporalHistoryAlpha;
+    cb["gHistoryLengthCap"] = mTemporalHistoryLengthCap;
+    cb["gClampBoxMargin"] = kTemporalClampBoxMargin;
+    cb["gDepthThreshold"] = mTemporalDepthThreshold;
+    cb["gDepthSigmaInv"] = mTemporalDepthSigmaInv;
+    cb["gDepthRelativeThreshold"] = mTemporalDepthRelativeThreshold;
+    cb["gNormalCosMin"] = kTemporalNormalCosMin;
+    cb["gNormalExponent"] = kTemporalNormalExponent;
+    cb["gMaterialMismatchWeight"] = kTemporalMaterialMismatchWeight;
+    cb["gHitDistanceThreshold"] = kTemporalHitDistanceThreshold;
+    cb["gConfidenceWeight"] = kTemporalConfidenceWeight;
+    cb["gMaxRejectAlpha"] = mTemporalMaxRejectAlpha;
+    cb["gMotionVectorScale"] = 1.f; // Falcor calcMotionVector convention: normalized screen space.
+    cb["gMotionLengthThreshold"] = mMotionLengthThreshold;
+    cb["gFireflyMaxRadiance"] = kTemporalFireflyMaxRadiance;
+    cb["gInvFrameDim"] = float2(1.f / (float)mFrameDim.x, 1.f / (float)mFrameDim.y);
+    cb["gPad0"] = 0u;
+    cb["gPad1"] = 0u;
+    cb["gPad2"] = 0u;
+
+    // S5-A1 history double buffer: gPrevGI = the PREVIOUS frame's output (slot 1-historyCurrIndex),
+    // gTemporalOutput = THIS frame's output slot (historyCurrIndex). The ping-pong is required:
+    // the pass reads gPrevGI while writing gTemporalOutput, and the two must be distinct resources.
+    var["gLinearZ"] = pLinearZ;
+    var["gCurrent"] = pCurrent;
+    var["gMotionVector"] = pMotionVector;
+    var["gPrevDepth"] = mTemporalFilter.pPrevDepth;
+    var["gPrevGI"] = mTemporalFilter.pHistory[1 - mTemporalFilter.historyCurrIndex];
+    var["gTemporalOutput"] = mTemporalFilter.pHistory[mTemporalFilter.historyCurrIndex];
+    if (hasAlpha)
+        var["gTemporalAlpha"] = renderData.getTexture(kTemporalAlpha);
+    if (hasConfidence)
+        var["gTemporalConfidence"] = renderData.getTexture(kTemporalConfidence);
+
+    // Dispatch ceil(gFrameDim / 8) x ceil(gFrameDim / 8) threads (8x8 thread groups per the frozen
+    // LumenTemporalFilterData.slang contract).
+    mTemporalFilter.pFilter->execute(
+        pRenderContext,
+        ((mFrameDim.x + 7u) / 8u) * 8u,
+        ((mFrameDim.y + 7u) / 8u) * 8u,
+        1
+    );
+
+    // S5-A1 frame-end updates: copy the freshly filtered history into the graph "temporalFiltered"
+    // output (same RGBA16F format -> full-resource copy) and blit the current linear depth into
+    // pPrevDepth so the NEXT frame validates against THIS frame. Then flip the ping-pong: the slot
+    // written this frame becomes the previous frame's input next frame.
+    pRenderContext->copyResource(pOutput.get(), mTemporalFilter.pHistory[mTemporalFilter.historyCurrIndex].get());
+    pRenderContext->blit(pLinearZ->getSRV(), mTemporalFilter.pPrevDepth->getRTV());
+    mTemporalFilter.historyCurrIndex ^= 1u;
 }

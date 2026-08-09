@@ -59,6 +59,7 @@ target_sources(FalcorTest PRIVATE
     Tests/RenderPasses/LumenHZBTests.cpp
     Tests/RenderPasses/LumenGlobalDistanceFieldTests.cpp
     Tests/RenderPasses/LumenMeshSDFAtlasTests.cpp
+    Tests/RenderPasses/LumenMeshSDFCacheTests.cpp
 
     Tests/Rendering/Materials/BSDFIntegratorTests.cpp
     Tests/Rendering/Materials/RGLAcquisitionTests.cpp
