@@ -29,6 +29,9 @@ target_sources(LumenGI PRIVATE
     ScreenProbe/LumenScreenProbeInterpolate.cs.slang
     Temporal/LumenTemporalFilterData.slang
     Temporal/LumenTemporalFilter.cs.slang
+    Spatial/LumenSpatialFilterData.slang
+    Spatial/LumenSpatialFilter.cs.slang
+    Spatial/LumenReconstruction.h
 )
 
 target_copy_shaders(LumenGI RenderPasses/LumenGI)

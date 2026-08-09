@@ -36,6 +36,7 @@
 #include "Capture/LumenCaptureScheduler.h" // Brings in Cards/LumenCardScene.h and SurfaceCache/LumenSurfaceCache.h.
 #include "ScreenTrace/LumenHZB.h" // S4-A1 HZB chain host component (mip dims / dispatch params).
 #include "ScreenProbe/LumenScreenProbe.h" // S4.2 screen probe grid host component (grid math / budget / stats).
+#include "Spatial/LumenReconstruction.h" // S5-A2 reconstruction host component (full/half/quarter resolution, upscale, spatial-filter CB mirror).
 
 using namespace Falcor;
 
@@ -191,6 +192,13 @@ private:
     void createTemporalFilterProgram();
     void ensureTemporalFilterResources(RenderContext* pRenderContext);
     void runTemporalFilter(RenderContext* pRenderContext, const RenderData& renderData);
+
+    // ------------------------------------------------------------------------------------------
+    // S5: spatial filter host (S5-B2 pass wiring + S5-A2 reconstruction CB)
+    // ------------------------------------------------------------------------------------------
+    void createSpatialFilterProgram();
+    void ensureSpatialFilterResources(RenderContext* pRenderContext);
+    void runSpatialFilter(RenderContext* pRenderContext, const RenderData& renderData);
 
     ///< gSamplesPerTexel preset mapping: Low/Medium/High/Reference -> 1/2/4/8
     ///< (LumenCacheLightingQuality in LumenSurfaceCacheLightingData.slang).
@@ -356,6 +364,11 @@ private:
     static constexpr const char* kTemporalAlpha = "temporalAlpha";
     ///< gTemporalConfidence (R32F): updated confidence, the S5-B2 spatial-filter input.
     static constexpr const char* kTemporalConfidence = "temporalConfidence";
+    ///< Scriptable S5-B2 gate channel (spatialFiltered): full-res RGBA16F, RGB = variance-guided
+    ///< spatially filtered incident irradiance, A = FILTERED confidence in [0,1] (carried from
+    ///< gConfidenceInput / the S5-B1 temporalConfidence, blended by the pass). This is the S5
+    ///< final filtered output; probed by tests/lumengi/run_spatial_gate.py / run_spatial_ghost.py.
+    static constexpr const char* kSpatialFiltered = "spatialFiltered";
 
     ///< S5-B1 temporal filter GPU resources. Created lazily by ensureTemporalFilterResources(),
     ///< frame-dim-scoped (recreated on resize). The pass compiles LumenTemporalFilter.cs.slang.
@@ -386,6 +399,36 @@ private:
     float mTemporalDepthRelativeThreshold = 0.05f; ///< gDepthRelativeThreshold: hard reject on relative depth jump.
     float mTemporalMaxRejectAlpha = 1.0f;         ///< gMaxRejectAlpha: blend alpha on disocclusion / soft reject.
     float mMotionLengthThreshold = 0.5f;          ///< gMotionLengthThreshold: hard reject when |mvec| exceeds this (normalized).
+
+    // ------------------------------------------------------------------------------------------
+    // S5: spatial filter host (S5-B2 pass wiring). The pass is a pure GPU compute filter: all
+    // resources come from the graph (gGIInput = temporalFiltered, gConfidenceInput =
+    // temporalConfidence, gLinearZ / gNormalRoughnessMaterialID from the GBuffer, gFilteredOutput
+    // = the "spatialFiltered" graph channel), so the host owns only the ComputePass. It runs at
+    // full frame resolution in the S5 MVP; half/quarter GI (S5-A2, LumenReconstruction) is an S8
+    // quality-preset item (the CB is still built through LumenReconstruction::makeSpatialFilterCB).
+    // ------------------------------------------------------------------------------------------
+    struct
+    {
+        ///< LumenSpatialFilter.cs.slang, entry "main" (8x8 threads, variance-guided bilateral).
+        ref<ComputePass> pFilter;
+    } mSpatialFilter;
+
+    ///< S5-B2 tuning (LumenSpatialFilterCB; defaults frozen with LumenSpatialFilterData.slang and
+    ///< mirrored by LumenReconstruction::SpatialFilterConstantBuffer). Every field below is set on
+    ///< the CB each dispatch; values match the frozen shader defaults so the pass is deterministic
+    ///< and the radius / threshold / variance fields can be retuned per preset (S8).
+    float mSpatialRadiusMin = 0.0f;               ///< gRadiusMin: adaptive radius floor (pixels).
+    float mSpatialRadiusMax = 3.0f;               ///< gRadiusMax: adaptive radius ceiling (pixels).
+    float mSpatialVarianceThresholdLow = 0.01f;   ///< gVarianceThresholdLow: rel-var below which radius = gRadiusMin.
+    float mSpatialVarianceThresholdHigh = 0.25f;  ///< gVarianceThresholdHigh: rel-var above which radius = gRadiusMax.
+    bool mSpatialFireflyClamp = true;             ///< gFireflyClamp: firefly replace + clamp.
+    uint32_t mSpatialNeighborhoodRadius = 1u;     ///< gNeighborhoodRadius: variance window radius (1 = 3x3, 2 = 5x5).
+    float mSpatialTemporalVarianceWeight = 1.0f;  ///< gTemporalVarianceWeight: scale on the S5-A1 temporal variance (0 = spatial only).
+    float mSpatialDepthThreshold = 0.05f;         ///< gDepthThreshold (m): depthW dead zone.
+    float mSpatialDepthSigmaInv = 8.0f;           ///< gDepthSigmaInv (1/m): depthW falloff beyond the zone.
+    float mSpatialNormalExponent = 8.0f;          ///< gNormalExponent: pow(saturate(dot)) on the normal affinity.
+    float mSpatialMaterialMismatchWeight = 0.05f; ///< gMaterialMismatchWeight: material-ID mismatch residual.
 
     ///< S5-A1 camera-cut detector: when the camera position moved more than this many meters
     ///< between frames (a jump, not a smooth pan/orbit), the history is hard-reset (the S5-B1

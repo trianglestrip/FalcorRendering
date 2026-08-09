@@ -42,6 +42,7 @@ const char kScreenProbeShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScr
 const char kScreenProbeIntegrateShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeIntegrate.cs.slang";
 const char kScreenProbeInterpolateShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeInterpolate.cs.slang";
 const char kTemporalFilterShaderFile[] = "RenderPasses/LumenGI/Temporal/LumenTemporalFilter.cs.slang";
+const char kSpatialFilterShaderFile[] = "RenderPasses/LumenGI/Spatial/LumenSpatialFilter.cs.slang";
 
 ///< S5-B1 LumenTemporalFilterCB fields that are not exposed as tunable members; defaults frozen
 ///< with Z5's LumenTemporalFilterData.slang comments (all but the last three are inert while the
@@ -150,6 +151,17 @@ const char kProbeDirectionsPerProbe[] = "probeDirectionsPerProbe";
 const char kProbeMaxProbesPerFrame[] = "probeMaxProbesPerFrame";
 const char kUseTemporalFilter[] = "useTemporalFilter";
 const char kUseSpatialFilter[] = "useSpatialFilter";
+const char kSpatialRadiusMin[] = "spatialRadiusMin";
+const char kSpatialRadiusMax[] = "spatialRadiusMax";
+const char kSpatialVarianceThresholdLow[] = "spatialVarianceThresholdLow";
+const char kSpatialVarianceThresholdHigh[] = "spatialVarianceThresholdHigh";
+const char kSpatialFireflyClamp[] = "spatialFireflyClamp";
+const char kSpatialNeighborhoodRadius[] = "spatialNeighborhoodRadius";
+const char kSpatialTemporalVarianceWeight[] = "spatialTemporalVarianceWeight";
+const char kSpatialDepthThreshold[] = "spatialDepthThreshold";
+const char kSpatialDepthSigmaInv[] = "spatialDepthSigmaInv";
+const char kSpatialNormalExponent[] = "spatialNormalExponent";
+const char kSpatialMaterialMismatchWeight[] = "spatialMaterialMismatchWeight";
 const char kUseRadianceCache[] = "useRadianceCache";
 const char kSurfaceCacheAtlasSize[] = "surfaceCacheAtlasSize";
 const char kCaptureMaxPagesPerFrame[] = "captureMaxPagesPerFrame";
@@ -224,6 +236,7 @@ const ChannelList kOutputChannels = {
     { "temporalFiltered",              "gTemporalOutput",                "S5-B1 temporal filter: RGB=temporally filtered incident irradiance, A=NEW history length (capped). S5 main output.", true, ResourceFormat::RGBA16Float },
     { "temporalAlpha",                 "gTemporalAlpha",                 "S5-B1 effective EMA alpha (1 = full reject / reset). Accept/reject cross-check.", true, ResourceFormat::R32Float },
     { "temporalConfidence",            "gTemporalConfidence",            "S5-B1 updated confidence; input to the S5-B2 spatial filter.", true, ResourceFormat::R32Float },
+    { "spatialFiltered",               "gSpatialOutput",                 "S5-B2 spatial filter: RGB=variance-guided filtered incident irradiance, A=filtered confidence. Consumes temporalFiltered + temporalConfidence.", true, ResourceFormat::RGBA16Float },
     // clang-format on
 };
 
@@ -307,6 +320,28 @@ void LumenGI::parseProperties(const Properties& props)
             mUseTemporalFilter = value;
         else if (key == kUseSpatialFilter)
             mUseSpatialFilter = value;
+        else if (key == kSpatialRadiusMin)
+            mSpatialRadiusMin = value;
+        else if (key == kSpatialRadiusMax)
+            mSpatialRadiusMax = value;
+        else if (key == kSpatialVarianceThresholdLow)
+            mSpatialVarianceThresholdLow = value;
+        else if (key == kSpatialVarianceThresholdHigh)
+            mSpatialVarianceThresholdHigh = value;
+        else if (key == kSpatialFireflyClamp)
+            mSpatialFireflyClamp = value;
+        else if (key == kSpatialNeighborhoodRadius)
+            mSpatialNeighborhoodRadius = std::clamp<uint32_t>(value, 1u, 2u);
+        else if (key == kSpatialTemporalVarianceWeight)
+            mSpatialTemporalVarianceWeight = value;
+        else if (key == kSpatialDepthThreshold)
+            mSpatialDepthThreshold = value;
+        else if (key == kSpatialDepthSigmaInv)
+            mSpatialDepthSigmaInv = value;
+        else if (key == kSpatialNormalExponent)
+            mSpatialNormalExponent = value;
+        else if (key == kSpatialMaterialMismatchWeight)
+            mSpatialMaterialMismatchWeight = value;
         else if (key == kUseRadianceCache)
             mUseRadianceCache = value;
         else if (key == kSurfaceCacheAtlasSize)
@@ -336,6 +371,17 @@ Properties LumenGI::getProperties() const
     props[kProbeMaxProbesPerFrame] = mProbeMaxProbesPerFrame;
     props[kUseTemporalFilter] = mUseTemporalFilter;
     props[kUseSpatialFilter] = mUseSpatialFilter;
+    props[kSpatialRadiusMin] = mSpatialRadiusMin;
+    props[kSpatialRadiusMax] = mSpatialRadiusMax;
+    props[kSpatialVarianceThresholdLow] = mSpatialVarianceThresholdLow;
+    props[kSpatialVarianceThresholdHigh] = mSpatialVarianceThresholdHigh;
+    props[kSpatialFireflyClamp] = mSpatialFireflyClamp;
+    props[kSpatialNeighborhoodRadius] = mSpatialNeighborhoodRadius;
+    props[kSpatialTemporalVarianceWeight] = mSpatialTemporalVarianceWeight;
+    props[kSpatialDepthThreshold] = mSpatialDepthThreshold;
+    props[kSpatialDepthSigmaInv] = mSpatialDepthSigmaInv;
+    props[kSpatialNormalExponent] = mSpatialNormalExponent;
+    props[kSpatialMaterialMismatchWeight] = mSpatialMaterialMismatchWeight;
     props[kUseRadianceCache] = mUseRadianceCache;
     props[kSurfaceCacheAtlasSize] = mAtlasSizeTexels;
     props[kCaptureMaxPagesPerFrame] = mCaptureMaxPagesPerFrame;
@@ -570,6 +616,15 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     if (mUseTemporalFilter)
         runTemporalFilter(pRenderContext, renderData);
 
+    // S5-B2: spatial / variance-guided filter (S5-B2 pass + S5-A2 reconstruction CB). Consumes
+    // the S5-B1 temporalFiltered output (RGB) + the temporalConfidence channel (the chosen
+    // confidence source -- temporalFiltered.a carries the HISTORY LENGTH, not a confidence), the
+    // GBufferRT linearZ / normal / material, and writes the "spatialFiltered" graph channel.
+    // Runs AFTER the temporal filter and BEFORE the debug pass, gated on mUseSpatialFilter plus
+    // the graph allocating both temporalFiltered and spatialFiltered (no-ops otherwise).
+    if (mUseSpatialFilter)
+        runSpatialFilter(pRenderContext, renderData);
+
     if (!mpDebugPass)
         createDebugPass();
 
@@ -768,6 +823,17 @@ void LumenGI::renderUI(Gui::Widgets& widget)
         );
     }
 
+    if (auto group = widget.group("Spatial filter", mUseSpatialFilter))
+    {
+        group.checkbox("Firefly clamp", mSpatialFireflyClamp);
+        group.slider("Radius min (px)", mSpatialRadiusMin, 0.f, 4.f, false);
+        group.slider("Radius max (px)", mSpatialRadiusMax, 0.f, 4.f, false);
+        group.slider("Variance threshold low", mSpatialVarianceThresholdLow, 0.f, 0.5f, false);
+        group.slider("Variance threshold high", mSpatialVarianceThresholdHigh, 0.f, 1.f, false);
+        group.slider("Neighborhood radius (1 = 3x3, 2 = 5x5)", mSpatialNeighborhoodRadius, 1u, 2u);
+        group.slider("Temporal variance weight", mSpatialTemporalVarianceWeight, 0.f, 2.f, false);
+    }
+
     if (dirty)
     {
         mOptionsChanged = true;
@@ -846,10 +912,11 @@ void LumenGI::onHotReload(HotReloadFlags reloaded)
         mScreenProbes.pUpdate = nullptr;
         mScreenProbes.pTrace = nullptr;
         mScreenProbes.pFinalize = nullptr;
-        mScreenProbes.pIntegrate = nullptr;
-        mScreenProbes.pInterpolate = nullptr;
-        mTemporalFilter.pFilter = nullptr; // pure compute, no scene deps; recreated lazily.
-        resetHistory();
+    mScreenProbes.pIntegrate = nullptr;
+    mScreenProbes.pInterpolate = nullptr;
+    mTemporalFilter.pFilter = nullptr; // pure compute, no scene deps; recreated lazily.
+    mSpatialFilter.pFilter = nullptr;  // pure compute, no scene deps; recreated lazily.
+    resetHistory();
     }
 }
 
@@ -2459,4 +2526,147 @@ void LumenGI::runTemporalFilter(RenderContext* pRenderContext, const RenderData&
     pRenderContext->copyResource(pOutput.get(), mTemporalFilter.pHistory[mTemporalFilter.historyCurrIndex].get());
     pRenderContext->blit(pLinearZ->getSRV(), mTemporalFilter.pPrevDepth->getRTV());
     mTemporalFilter.historyCurrIndex ^= 1u;
+}
+
+// ------------------------------------------------------------------------------------------
+// S5: spatial filter host (S5-B2 pass wiring + S5-A2 reconstruction CB)
+// ------------------------------------------------------------------------------------------
+
+void LumenGI::createSpatialFilterProgram()
+{
+    // S5-B2 variance-guided spatial filter (LumenSpatialFilter.cs.slang, entry "main"). The
+    // REQUIRED resources (gGIInput / gLinearZ / gFilteredOutput) are always bound every dispatch,
+    // so their is_valid defines are pinned to 1. The OPTIONAL inputs (normal/material, the S5-A1
+    // confidence R32F, temporal variance / moments, the confidence / variance UAVs) are pinned to
+    // 0 here and specialized per-frame in runSpatialFilter based on graph allocation. The S5-B1
+    // temporal-variance inputs (gVariance / gMoments) stay unbound in the MVP -- the pass's own
+    // depth-gated local variance drives the adaptive radius (the temporal variance term adds
+    // history-noise information the S4.3 probe input does not currently provide).
+    DefineList defines;
+    defines.add("is_valid_gGIInput", "1");
+    defines.add("is_valid_gLinearZ", "1");
+    defines.add("is_valid_gFilteredOutput", "1");
+    defines.add("is_valid_gNormalRoughnessMaterialID", "0");
+    defines.add("is_valid_gConfidenceInput", "0");
+    defines.add("is_valid_gVariance", "0");
+    defines.add("is_valid_gMoments", "0");
+    defines.add("is_valid_gFilteredConfidence", "0");
+    defines.add("is_valid_gFilteredVariance", "0");
+    mSpatialFilter.pFilter = ComputePass::create(mpDevice, kSpatialFilterShaderFile, "main", defines);
+}
+
+void LumenGI::ensureSpatialFilterResources(RenderContext* pRenderContext)
+{
+    if (!mSpatialFilter.pFilter)
+        createSpatialFilterProgram();
+}
+
+void LumenGI::runSpatialFilter(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    // Allocation gates: gGIInput is the S5-B1 temporalFiltered graph output (the S5 main output),
+    // gFilteredOutput is the S5-B2 spatialFiltered graph output this pass feeds. The graph channel
+    // names mirror kOutputChannels, so renderData.getTexture() resolves them by name.
+    const ref<Texture> pInput = renderData.getTexture(kTemporalFiltered);
+    const ref<Texture> pOutput = renderData.getTexture(kSpatialFiltered);
+    if (!pInput || !pOutput)
+        return;
+
+    const ref<Texture> pLinearZ = renderData.getTexture("linearZ");
+    if (!pLinearZ)
+        return;
+
+    ensureSpatialFilterResources(pRenderContext);
+    if (!mSpatialFilter.pFilter)
+        return;
+
+    // S5-B2 confidence source: the S5-A1 temporalConfidence R32F graph channel. This is the
+    // chosen confidence source -- temporalFiltered.a carries the S5-B1 HISTORY LENGTH, not a
+    // confidence, so it cannot be passed through gGIInput.a. When the graph allocates the
+    // channel the host binds it as the pass's optional gConfidenceInput (overriding gGIInput.a);
+    // otherwise the pass falls back to gGIInput.a (degraded proxy).
+    const bool hasConfidence = renderData.getTexture(kTemporalConfidence) != nullptr;
+    const bool hasNormal = renderData.getTexture("normWRoughnessMaterialID") != nullptr;
+
+    // Per-frame program specialization for the optional resources (graph allocation is fixed per
+    // graph, so this changes only once per graph build).
+    ref<Program> pProgram = mSpatialFilter.pFilter->getProgram();
+    bool programChanged = false;
+    programChanged |= pProgram->addDefine("is_valid_gNormalRoughnessMaterialID", hasNormal ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gConfidenceInput", hasConfidence ? "1" : "0");
+    if (programChanged)
+        mSpatialFilter.pFilter->setVars(nullptr);
+
+    // S5-A2 reconstruction CB: built through LumenReconstruction::makeSpatialFilterCB (frame dims
+    // + inverse dims) and overridden with the quality-preset tuning. The S5 MVP runs the filter at
+    // FULL frame resolution (the whole pipeline is full-res today); half / quarter GI (2x / 4x
+    // upscale) is an S8 quality-preset item -- the CB is resolution-agnostic, so switching to
+    // LumenReconstruction::makeDimensions(..., LumenGIResolutionQuality::Half) and dispatching on
+    // giW/giH is all S8 needs.
+    const LumenReconstruction::Dimensions dims = LumenReconstruction::makeDimensions(
+        mFrameDim.x, mFrameDim.y, LumenGIResolutionQuality::Full
+    );
+    LumenReconstruction::SpatialFilterConstantBuffer cb = LumenReconstruction::makeSpatialFilterCB(dims);
+    cb.filterEnabled = 1u;
+    cb.fireflyClamp = mSpatialFireflyClamp ? 1u : 0u;
+    cb.fireflyMaxRadiance = 10000.f;   // LUMEN_GI_MAX_RADIANCE default (frozen, matches the shader).
+    cb.fireflyStdDevFactor = 4.0f;     // Frozen with LumenSpatialFilterData.slang.
+    cb.varianceThresholdLow = mSpatialVarianceThresholdLow;
+    cb.varianceThresholdHigh = mSpatialVarianceThresholdHigh;
+    cb.radiusMin = mSpatialRadiusMin;
+    cb.radiusMax = mSpatialRadiusMax;
+    cb.spatialSigmaScale = 0.5f;       // Frozen with LumenSpatialFilterData.slang (sigma = r/2).
+    cb.depthThreshold = mSpatialDepthThreshold;
+    cb.depthSigmaInv = mSpatialDepthSigmaInv;
+    cb.normalExponent = mSpatialNormalExponent;
+    cb.materialMismatchWeight = mSpatialMaterialMismatchWeight;
+    cb.temporalVarianceWeight = mSpatialTemporalVarianceWeight;
+    cb.maxVarianceClamp = 1e4f;        // Frozen with LumenSpatialFilterData.slang.
+    cb.varianceEpsilon = 1e-6f;        // Frozen with LumenSpatialFilterData.slang.
+    cb.neighborhoodRadius = mSpatialNeighborhoodRadius;
+
+    // Constant buffer (LumenSpatialFilterCB; every field filled every dispatch through the
+    // ShaderVar binding, defaults per the frozen LumenSpatialFilterData.slang contract).
+    ShaderVar var = mSpatialFilter.pFilter->getRootVar();
+    ShaderVar cbs = var["LumenSpatialFilterCB"];
+    cbs["gFrameDim"] = uint2(cb.frameDim[0], cb.frameDim[1]);
+    cbs["gFilterEnabled"] = cb.filterEnabled;
+    cbs["gFireflyClamp"] = cb.fireflyClamp;
+    cbs["gFireflyMaxRadiance"] = cb.fireflyMaxRadiance;
+    cbs["gFireflyStdDevFactor"] = cb.fireflyStdDevFactor;
+    cbs["gVarianceThresholdLow"] = cb.varianceThresholdLow;
+    cbs["gVarianceThresholdHigh"] = cb.varianceThresholdHigh;
+    cbs["gRadiusMin"] = cb.radiusMin;
+    cbs["gRadiusMax"] = cb.radiusMax;
+    cbs["gSpatialSigmaScale"] = cb.spatialSigmaScale;
+    cbs["gDepthThreshold"] = cb.depthThreshold;
+    cbs["gDepthSigmaInv"] = cb.depthSigmaInv;
+    cbs["gNormalExponent"] = cb.normalExponent;
+    cbs["gMaterialMismatchWeight"] = cb.materialMismatchWeight;
+    cbs["gTemporalVarianceWeight"] = cb.temporalVarianceWeight;
+    cbs["gMaxVarianceClamp"] = cb.maxVarianceClamp;
+    cbs["gVarianceEpsilon"] = cb.varianceEpsilon;
+    cbs["gInvFrameDim"] = float2(cb.invFrameDim[0], cb.invFrameDim[1]);
+    cbs["gNeighborhoodRadius"] = cb.neighborhoodRadius;
+
+    // Resources: gGIInput = temporalFiltered (RGB), gConfidenceInput = temporalConfidence when
+    // allocated, gLinearZ / gNormalRoughnessMaterialID from the GBuffer inputs, and gFilteredOutput
+    // = the spatialFiltered graph channel (direct UAV binding, same pattern as the S4.3 interpolate
+    // writing probeInterpolated). No host-owned buffers: the pass reads the previous stage and
+    // writes the graph output in one dispatch, so no ping-pong or copy is needed.
+    var["gGIInput"] = pInput;
+    if (hasConfidence)
+        var["gConfidenceInput"] = renderData.getTexture(kTemporalConfidence);
+    var["gLinearZ"] = pLinearZ;
+    if (hasNormal)
+        var["gNormalRoughnessMaterialID"] = renderData.getTexture("normWRoughnessMaterialID");
+    var["gFilteredOutput"] = pOutput;
+
+    // Dispatch ceil(gFrameDim / 8) x ceil(gFrameDim / 8) threads (8x8 thread groups per the frozen
+    // LumenSpatialFilterData.slang contract). The pass self-guards out-of-frame threads.
+    mSpatialFilter.pFilter->execute(
+        pRenderContext,
+        ((mFrameDim.x + 7u) / 8u) * 8u,
+        ((mFrameDim.y + 7u) / 8u) * 8u,
+        1
+    );
 }

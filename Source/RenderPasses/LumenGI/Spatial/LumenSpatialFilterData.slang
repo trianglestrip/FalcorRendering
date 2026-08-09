@@ -131,11 +131,14 @@
  *                                                  (gGIOutput.a) when no
  *                                                  temporal pass is wired, the
  *                                                  S5-B1 gTemporalConfidence
- *                                                  R32F (copied by the host
- *                                                  into gGIInput.a), or the
+ *                                                  R32F (see gConfidenceInput
+ *                                                  below; this is the Z10/S5-B2
+ *                                                  chosen source, because the
  *                                                  S5-B1 gTemporalOutput.a
- *                                                  history length as a degraded
- *                                                  proxy. It is passed through
+ *                                                  history length is only a
+ *                                                  degraded proxy), or the
+ *                                                  history length as a last
+ *                                                  resort. It is passed through
  *                                                  to gFilteredOutput.a /
  *                                                  gFilteredConfidence.
  *      gLinearZ        Texture2D<float2> RG32F    GBufferRT linearZ, .x = linear
@@ -156,6 +159,20 @@
  *                                                  (diagnostics / composite).
  *      gFilteredVariance   RWTexture2D<float> R32F combined variance estimate
  *                                                  (diagnostics / debug view).
+ *
+ *  ============================================================================
+ *  CONFIDENCE SOURCE (S5-B2 host wiring, Z10 decision -- read by the shader)
+ *  ============================================================================
+ *  gConfidenceInput Texture2D<float> R32F  optional S5-A1 per-pixel confidence.
+ *      The S5-B1 temporal filter writes its updated confidence to the R32F
+ *      "temporalConfidence" graph channel. When this input is valid it
+ *      OVERRIDES gGIInput.a as the per-pixel confidence source for the center
+ *      pixel and every gather tap (gGIInput is the S5-B1 temporal OUTPUT, whose
+ *      .a channel carries the HISTORY LENGTH, not a confidence). Unbound =>
+ *      the filter falls back to gGIInput.a (the degraded proxy / the S4-B3
+ *      interpolate confidence when the temporal pass is not wired). The value
+ *      is clamped to [0,1] at read time and passed through to gFilteredOutput.a
+ *      / gFilteredConfidence.
  *
  *  Dispatch: [numthreads(8,8,1)], ceil(gFrameDim / 8) per axis. The pass is
  *  resolution-agnostic: gFrameDim is whatever GI resolution the S5-A2 host
@@ -232,6 +249,7 @@ cbuffer LumenSpatialFilterCB
 Texture2D<float4>  gGIInput;                    // required; current GI to filter (RGB + confidence in .a).
 Texture2D<float2>  gLinearZ;                    // required; current depth (.x).
 Texture2D<float4>  gNormalRoughnessMaterialID;  // optional; current normal (.xy oct) / material (.w).
+Texture2D<float>   gConfidenceInput;            // optional; S5-A1 per-pixel confidence R32F (temporalConfidence graph channel). Overrides gGIInput.a when valid.
 Texture2D<float>   gVariance;                   // optional; S5-A1 running per-pixel luminance variance R32F.
 Texture2D<float2>  gMoments;                    // optional; S5-A1 running moments (.x mean, .y mean of squares).
 RWTexture2D<float4> gFilteredOutput;            // required; filtered GI (.a = filtered confidence).

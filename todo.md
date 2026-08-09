@@ -34,6 +34,7 @@ Get-CimInstance Win32_Process |
 | S3 Cache Lighting | **集成完成（2026-08-09），Gate 部分证据** | P 集成：cache lighting compute pass 接入 LumenGI.cpp（render-list 模式、独立 counters、cacheDirectRadiance 可选通道、质量档映射、useCacheLighting 开关）；root 修复：CB static_assert、SampleGenerator defines、**sampler 条件声明 + _EMISSIVE_LIGHT_SAMPLER_TYPE pin NULL**（根治 RT program 重编译 dxc 崩溃 + cornell_pointlight dispatchRays E_INVALIDARG 回归）。验证：cacheDirectRadiance 非零有限、emissive 分量 on/off 响应、稳定性 15/15 PASS（黑房间不自发增亮/白炉平台/强 emissive clamp/能量有界）、灯光阶跃跑通。S3 Gate 剩余：cache lighting vs hit-lighting reference 对比、S3-B2 多反弹反馈、动态光更新延迟。 |
 | S3 组件 | Shader 已写，未集成 | J: `Lighting/LumenSurfaceCacheLighting*.slang`（direct cache lighting，Falcor sampler 消费端）。 |
 | S4 组件 | Shader 已写，未集成 | root 亲写 `ScreenTrace/LumenScreenTraceData.slang`+`LumenScreenTrace.cs.slang`（精确透视 HZB march；Agent E 三次空返回已弃用）。Falcor 无现成 HZB 工具，S4-A1 需自建。 |
+| S5 Temporal/Spatial | **S5-B1 集成完成、S5-B2 集成完成（2026-08-09），S5 Gate 4/5 关闭** | S5-A1/B1（Z7）：temporal history ping-pong + 相机 cut 检测，`run_temporal_verify.py` 14/14 PASS。S5-B2（Z10）：variance-guided spatial filter 接线（`spatialFiltered` 通道、gConfidenceInput 置信度来源 = `temporalConfidence`、CB 经 `LumenReconstruction::makeSpatialFilterCB`），spatial gate 14/14 + ghost 4/4 PASS。S5 门禁：camera cut 失效 ✓、动态拖影 ✓、NaN/负/溢出 ✓、flicker ✓；half-res 重建（S5-A2 upscale）冻结为 S8 项。证据 `artifacts/lumengi/S5/gate/`。剩余：Z6 `run_temporal_ghost.py` 地板标定 bug、S5-C2 NRD/SVGF 对比。 |
 | S6A/S6B 组件 | 工具与 GPU 布局已写 | D: `Source/Tools/MeshSDFBuilder/`（.msdf 格式+hash+检测，161 自测）；G: `MeshSDF/LumenMeshSDF*.slang/.h/.cpp`（R16Float/R8Snorm mip 链、MinAbs 池化、sphere trace，161 自测）；I: `MeshSDF/LumenMeshSDFAtlas.h/.slang`（落盘未验证，S6B 集成时 cl/MSBuild 验证）。**均未注册 CMake**（按 task.md §11 待格式冻结）。 |
 
 不要把当前结果称为“完整 Lumen”或“完整实时 GI”。目前准确名称是：**HWRT GI Baseline / LumenGI 原型 + S2.1 组件库**。
@@ -46,14 +47,17 @@ Get-CimInstance Win32_Process |
 - `Source\RenderPasses\LumenGI\Lighting\LumenSurfaceCacheLighting*.slang`（S3-B1，Agent J）：direct cache lighting，已集成（S3）。
 - `Source\RenderPasses\LumenGI\MeshSDF\LumenGlobalDistanceField.h` + 测试（S6-A3，Agent Q2，2026-08-09 落盘）：相机中心多级 clipmap、ceil 取整、滚动/dirty/驻留、预算，CPU 测试全绿。
 - `tests\lumengi\run_screentrace.py` / `run_hzb_check.py`（S4 测试资产，Agent R2）：骨架 + S4_TODO 契约。
+- `Source\RenderPasses\LumenGI\Spatial\`（S5-B2，Z8 shader + Z10 集成）：`LumenSpatialFilterData.slang`/`LumenSpatialFilter.cs.slang`（variance-guided bilateral + firefly clamp，已接线）+ `LumenReconstruction.h`（S5-A2 纯 CPU：full/half/quarter 尺寸、CB mirror、upscale 权重；half/quarter 为 S8 项）。已注册 CMake 复制列表。
+- `tests\lumengi\run_spatial_gate.py` / `run_spatial_ghost.py` / `run_spatial_diag.py`（S5-B2 gate 资产，Agent Z10）：GPU 已跑 PASS。
 - **待办（Atlas 打磨）**：`LumenMeshSDFAtlas` 4 个 CPU 测试失败（SharedPagesAcrossInstances 引用计数、MultiBrickTiling/NonUniformScaleRoundTrip 采样精度、EvictionAndReload）——S6B 轮修复。
 
 ## 1.6 下一步（root 集成优先序）
 
-1. **S3-B2 多反弹反馈**（P2 被中断未做）：S3 gate 关键项（白炉收敛、动态光延迟）。
-2. **S3 Gate 收尾**：cache lighting vs hit-lighting reference 对比、动态光更新延迟。
-3. **S4 集成**：HZB 构建 pass + screen trace dispatch 接入 LumenGI.cpp（S4-A1），消费 S4-B1 shader。
+1. **S5 收尾**：冻结 Z6 `run_temporal.py`/`run_temporal_ghost.py` 的 S5_TODO 阈值（moving-light ghost 地板按场景标定、`get_material` pybind bug、animated_cubes 无动画）；S5-C2 NRD/SVGF 对比。
+2. **S3-B2 多反弹反馈**（P2 被中断未做）：S3 gate 关键项（白炉收敛、动态光延迟）。
+3. **S3 Gate 收尾**：cache lighting vs hit-lighting reference 对比、动态光更新延迟。
 4. **S6B**：Atlas 4 个测试修复 + MeshSDF 集成 + GDF clipmap 接线。
+5. **S8（half-res 质量档）**：用 `LumenReconstruction` 冻结的 half/quarter 尺寸 + bilateral upscale 实现 S5-A2 half-res GI（gate 项“half-res 接近 full-res reference”在此关闭）。
 
 ## 2. 已落盘实现
 
@@ -239,19 +243,26 @@ tools\.packman\cmake\bin\cmake.exe --build build\windows-vs2022 `
 
 - `Source/RenderPasses/CMakeLists.txt`
 - `Source/Tools/FalcorTest/CMakeLists.txt`
+- `Source/RenderPasses/LumenGI/LumenGI.cpp`
+- `Source/RenderPasses/LumenGI/LumenGI.h`
+- `Source/RenderPasses/LumenGI/CMakeLists.txt`
+- `Source/RenderPasses/LumenGI/Spatial/LumenSpatialFilterData.slang`
+- `Source/RenderPasses/LumenGI/Spatial/LumenSpatialFilter.cs.slang`
+- `task.md`
 
 主要新增目录/文件：
 
 - `Source/RenderPasses/LumenGI/`
+- `Source/RenderPasses/LumenGI/Spatial/`（LumenReconstruction.h 等）
 - `Source/Tools/FalcorTest/Tests/RenderPasses/LumenGIStatsTests.cpp`
 - `scripts/LumenGI.py`
 - `scripts/LumenGIBenchmark.py`
 - `tests/image_tests/renderpasses/graphs/LumenGI*.py`
 - `tests/image_tests/renderpasses/test_LumenGI*.py`
-- `tests/lumengi/`
+- `tests/lumengi/`（含本轮新增 `run_spatial_gate.py` / `run_spatial_ghost.py` / `run_spatial_diag.py`）
 - `docs/LumenGI_Technical_Roadmap.md`
 - `task.md`
-- `artifacts/lumengi/`
+- `artifacts/lumengi/`（含本轮 `artifacts/lumengi/S5/gate/`）
 
 ## 10. 新对话可直接使用的开场指令
 

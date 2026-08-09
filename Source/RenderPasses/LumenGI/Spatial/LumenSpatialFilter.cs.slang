@@ -133,6 +133,9 @@
 #ifndef is_valid_gNormalRoughnessMaterialID
 #define is_valid_gNormalRoughnessMaterialID 0
 #endif
+#ifndef is_valid_gConfidenceInput
+#define is_valid_gConfidenceInput 0
+#endif
 #ifndef is_valid_gVariance
 #define is_valid_gVariance 0
 #endif
@@ -181,6 +184,18 @@ float3 lumenSpatialFilterSanitize(const float3 rgb)
     if (!any(isnan(r)) && !any(isinf(r)))
         return min(r, float3(max(gFireflyMaxRadiance, 0.f)));
     return float3(0.f);
+}
+
+/** Confidence source (see the data file contract): the S5-A1 per-pixel
+ *  confidence R32F (gConfidenceInput, the "temporalConfidence" graph channel)
+ *  OVERRIDES gGIInput.a when valid -- gGIInput is the S5-B1 temporal output
+ *  whose .a channel carries the HISTORY LENGTH, not a confidence. Unbound =>
+ *  fall back to gGIInput.a (degraded proxy / S4-B3 interpolate confidence). */
+float lumenSpatialFilterConfidence(const int2 pixel, const float fallbackA)
+{
+    if (is_valid(gConfidenceInput))
+        return saturate(gConfidenceInput.Load(int3(pixel, 0)).x);
+    return saturate(fallbackA);
 }
 
 /** Depth affinity factor (same dead-zone + exponential form as the S4-B3
@@ -321,7 +336,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 
     const float4 curGI = gGIInput.Load(int3(pixel, 0));
     const float3 curRGB = lumenSpatialFilterSanitize(curGI.rgb);
-    const float curConf = saturate(curGI.a);
+    const float curConf = lumenSpatialFilterConfidence(pixel, curGI.a);
     const float curLum = lumenSpatialFilterLuminance(curRGB);
 
     // Pass-through mode (disabled / debug): the output is the input, unchanged.
@@ -414,7 +429,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 
             const float4 tapGI = gGIInput.Load(int3(p, 0));
             const float3 gi = lumenSpatialFilterSanitize(tapGI.rgb);
-            const float conf = saturate(tapGI.a);
+            const float conf = lumenSpatialFilterConfidence(p, tapGI.a);
             const float lum = lumenSpatialFilterLuminance(gi);
 
             accRGB += w * gi;

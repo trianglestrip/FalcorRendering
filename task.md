@@ -287,19 +287,19 @@ flowchart TD
 ### Wave S5.2（3 个 subagent 并行）
 
 - [ ] **S5-A2 Reconstruction Host** — Agent A  
-  支持 full/half/quarter GI resolution，管理 upscale 资源和质量档位。
-- [ ] **S5-B2 Spatial/Adaptive Filter** — Agent B  
-  实现 variance-guided spatial filter、bilateral upsample、firefly clamp；保持几何和材质边界。
+  支持 full/half/quarter GI resolution，管理 upscale 资源和质量档位。（Z10 轮：CB 已统一走 `LumenReconstruction::makeSpatialFilterCB` + `makeDimensions(Full)`，half/quarter upscale 冻结为 S8 quality-preset 项；MVP full-res。）
+- [x] **S5-B2 Spatial/Adaptive Filter** — Agent B (Z8 shader + Z10 集成)
+  实现 variance-guided spatial filter、bilateral upsample、firefly clamp；保持几何和材质边界。——Z8 shader（`Spatial/LumenSpatialFilterData.slang` + `LumenSpatialFilter.cs.slang`）+ Z10 集成：compute pass 接线、gConfidenceInput 置信度来源、CB 经 LumenReconstruction、`spatialFiltered` 通道。bilateral upsample 属 S5-A2/S8 half-res 项。
 - [ ] **S5-C2 稳定性与细节测试** — Agent C  
-  检查 flicker、ghost、薄结构、接触阴影、法线边界；与 NRD/SVGF baseline 比较。
+  检查 flicker、ghost、薄结构、接触阴影、法线边界；与 NRD/SVGF baseline 比较。——Z10 已测 flicker/ghost/法线+深度边界统计（`run_spatial_gate.py`/`run_spatial_ghost.py`）；NRD/SVGF 对比未做。
 
 ### S5 门禁
 
-- [ ] Camera cut 后历史立即失效，平滑运动时历史稳定复用；
-- [ ] 动态物体不留下长期拖影；
-- [ ] half-res 重建在冻结阈值内接近 full-res reference；
-- [ ] 无 NaN/Inf、负方差、history length 溢出；
-- [ ] 固定轨迹的帧间闪烁指标达到目标。
+- [x] Camera cut 后历史立即失效，平滑运动时历史稳定复用；——Z10 重跑 `run_temporal_verify.py` 14/14 PASS（cut 帧 temporalFiltered.a accept=0.0/hist≈1、static 尾段 hist 255/accept 1.0）；S5-B2 `spatialFiltered.a` 置信度在 cut 帧 0.90→0.023 坍缩（“历史立即失效”在最终输出上可见）。证据 `artifacts/lumengi/S5/gate/temporal-verify.json`、`spatial-gate.json`。
+- [x] 动态物体不留下长期拖影；——Z10 `run_spatial_ghost.py`（场景相对噪声地板校准）spatialFiltered 拖影尾帧 0（≤4，地板 2.47）；`run_temporal_verify.py` moving-light trailing 0。Z6 `run_temporal_ghost.py` 的 moving-light FAIL（got 8）为既有测试地板标定 bug（Cornell 噪声地板误用于 pointlight 场景，Z7 已记录），非本集成回归。证据 `artifacts/lumengi/S5/gate/ghost-spatial.json`。
+- [ ] half-res 重建在冻结阈值内接近 full-res reference；——S5-A2 half/quarter 重建（`LumenReconstruction` upscale）为 S8 quality-preset 项；本轮 MVP full-res，契约与 CB 路径已冻结。见 `Spatial/LumenReconstruction.h`。
+- [x] 无 NaN/Inf、负方差、history length 溢出；——static/cut/ghost 全相位全通道 finite + 非负；temporalFiltered.a 峰值 255 ≤ cap 255；spatialFiltered 非负、置信度∈[0,1]。证据 `artifacts/lumengi/S5/gate/*.json`。
+- [x] 固定轨迹的帧间闪烁指标达到目标；——static-tail spatial 帧间 diff 0.05206 ≤ temporal 0.05215×1.1（空间滤波不增闪烁）；temporal 收敛尾 0.053 << raw probe 0.555（~10× 降噪）；cut settle 恢复。证据 `artifacts/lumengi/S5/gate/spatial-gate.json`。
 
 ## 11. S6：Mesh SDF、Global Distance Field 与软件追踪
 
