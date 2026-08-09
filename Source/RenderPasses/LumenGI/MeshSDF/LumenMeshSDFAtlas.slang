@@ -43,8 +43,10 @@
 //    brick grid of ceil(d(m) / 32) per axis. All bricks of one mip are contiguous:
 //    page table entry (instanceID, mip) = BASE page slot, brick index
 //        brickIdx = bz*bx*by + by*bx + bx   (z-major, x-fastest)
-//    pageSlot = baseSlot + brickIdx ; texel = pageSlot * 32 + local.
-//    Note texel == voxel in texel coordinates (the atlas is a pure tiling).
+//    pageSlot = baseSlot + brickIdx ; texel = pageBrick(pageSlot) * 32 + local where
+//    pageBrick(s) = (s % P, (s / P) % P, s / (P*P)), P = a.pagesPerSide (the atlas texture
+//    is a pagesPerSide^3 cube of 32^3 page bricks). The CPU mirror and the host atlas-texture
+//    upload use the identical slot -> brick-origin layout.
 //  * Page table: StructuredBuffer<uint>[instanceID * kLumenMeshSDFMaxMipCount + mip].
 //    kLumenMeshSDFNotResident = not resident (atlas full / evicted / budget).
 //
@@ -249,11 +251,15 @@ float lumenMeshSDFAtlasOutputToWorldDistance(LumenMeshSDFAtlasInstance inst, flo
 // -------------------------------------------------------------------------------------
 
 /// Map an integer voxel coordinate of a mip to (page slot, atlas texel).
-/// Canonical formula (mirrors the CPU mirror):
+/// Canonical formula (mirrors the CPU mirror + the host atlas-texture layout):
 ///     brick = voxel / pageSize ; local = voxel % pageSize ;
-///     slot = baseSlot + (bz*bx*by + by*bx + bx) ; texel = brick * pageSize + local.
-/// Returns false and sets PageCorrupt when the slot exceeds atlas capacity
-/// (guards corrupted page tables; never clamps silently).
+///     slot = baseSlot + (bz*bx*by + by*bx + bx) ;
+///     texel = pageBrick(slot) * pageSize + local
+/// The atlas texture is a pagesPerSide^3 cube of 32^3 page bricks; page slot s occupies
+/// the brick with grid coordinates (s % P, (s / P) % P, s / (P*P)) (P = a.pagesPerSide), so
+///     texel = ((s % P), ((s / P) % P), (s / (P*P))) * pageSize + local.
+/// Returns false and sets PageCorrupt when the slot exceeds atlas capacity (guards
+/// corrupted page tables; never clamps silently).
 bool lumenMeshSDFAtlasVoxelToPageAndTexel(
     LumenMeshSDFAtlasBindings a,
     LumenMeshSDFVolumeDescriptor vol,
@@ -276,7 +282,10 @@ bool lumenMeshSDFAtlasVoxelToPageAndTexel(
         return false;
     }
     pageSlot = baseSlot + brickIdx;
-    texel = brick * int(kLumenMeshSDFAtlasPageSize) + local;
+    const int P = int(a.pagesPerSide);
+    const int s = int(pageSlot);
+    const int3 pageBrick = int3(s % P, (s / P) % P, s / (P * P));
+    texel = pageBrick * int(kLumenMeshSDFAtlasPageSize) + local;
     return true;
 }
 
@@ -343,8 +352,11 @@ LumenMeshSDFAtlasSampleResult lumenMeshSDFAtlasSample(
     const float3 f = cell - float3(base);
 
     const bool fine = (mip == 0 && vol.formatMip0 == kLumenMeshSDFFormatR16Float);
-    Texture3D<float> atlasTex = fine ? a.fineAtlas : a.coarseAtlas;
 
+    // Load one stored corner texel. The texture is selected by a data-dependent branch instead
+    // of a local resource variable: DXC rejects "local resource not guaranteed to map to unique
+    // global resource" when a Texture3D local is assigned from a runtime-selected binding.
+    float stored = 0.f;
     float corner[8];
     for (uint c = 0; c < 8; ++c)
     {
@@ -357,7 +369,10 @@ LumenMeshSDFAtlasSampleResult lumenMeshSDFAtlasSample(
             result.reason = reason;
             return result;
         }
-        const float stored = atlasTex.Load(int4(texel, 0)).x;
+        if (fine)
+            stored = a.fineAtlas.Load(int4(texel, 0)).x;
+        else
+            stored = a.coarseAtlas.Load(int4(texel, 0)).x;
         corner[c] = fine ? stored : stored * vol.quantRange; // R8SNorm code/127 * R (S6-B1 decode)
     }
 

@@ -37,6 +37,8 @@
 #include "ScreenTrace/LumenHZB.h" // S4-A1 HZB chain host component (mip dims / dispatch params).
 #include "ScreenProbe/LumenScreenProbe.h" // S4.2 screen probe grid host component (grid math / budget / stats).
 #include "Spatial/LumenReconstruction.h" // S5-A2 reconstruction host component (full/half/quarter resolution, upscale, spatial-filter CB mirror).
+#include "MeshSDF/LumenMeshSDFScene.h"       // S6-A/A2: scene -> cache -> builder -> volume -> atlas -> instance table (CPU, header-only).
+#include "MeshSDF/LumenGlobalDistanceField.h" // S6-A3: camera-centered GDF clipmap (CPU, header-only).
 
 using namespace Falcor;
 
@@ -45,12 +47,12 @@ using namespace Falcor;
     The implementation is intentionally modular. Every optional subsystem can be disabled
     independently so that a validated earlier stage remains available as a fallback.
 */
-class LumenGI : public RenderPass
+class LumenGIPass : public RenderPass
 {
 public:
-    FALCOR_PLUGIN_CLASS(LumenGI, "LumenGI", "Real-time diffuse global illumination.");
+    FALCOR_PLUGIN_CLASS(LumenGIPass, "LumenGI", "Real-time diffuse global illumination.");
 
-    static ref<LumenGI> create(ref<Device> pDevice, const Properties& props) { return make_ref<LumenGI>(pDevice, props); }
+    static ref<LumenGIPass> create(ref<Device> pDevice, const Properties& props) { return make_ref<LumenGIPass>(pDevice, props); }
 
     enum class TraceMode : uint32_t
     {
@@ -122,7 +124,7 @@ public:
         }
     );
 
-    LumenGI(ref<Device> pDevice, const Properties& props);
+    LumenGIPass(ref<Device> pDevice, const Properties& props);
 
     Properties getProperties() const override;
     RenderPassReflection reflect(const CompileData& compileData) override;
@@ -136,6 +138,11 @@ public:
     ///< (read through the Python binding "surfaceCacheStats"). Values are doubles so the
     ///< map converts losslessly to a Python dict. Keys are documented in the .cpp.
     std::map<std::string, double> getSurfaceCacheStats() const;
+
+    ///< Scriptable S6 gate snapshot (read through the Python binding "gdfStats"): Mesh SDF
+    ///< scene pipeline counters + GDF clipmap parameters + the last sphere-trace dispatch
+    ///< counters. Values are doubles so the map converts losslessly to a Python dict.
+    std::map<std::string, double> getGDFStats() const;
 
 private:
     void parseProperties(const Properties& props);
@@ -199,6 +206,30 @@ private:
     void createSpatialFilterProgram();
     void ensureSpatialFilterResources(RenderContext* pRenderContext);
     void runSpatialFilter(RenderContext* pRenderContext, const RenderData& renderData);
+
+    // ------------------------------------------------------------------------------------------
+    // S6: Mesh SDF + Global Distance Field host (S6-A data pipeline, S6-B3 compose, S6-B4 sphere
+    // trace). The CPU components (LumenMeshSDFScene + LumenGlobalDistanceField) are header-only
+    // and std-lib; this pass owns all GPU resources and dispatches the two S6 shaders
+    // (LumenGDFCompose.cs.slang, LumenGDFTrace.cs.slang). See the S6 section comment in the .cpp.
+    // ------------------------------------------------------------------------------------------
+    void invalidateMeshSDF();                     ///< Drop the CPU scene + GPU resources (scene change / teardown).
+    void ensureMeshSDFScene();                    ///< (Re)create the CPU scene and register the scene's static instances.
+    void ensureGDFResources(RenderContext* pRenderContext); ///< Create GDF clipmap textures + buffers + passes.
+    void rebuildMeshSDFAtlasImages();             ///< Re-tile the CPU atlas page data into the host fine/coarse images.
+    void uploadMeshSDFAtlas(RenderContext* pRenderContext); ///< Upload the host atlas images to the GPU textures.
+    void uploadGDFHostData(RenderContext* pRenderContext, bool forceFullCompose); ///< Level table / instances / dirty regions / CB.
+    void runGDFCompose(RenderContext* pRenderContext);      ///< Dispatch LumenGDFCompose.cs.slang over the dirty regions.
+    void runGDFSphereTrace(RenderContext* pRenderContext, const RenderData& renderData); ///< Dispatch LumenGDFTrace.cs.slang.
+    void readbackGDFTraceStats(RenderContext* pRenderContext);
+
+    ///< S6-A per-mesh volume resolution (voxel count along the longest grid axis).
+    uint32_t meshSDFResolution() const { return std::max<uint32_t>(mMeshSDFResolution, 8u); }
+    ///< S6-A per-mesh volume quality (LumenGI::MeshSDF::Quality enum value: 0 = High, 1 = Low).
+    LumenGI::MeshSDF::Quality meshSDFQuality() const
+    {
+        return mMeshSDFQuality == 0 ? LumenGI::MeshSDF::Quality::High : LumenGI::MeshSDF::Quality::Low;
+    }
 
     ///< gSamplesPerTexel preset mapping: Low/Medium/High/Reference -> 1/2/4/8
     ///< (LumenCacheLightingQuality in LumenSurfaceCacheLightingData.slang).
@@ -498,8 +529,108 @@ private:
     bool mUseTemporalFilter = false;
     bool mUseSpatialFilter = false;
     bool mUseRadianceCache = false;
+
+    // ------------------------------------------------------------------------------------------
+    // S6: Mesh SDF / Global Distance Field state (see the S6 section comment in the .cpp).
+    // ------------------------------------------------------------------------------------------
+    ///< Scriptable S6 gate channel: the GDF sphere-trace output (RGBA16F). RGB = (t / tMax,
+    ///< |SDF| at surface / voxel, t), A = hit. Written every frame the GDF pipeline is active;
+    ///< used by tests/lumengi/run_s6_gdf.py. In TraceMode::MeshSDF the same data also replaces
+    ///< the S1 outputs (diffuseGI / diffuseRadianceHitDist / confidence).
+    static constexpr const char* kGDFTrace = "gdfTrace";
+
+    ///< S6-A: master switch. The GDF data pipeline (scene -> MeshSDFScene -> GDF compose) runs
+    ///< when this is true OR TraceMode is MeshSDF / Hybrid.
+    bool mUseGDF = false;
+    ///< S6-A: optional MeshSDFBuilder.exe path. When empty (or the file is missing) the built-in
+    ///< analytic box-SDF builder is used (the "placeholder / built-in generation" fallback).
+    std::filesystem::path mMeshSDFBuilderPath;
+    ///< S6-A: disk cache directory override (default: LumenMeshSDFCache default).
+    std::filesystem::path mMeshSDFCacheDir;
+    ///< S6-A: per-mesh volume voxel count along the longest axis.
+    uint32_t mMeshSDFResolution = 48u;
+    ///< S6-A: 0 = High (R16Float mip0), 1 = Low (R8Snorm mip0).
+    uint32_t mMeshSDFQuality = 0u;
+    ///< S6-A: grid padding around the mesh AABB, fraction of the largest mesh extent.
+    float mMeshSDFPadding = 0.1f;
+    ///< S6-A: atlas + volume budget in GPU bytes (0 = unlimited).
+    uint64_t mMeshSDFBudgetBytes = 0u;
+    ///< S6-A3: GDF clipmap level count (>= kDynamicLevels; default 2 = dynamic near + static far).
+    uint32_t mGDFLevelCount = 2u;
+    ///< S6-A3: GDF voxels per side (all levels share one resolution).
+    uint32_t mGDFResolution = 64u;
+    ///< S6-A3: GDF base level extent (meters); level m spans baseExtent * 2^m.
+    float mGDFBaseExtent = 4.f;
+    ///< S6-B4: sphere-trace step budget (0 -> shader default).
+    uint32_t mGDFTraceMaxSteps = 64u;
+    ///< S6-B4: sphere-trace max distance (world m; 0 -> shader default).
+    float mGDFTraceMaxDistance = 20.f;
+    ///< S6-B3: empty-distance scale in voxels (empty GDF voxels store this * voxelSize).
+    float mGDFEmptyDistanceScale = 8.f;
+
+    ///< S6 host resources + CPU components. pScene and gdf are CPU-only; the rest are GPU.
+    struct
+    {
+        ///< S6-A2/A: scene -> cache -> builder -> volume -> atlas -> instance table (CPU).
+        std::unique_ptr<LumenGI::MeshSDF::Scene::LumenMeshSDFScene> pScene;
+        ///< S6-A3: camera-centered GDF clipmap (CPU). Rebuilt when the GDF config changes.
+        std::unique_ptr<LumenGI::GlobalDistanceField::LumenGlobalDistanceField> gdf;
+        ///< Scene-instance -> MeshSDFScene instance handle (parallel to pScene->instances).
+        std::vector<uint32_t> sceneInstanceHandles;
+        ///< Per-handle scene mesh descriptors (parallel to sceneInstanceHandles; used to re-parse
+        ///< the cached volumes when building the GPU atlas images).
+        std::vector<LumenGI::MeshSDF::Scene::LumenMeshSDFSceneMeshDesc> sceneMeshDescs;
+        ///< True once the GDF levels have been fully composed at least once (first frame /
+        ///< after a resize / after the instance list changes issue a full-region compose).
+        bool needsFullCompose = true;
+        ///< Host-tracked atlas upload generation; bump => re-upload the GPU atlas textures.
+        uint64_t atlasUploadVersion = 0;
+        ///< Last uploaded atlas upload generation (== atlasUploadVersion when the GPU is current).
+        uint64_t uploadedAtlasVersion = 0;
+        ///< Host-tracked GDF instance-list generation; bump => force a full recompose.
+        uint64_t gdfInstanceVersion = 0;
+
+        ///< S6-B3 compose pass (LumenGDFCompose.cs.slang).
+        ref<ComputePass> pCompose;
+        ///< S6-B4 sphere-trace pass (LumenGDFTrace.cs.slang).
+        ref<ComputePass> pTrace;
+
+        ///< GDF clipmap textures: level 0 R16Float, levels >= 1 R8Snorm (levelCount entries).
+        std::vector<ref<Texture>> levels;
+        ///< StructuredBuffer<LumenGDFLevelParams> (levelCount entries).
+        ref<Buffer> pLevelTable;
+        ///< StructuredBuffer<LumenGDFInstance> (resident instances this frame).
+        ref<Buffer> pGDFInstances;
+        ///< StructuredBuffer<LumenGDFDirtyRegion> (dirty/removed regions this frame).
+        ref<Buffer> pDirtyRegions;
+        ///< Sphere-trace counters (kGDFTraceStatCount uints) + readback mirror.
+        ref<Buffer> pTraceStats;
+        ref<Buffer> pTraceStatsReadback;
+        bool traceStatsReadbackPending = false;
+        ///< Last completed sphere-trace dispatch counters [traced, hit, miss, maxSteps, noGrid].
+        std::array<uint32_t, 5> traceStats = {};
+
+        ///< Mesh SDF atlas GPU mirror (S6-B2): fine = R16Float mip0 pages, coarse = R8Snorm.
+        ref<Texture> pFineAtlas;
+        ref<Texture> pCoarseAtlas;
+        ///< StructuredBuffer<uint> page table (atlas-instance * kLumenMeshSDFMaxMipCount).
+        ref<Buffer> pPageTable;
+        ///< StructuredBuffer<LumenMeshSDFVolumeDescriptor> (deduplicated meshes).
+        ref<Buffer> pVolumes;
+        ///< StructuredBuffer<LumenMeshSDFAtlasInstance> (atlas instance table).
+        ref<Buffer> pAtlasInstances;
+        ///< Host mirror of the fine/coarse atlas images (capacity * pageSize^3 floats each).
+        std::vector<float> fineImage;
+        std::vector<float> coarseImage;
+        ///< [meshID][mip] floats, re-encoded exactly as the CPU atlas tiles them (for GPU upload).
+        std::vector<std::vector<std::vector<float>>> meshMipFloats;
+        ///< Atlas geometry: pages per side of each 3D texture (== pScene->instanceTable() atlas).
+        uint32_t atlasPagesPerSide = 0;
+        ///< Last scene stats snapshot (read on demand for getGDFStats / UI).
+        LumenGI::MeshSDF::Scene::LumenMeshSDFSceneStats sceneStats;
+    } mSDF;
 };
 
-FALCOR_ENUM_REGISTER(LumenGI::TraceMode);
-FALCOR_ENUM_REGISTER(LumenGI::QualityPreset);
-FALCOR_ENUM_REGISTER(LumenGI::DebugMode);
+FALCOR_ENUM_REGISTER(LumenGIPass::TraceMode);
+FALCOR_ENUM_REGISTER(LumenGIPass::QualityPreset);
+FALCOR_ENUM_REGISTER(LumenGIPass::DebugMode);

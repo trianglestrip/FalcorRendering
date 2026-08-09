@@ -1,4 +1,4 @@
-﻿/***************************************************************************
+/***************************************************************************
  # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
  #
  # Redistribution and use in source and binary forms, with or without
@@ -29,9 +29,23 @@
 #include "LumenGI.h"
 #include "RenderGraph/RenderPassHelpers.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
+#include "Utils/Math/Float16.h" // float32ToFloat16 (fine-atlas upload).
+
+#include <array>
+#include <cstdlib>
+#include <fstream>
+#include <map>
+#include <sstream>
 
 namespace
 {
+// NOTE: no `using namespace LumenGI::MeshSDF...` here. The S6 headers declare a global
+// `namespace LumenGI` that collides with the plugin class name in the enclosing scope; a
+// using-directive inside the anonymous namespace would leak `Scene`/`Cache` into file scope
+// and make the existing `Falcor::Scene` references ambiguous. The S6 helpers below therefore
+// fully qualify the Mesh SDF types.
+namespace s6ns = LumenGI::MeshSDF;       ///< Alias for the Mesh SDF host component namespace.
+namespace s6scene = LumenGI::MeshSDF::Scene; ///< Alias for the Mesh SDF scene pipeline namespace.
 const char kShaderFile[] = "RenderPasses/LumenGI/LumenGIDebug.cs.slang";
 const char kTraceShaderFile[] = "RenderPasses/LumenGI/Tracing/LumenHardwareTrace.rt.slang";
 const char kCaptureShaderFile[] = "RenderPasses/LumenGI/Capture/LumenCardCapture.3d.slang";
@@ -166,6 +180,25 @@ const char kUseRadianceCache[] = "useRadianceCache";
 const char kSurfaceCacheAtlasSize[] = "surfaceCacheAtlasSize";
 const char kCaptureMaxPagesPerFrame[] = "captureMaxPagesPerFrame";
 
+// S6: Mesh SDF / Global Distance Field properties.
+const char kUseGDF[] = "useGDF";
+const char kMeshSDFBuilderPath[] = "meshSDFBuilderPath";
+const char kMeshSDFCacheDir[] = "meshSDFCacheDir";
+const char kMeshSDFResolution[] = "meshSDFResolution";
+const char kMeshSDFQuality[] = "meshSDFQuality";
+const char kMeshSDFPadding[] = "meshSDFPadding";
+const char kMeshSDFBudgetBytes[] = "meshSDFBudgetBytes";
+const char kGDFLevelCount[] = "gdfLevelCount";
+const char kGDFResolution[] = "gdfResolution";
+const char kGDFBaseExtent[] = "gdfBaseExtent";
+const char kGDFTraceMaxSteps[] = "gdfTraceMaxSteps";
+const char kGDFTraceMaxDistance[] = "gdfTraceMaxDistance";
+const char kGDFEmptyDistanceScale[] = "gdfEmptyDistanceScale";
+
+// S6 shader files.
+const char kGDFComposeShaderFile[] = "RenderPasses/LumenGI/MeshSDF/LumenGDFCompose.cs.slang";
+const char kGDFTraceShaderFile[] = "RenderPasses/LumenGI/MeshSDF/LumenGDFTrace.cs.slang";
+
 ///< Camera margin in front of the captured card face, in meters. Mirrors
 ///< kLumenCardCaptureDefaultNearMargin in LumenCardCaptureData.slang (frozen with Agent C).
 const float kCaptureNearMargin = 0.01f;
@@ -237,25 +270,380 @@ const ChannelList kOutputChannels = {
     { "temporalAlpha",                 "gTemporalAlpha",                 "S5-B1 effective EMA alpha (1 = full reject / reset). Accept/reject cross-check.", true, ResourceFormat::R32Float },
     { "temporalConfidence",            "gTemporalConfidence",            "S5-B1 updated confidence; input to the S5-B2 spatial filter.", true, ResourceFormat::R32Float },
     { "spatialFiltered",               "gSpatialOutput",                 "S5-B2 spatial filter: RGB=variance-guided filtered incident irradiance, A=filtered confidence. Consumes temporalFiltered + temporalConfidence.", true, ResourceFormat::RGBA16Float },
+    { "gdfTrace",                      "gGDFTraceOutput",                "S6-B4 GDF sphere trace: RGB=(t/tMax, |SDF| at surface/voxel, t), A=hit. Scriptable S6 gate channel.", true, ResourceFormat::RGBA16Float },
     // clang-format on
 };
 
+// -------------------------------------------------------------------------------------
+// S6: Mesh SDF / Global Distance Field host helpers. All pure host code (no CPU-component
+// or shader edits): the mesh->SDF volume generation (built-in analytic box SDF or an
+// external MeshSDFBuilder.exe), the mesh content hash, the box-OBJ writer and the GDF
+// dirty-region / clipmap host mirrors.
+// -------------------------------------------------------------------------------------
+
+///< Sphere-trace counters layout (mirror of LumenGDFTrace.cs.slang kGDFTraceStat*).
+constexpr uint32_t kGDFTraceStatCount = 5u;
+constexpr uint32_t kGDFTraceStatTraced = 0;
+constexpr uint32_t kGDFTraceStatHit = 1;
+constexpr uint32_t kGDFTraceStatMiss = 2;
+constexpr uint32_t kGDFTraceStatMaxSteps = 3;
+constexpr uint32_t kGDFTraceStatNoGrid = 4;
+
+///< GDF shader resource-array length (mirror of kLumenGDFMaxLevels in LumenGDFData.slang).
+///< Every slot of the gGDFLevels[16] arrays must be bound to a VALID descriptor; the host fills
+///< them all (repeating the last level) because D3D12 aborts the dispatch on an invalid entry.
+constexpr uint32_t kLumenGDFMaxLevelsHost = 16;
+
+/// FNV-1a 64-bit (algorithm-identical to the S6 cache / builder / atlas hashes; distinct
+/// name avoids ODR collisions with the symbols those headers define).
+uint64_t s6FNV1a64(const void* data, size_t size)
+{
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint64_t h = 0xcbf29ce484222325ULL;
+    constexpr uint64_t kPrime = 0x100000001b3ULL;
+    for (size_t i = 0; i < size; ++i)
+    {
+        h ^= p[i];
+        h *= kPrime;
+    }
+    return h;
+}
+
+/// Analytic signed distance to an axis-aligned box [bmin, bmax] at (px,py,pz), math
+/// convention (positive outside). The box is the mesh's padded object-space AABB, so the
+/// produced field is a faithful proxy for closed box-like meshes (Cornell walls / boxes).
+float s6BoxSDF(
+    float px,
+    float py,
+    float pz,
+    const std::array<float, 3>& bmin,
+    const std::array<float, 3>& bmax
+)
+{
+    const float qx = std::fabs(px - 0.5f * (bmin[0] + bmax[0])) - 0.5f * (bmax[0] - bmin[0]);
+    const float qy = std::fabs(py - 0.5f * (bmin[1] + bmax[1])) - 0.5f * (bmax[1] - bmin[1]);
+    const float qz = std::fabs(pz - 0.5f * (bmin[2] + bmax[2])) - 0.5f * (bmax[2] - bmin[2]);
+    const float outside = std::sqrt(std::max(qx, 0.f) * std::max(qx, 0.f) +
+                                    std::max(qy, 0.f) * std::max(qy, 0.f) +
+                                    std::max(qz, 0.f) * std::max(qz, 0.f));
+    const float inside = std::min(std::max(qx, std::max(qy, qz)), 0.f);
+    return outside + inside;
+}
+
+/// Write a minimal OBJ for the axis-aligned box [bmin, bmax] (feeds MeshSDFBuilder.exe).
+bool s6WriteBoxOBJ(
+    const std::filesystem::path& path,
+    const std::array<float, 3>& bmin,
+    const std::array<float, 3>& bmax,
+    std::string& err
+)
+{
+    std::ofstream out(path);
+    if (!out)
+    {
+        err = "cannot open box obj: " + path.string();
+        return false;
+    }
+    const float x[2] = {bmin[0], bmax[0]};
+    const float y[2] = {bmin[1], bmax[1]};
+    const float z[2] = {bmin[2], bmax[2]};
+    for (int i = 0; i < 8; ++i)
+    {
+        const int ix = (i & 1) ? 1 : 0;
+        const int iy = (i & 2) ? 1 : 0;
+        const int iz = (i & 4) ? 1 : 0;
+        out << "v " << x[ix] << " " << y[iy] << " " << z[iz] << "\n";
+    }
+    // 6 faces x 2 triangles (1-based indices). Winding only affects the normal-vote
+    // diagnostics, not the unsigned distance; the parity sign is authoritative.
+    const int faces[6][4] = {
+        {0, 2, 6, 4}, // -z
+        {1, 5, 7, 3}, // +z
+        {0, 1, 3, 2}, // -y
+        {4, 6, 7, 5}, // +y
+        {0, 4, 5, 1}, // -x
+        {2, 3, 7, 6}, // +x
+    };
+    for (int f = 0; f < 6; ++f)
+    {
+        out << "f " << (faces[f][0] + 1) << " " << (faces[f][1] + 1) << " " << (faces[f][2] + 1) << "\n";
+        out << "f " << (faces[f][0] + 1) << " " << (faces[f][2] + 1) << " " << (faces[f][3] + 1) << "\n";
+    }
+    if (!out)
+    {
+        err = "failed writing box obj: " + path.string();
+        return false;
+    }
+    return true;
+}
+
+/// Built-in volume builder: analytic box SDF over the mesh's padded object AABB
+/// (cacheParams.gridBounds, which the host always populates). This is the "placeholder /
+/// built-in generation" fallback used when MeshSDFBuilder.exe is not configured/present.
+bool s6BoxSDFBuilder(
+    const s6scene::LumenMeshSDFSceneMeshDesc& mesh,
+    const std::filesystem::path& targetPath,
+    std::string& err
+)
+{
+    const std::array<uint32_t, 3>& res = mesh.cacheParams.resolution;
+    const std::array<float, 6>& g = mesh.cacheParams.gridBounds;
+    if (res[0] < 2 || res[1] < 2 || res[2] < 2)
+    {
+        err = "box SDF builder requires resolution >= 2 per axis";
+        return false;
+    }
+    if (!(g[0] < g[3] && g[1] < g[4] && g[2] < g[5]))
+    {
+        err = "box SDF builder requires valid grid bounds";
+        return false;
+    }
+
+    s6ns::MSDFHeader h;
+    h.formatVersion = s6ns::kMSDFFormatVersion;
+    h.resolution = res;
+    h.bboxMin = {g[0], g[1], g[2]};
+    h.bboxMax = {g[3], g[4], g[5]};
+    const float maxExt = std::max(g[3] - g[0], std::max(g[4] - g[1], g[5] - g[2]));
+    const uint32_t maxRes = std::max(res[0], std::max(res[1], res[2]));
+    h.voxelSize = maxExt / (float(maxRes) - 1.f); // voxel-center convention.
+    h.normalizationScale = 1.f;                   // output == object space (identity instance map).
+    h.paddingWorld = 0.f;
+    h.signConvention = s6ns::kLumenMeshSDFSignConventionPositiveOutside;
+    h.signReliable = 1; // a closed box has a well-defined sign.
+    h.dataCount = uint64_t(res[0]) * uint64_t(res[1]) * uint64_t(res[2]);
+
+    const std::array<float, 3> bmin = {g[0], g[1], g[2]};
+    const std::array<float, 3> bmax = {g[3], g[4], g[5]};
+    std::vector<float> d(size_t(h.dataCount));
+    size_t i = 0;
+    for (uint32_t z = 0; z < res[2]; ++z)
+        for (uint32_t y = 0; y < res[1]; ++y)
+            for (uint32_t x = 0; x < res[0]; ++x, ++i)
+            {
+                const float px = g[0] + (float(x) + 0.5f) * h.voxelSize;
+                const float py = g[1] + (float(y) + 0.5f) * h.voxelSize;
+                const float pz = g[2] + (float(z) + 0.5f) * h.voxelSize;
+                d[i] = s6BoxSDF(px, py, pz, bmin, bmax);
+            }
+
+    std::vector<uint8_t> bytes;
+    std::string serr;
+    if (!s6ns::Cache::serializeMSDFBytes(h, d, {}, bytes, serr))
+    {
+        err = "box SDF serialize failed: " + serr;
+        return false;
+    }
+    if (!s6ns::Cache::store(targetPath, bytes, err))
+        return false;
+    return true;
+}
+
+/// External builder wrapper: invokes MeshSDFBuilder.exe on a box OBJ derived from the mesh's
+/// grid bounds (or on mesh.sourcePath when provided). The scene validates the produced
+/// ".msdf" before storing it, so a bad exit code or a corrupt output never reaches the cache.
+bool s6ExternalMeshSDFBuilder(
+    const std::filesystem::path& exe,
+    const s6scene::LumenMeshSDFSceneMeshDesc& mesh,
+    const std::filesystem::path& targetPath,
+    std::string& err
+)
+{
+    const std::array<uint32_t, 3>& res = mesh.cacheParams.resolution;
+    if (res[0] < 2 || res[1] < 2 || res[2] < 2)
+    {
+        err = "external builder requires resolution >= 2 per axis";
+        return false;
+    }
+
+    std::filesystem::path inputPath = mesh.sourcePath;
+    std::string bboxArg;
+    if (inputPath.empty())
+    {
+        const std::array<float, 6>& g = mesh.cacheParams.gridBounds;
+        if (!(g[0] < g[3] && g[1] < g[4] && g[2] < g[5]))
+        {
+            err = "external builder requires valid grid bounds";
+            return false;
+        }
+        inputPath = targetPath.parent_path() / (targetPath.filename().string() + ".box.obj");
+        if (!s6WriteBoxOBJ(inputPath, {g[0], g[1], g[2]}, {g[3], g[4], g[5]}, err))
+            return false;
+        std::stringstream ss;
+        ss << " --bbox " << g[0] << "," << g[1] << "," << g[2] << "," << g[3] << "," << g[4] << "," << g[5];
+        bboxArg = ss.str();
+    }
+
+    std::stringstream cmd;
+    cmd << "\"" << exe.string() << "\" --input \"" << inputPath.string()
+        << "\" --output \"" << targetPath.string()
+        << "\" --resolution " << res[0] << "," << res[1] << "," << res[2]
+        << " --no-normalize --padding 0" << bboxArg;
+    const int rc = std::system(cmd.str().c_str());
+    if (rc != 0)
+    {
+        err = "MeshSDFBuilder.exe exited with code " + std::to_string(rc);
+        return false;
+    }
+    return true;
+}
+
+/// Padded output-space grid bounds for a mesh's object AABB (S6-A volume grid input).
+/// Every axis gets at least a 2-voxel pad so degenerate (flat) meshes still produce a
+/// valid volume grid.
+std::array<float, 6> s6PaddedGridBounds(const Falcor::AABB& oabb, uint32_t resolution, float padFraction)
+{
+    const Falcor::float3 extent = oabb.extent();
+    const float maxExt = std::max(extent.x, std::max(extent.y, extent.z));
+    const float voxel = maxExt / (float(std::max<uint32_t>(resolution, 2u)) - 1.f);
+    const float pad = std::max(padFraction * maxExt, 2.f * voxel);
+    std::array<float, 6> g;
+    g[0] = oabb.minPoint.x - pad;
+    g[3] = oabb.maxPoint.x + pad;
+    g[1] = oabb.minPoint.y - pad;
+    g[4] = oabb.maxPoint.y + pad;
+    g[2] = oabb.minPoint.z - pad;
+    g[5] = oabb.maxPoint.z + pad;
+    return g;
+}
+
+/// Mesh geometry-identity hash (S6-A2 cache key input). Stable per scene; a geometry or
+/// bounds change invalidates the entry.
+uint64_t s6MeshContentHash(uint32_t meshID, const Falcor::AABB& oabb, uint32_t vertexCount, uint32_t indexCount)
+{
+    struct Key
+    {
+        uint32_t meshID;
+        uint32_t vertexCount;
+        uint32_t indexCount;
+        std::array<float, 6> bounds;
+    };
+    Key k;
+    k.meshID = meshID;
+    k.vertexCount = vertexCount;
+    k.indexCount = indexCount;
+    k.bounds = {
+        oabb.minPoint.x, oabb.minPoint.y, oabb.minPoint.z,
+        oabb.maxPoint.x, oabb.maxPoint.y, oabb.maxPoint.z,
+    };
+    return s6FNV1a64(&k, sizeof(k));
+}
+
+// -------------------------------------------------------------------------------------
+// S6 GPU layout mirrors (host -> GPU upload structs; keep in sync with LumenGDFData.slang /
+// LumenMeshSDFAtlas.slang). The GDF instance entry is the scene's LumenMeshSDFGDFInstance
+// (40 bytes, already a byte-exact mirror of LumenGDFInstance).
+// -------------------------------------------------------------------------------------
+
+/// Host mirror of `LumenGDFLevelParams` in LumenGDFData.slang (32 bytes).
+struct LumenGDFLevelParamsHost
+{
+    uint32_t resolution = 0;   // +0  voxels per side.
+    uint32_t format = 0;       // +4  kLumenMeshSDFFormatR16Float (0) / R8Snorm (1).
+    float worldExtent = 0.f;   // +8  level extent (meters).
+    float voxelSize = 0.f;     // +12 extent / resolution.
+    float quantRange = 0.f;    // +16 R8Snorm scale R of this level.
+    float emptyDistance = 0.f; // +20 empty-voxel distance (> 0).
+    uint32_t flags = 0;        // +24 reserved.
+    uint32_t pad = 0;          // +28
+};
+static_assert(sizeof(LumenGDFLevelParamsHost) == 32, "LumenGDFLevelParams host mirror is 32 bytes");
+
+/// Host mirror of `LumenGDFDirtyRegion` in LumenGDFData.slang (40 bytes; the shader's "36 bytes"
+/// comment is a doc slip - level+axis+int3+int3+flags+pad = 40).
+struct LumenGDFDirtyRegionHost
+{
+    uint32_t level = 0;        // +0
+    uint32_t axis = 0;         // +4 (informational; 0xFFFFFFFF for a full-level region).
+    int32_t min[3] = {0, 0, 0}; // +8 inclusive lower corner.
+    int32_t max[3] = {0, 0, 0}; // +20 inclusive upper corner.
+    uint32_t flags = 0;        // +32 kLumenGDFDirtyFlagAdded (1) / kLumenGDFDirtyFlagRemoved (2).
+    uint32_t pad = 0;          // +36
+};
+static_assert(sizeof(LumenGDFDirtyRegionHost) == 40, "LumenGDFDirtyRegion host mirror is 40 bytes");
+
+/// Host mirror of the LumenGDFDirtyFlag* bits (LumenGDFData.slang).
+constexpr uint32_t kLumenGDFDirtyFlagAdded = 1u << 0;
+constexpr uint32_t kLumenGDFDirtyFlagRemoved = 1u << 1;
+
+/// Tile one mip's float data (x-fastest, dims^3) into a flat atlas image (GPU layout:
+/// page slot s -> brick origin (s % P, (s / P) % P, s / (P*P)) * pageSize, texel index
+/// (tz * T + ty) * T + tx with T = P * pageSize). Mirrors the fixed atlas sampler in
+/// LumenMeshSDFAtlas.slang (this host image is what the GPU atlas textures are uploaded from).
+void s6TileMipIntoAtlasImage(
+    const std::vector<float>& data,
+    const std::array<uint32_t, 3>& res,
+    uint32_t mip,
+    uint32_t baseSlot,
+    uint32_t pagesPerSide,
+    std::vector<float>& image
+)
+{
+    const std::array<uint32_t, 3> dims = s6ns::atlasMipDims(res, mip);
+    const uint32_t bricks[3] = {
+        (dims[0] + s6ns::kLumenMeshSDFAtlasPageSize - 1u) / s6ns::kLumenMeshSDFAtlasPageSize,
+        (dims[1] + s6ns::kLumenMeshSDFAtlasPageSize - 1u) / s6ns::kLumenMeshSDFAtlasPageSize,
+        (dims[2] + s6ns::kLumenMeshSDFAtlasPageSize - 1u) / s6ns::kLumenMeshSDFAtlasPageSize,
+    };
+    const uint32_t T = pagesPerSide * s6ns::kLumenMeshSDFAtlasPageSize;
+    for (uint32_t bz = 0; bz < bricks[2]; ++bz)
+        for (uint32_t by = 0; by < bricks[1]; ++by)
+            for (uint32_t bx = 0; bx < bricks[0]; ++bx)
+            {
+                const uint32_t brickIdx = bz * (bricks[0] * bricks[1]) + by * bricks[0] + bx;
+                const uint32_t slot = baseSlot + brickIdx;
+                const uint32_t ox = (slot % pagesPerSide) * s6ns::kLumenMeshSDFAtlasPageSize;
+                const uint32_t oy = ((slot / pagesPerSide) % pagesPerSide) * s6ns::kLumenMeshSDFAtlasPageSize;
+                const uint32_t oz = (slot / (pagesPerSide * pagesPerSide)) * s6ns::kLumenMeshSDFAtlasPageSize;
+                for (uint32_t z = 0; z < s6ns::kLumenMeshSDFAtlasPageSize; ++z)
+                    for (uint32_t y = 0; y < s6ns::kLumenMeshSDFAtlasPageSize; ++y)
+                        for (uint32_t x = 0; x < s6ns::kLumenMeshSDFAtlasPageSize; ++x)
+                        {
+                            const uint32_t vx = bx * s6ns::kLumenMeshSDFAtlasPageSize + x;
+                            const uint32_t vy = by * s6ns::kLumenMeshSDFAtlasPageSize + y;
+                            const uint32_t vz = bz * s6ns::kLumenMeshSDFAtlasPageSize + z;
+                            if (vx >= dims[0] || vy >= dims[1] || vz >= dims[2])
+                                continue;
+                            const size_t src = (static_cast<size_t>(vz) * dims[1] + vy) * dims[0] + vx;
+                            const size_t dst = (static_cast<size_t>(oz + z) * T + (oy + y)) * T + (ox + x);
+                            image[dst] = data[src];
+                        }
+            }
+}
+
+/// Convert a float atlas image in [-1, 1] into int8 R8_SNORM codes (the coarse-atlas upload
+/// representation; matches the GPU R8_SNORM float<->code/127 conversion).
+void s6CoarseImageToCodes(const std::vector<float>& image, std::vector<int8_t>& out)
+{
+    out.resize(image.size());
+    for (size_t i = 0; i < image.size(); ++i)
+    {
+        const float v = std::max(-1.f, std::min(1.f, image[i]));
+        out[i] = static_cast<int8_t>(std::lround(v * 127.f));
+    }
+}
+
 void registerBindings(pybind11::module& m)
 {
-    pybind11::class_<LumenGI, RenderPass, ref<LumenGI>> pass(m, "LumenGI");
+    pybind11::class_<LumenGIPass, RenderPass, ref<LumenGIPass>> pass(m, "LumenGI");
     // Scriptable S2 gate snapshot: read as m.activeGraph.getPass("LumenGI").surfaceCacheStats.
     // std::map<std::string, double> converts to a Python dict losslessly.
-    pass.def_property_readonly("surfaceCacheStats", &LumenGI::getSurfaceCacheStats);
+    pass.def_property_readonly("surfaceCacheStats", &LumenGIPass::getSurfaceCacheStats);
+    // Scriptable S6 gate snapshot: read as m.activeGraph.getPass("LumenGI").gdfStats.
+    pass.def_property_readonly("gdfStats", &LumenGIPass::getGDFStats);
+    // Compatibility alias for the Z15 S6-C2 atlas test skeleton (run_sdf_atlas.py) which probes
+    // a `meshSDFSceneStats` dict binding; the scene-pipeline counters live in gdfStats.
+    pass.def_property_readonly("meshSDFSceneStats", &LumenGIPass::getGDFStats);
 }
 } // namespace
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
 {
-    registry.registerClass<RenderPass, LumenGI>();
+    registry.registerClass<RenderPass, LumenGIPass>();
     ScriptBindings::registerBinding(registerBindings);
 }
 
-LumenGI::LumenGI(ref<Device> pDevice, const Properties& props)
+LumenGIPass::LumenGIPass(ref<Device> pDevice, const Properties& props)
     : RenderPass(pDevice)
     , mPageCache(
           kLumenSurfaceCacheDefaultAtlasSize,
@@ -286,7 +674,7 @@ LumenGI::LumenGI(ref<Device> pDevice, const Properties& props)
     createDebugPass();
 }
 
-void LumenGI::parseProperties(const Properties& props)
+void LumenGIPass::parseProperties(const Properties& props)
 {
     for (const auto& [key, value] : props)
     {
@@ -348,12 +736,65 @@ void LumenGI::parseProperties(const Properties& props)
             mAtlasSizeTexels = value;
         else if (key == kCaptureMaxPagesPerFrame)
             mCaptureMaxPagesPerFrame = value;
+        else if (key == kUseGDF)
+            mUseGDF = value;
+        else if (key == kMeshSDFBuilderPath)
+        {
+            const std::string s = value;
+            mMeshSDFBuilderPath = std::filesystem::path(s);
+        }
+        else if (key == kMeshSDFCacheDir)
+        {
+            const std::string s = value;
+            mMeshSDFCacheDir = std::filesystem::path(s);
+        }
+        else if (key == kMeshSDFResolution)
+        {
+            const uint32_t v = value;
+            mMeshSDFResolution = std::max<uint32_t>(v, 8u);
+        }
+        else if (key == kMeshSDFQuality)
+            mMeshSDFQuality = value ? 1u : 0u;
+        else if (key == kMeshSDFPadding)
+        {
+            const float v = value;
+            mMeshSDFPadding = std::max(v, 0.f);
+        }
+        else if (key == kMeshSDFBudgetBytes)
+            mMeshSDFBudgetBytes = value;
+        else if (key == kGDFLevelCount)
+        {
+            const uint32_t v = value;
+            mGDFLevelCount = std::clamp<uint32_t>(v, 1u, LumenGI::GlobalDistanceField::kMaxGDFLevels);
+        }
+        else if (key == kGDFResolution)
+        {
+            const uint32_t v = value;
+            mGDFResolution = std::max<uint32_t>(v, 16u);
+        }
+        else if (key == kGDFBaseExtent)
+        {
+            const float v = value;
+            mGDFBaseExtent = std::max(v, 0.1f);
+        }
+        else if (key == kGDFTraceMaxSteps)
+            mGDFTraceMaxSteps = value;
+        else if (key == kGDFTraceMaxDistance)
+        {
+            const float v = value;
+            mGDFTraceMaxDistance = std::max(v, 0.f);
+        }
+        else if (key == kGDFEmptyDistanceScale)
+        {
+            const float v = value;
+            mGDFEmptyDistanceScale = std::max(v, 1.f);
+        }
         else
             logWarning("Unknown property '{}' in LumenGI properties.", key);
     }
 }
 
-Properties LumenGI::getProperties() const
+Properties LumenGIPass::getProperties() const
 {
     Properties props;
     props[kEnabled] = mEnabled;
@@ -385,10 +826,23 @@ Properties LumenGI::getProperties() const
     props[kUseRadianceCache] = mUseRadianceCache;
     props[kSurfaceCacheAtlasSize] = mAtlasSizeTexels;
     props[kCaptureMaxPagesPerFrame] = mCaptureMaxPagesPerFrame;
+    props[kUseGDF] = mUseGDF;
+    props[kMeshSDFBuilderPath] = mMeshSDFBuilderPath.string();
+    props[kMeshSDFCacheDir] = mMeshSDFCacheDir.string();
+    props[kMeshSDFResolution] = mMeshSDFResolution;
+    props[kMeshSDFQuality] = mMeshSDFQuality;
+    props[kMeshSDFPadding] = mMeshSDFPadding;
+    props[kMeshSDFBudgetBytes] = mMeshSDFBudgetBytes;
+    props[kGDFLevelCount] = mGDFLevelCount;
+    props[kGDFResolution] = mGDFResolution;
+    props[kGDFBaseExtent] = mGDFBaseExtent;
+    props[kGDFTraceMaxSteps] = mGDFTraceMaxSteps;
+    props[kGDFTraceMaxDistance] = mGDFTraceMaxDistance;
+    props[kGDFEmptyDistanceScale] = mGDFEmptyDistanceScale;
     return props;
 }
 
-RenderPassReflection LumenGI::reflect(const CompileData& compileData)
+RenderPassReflection LumenGIPass::reflect(const CompileData& compileData)
 {
     RenderPassReflection reflector;
     addRenderPassInputs(reflector, kInputChannels);
@@ -412,7 +866,7 @@ RenderPassReflection LumenGI::reflect(const CompileData& compileData)
     return reflector;
 }
 
-void LumenGI::compile(RenderContext* pRenderContext, const CompileData& compileData)
+void LumenGIPass::compile(RenderContext* pRenderContext, const CompileData& compileData)
 {
     if (any(mFrameDim != compileData.defaultTexDims))
     {
@@ -421,7 +875,7 @@ void LumenGI::compile(RenderContext* pRenderContext, const CompileData& compileD
     }
 }
 
-void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderData)
+void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
     auto& dict = renderData.getDictionary();
     if (mOptionsChanged)
@@ -560,17 +1014,27 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     // without a primary hit (sky, out-of-bounds) are not read as stale data.
     if (mpLightingComponents)
         pRenderContext->clearUAV(mpLightingComponents->getUAV().get(), float4(0.f));
-    // The counters must be cleared before each dispatch; they accumulate
-    // across the frame and are copied to the readback buffer afterwards.
-    if (mpLumenGICounters)
-        pRenderContext->clearUAV(mpLumenGICounters->getUAV().get(), uint4(0));
 
-    mpScene->raytrace(pRenderContext, mTracer.pProgram.get(), mTracer.pVars, uint3(mFrameDim, 1));
-
-    if (mpLumenGICounters && mpLumenGICountersReadback)
+    // S6: TraceMode::MeshSDF makes the GDF sphere trace the PRIMARY path (the S6-B4
+    // pass writes the S1 outputs below). The HWRT raytrace is skipped so the pass output
+    // is genuinely software-traced (no DXR in the hot path); the tracer program/vars are
+    // still maintained so toggling back to HardwareRT stays instant. In every other mode
+    // the S1 raytrace runs exactly as before.
+    const bool sdfPrimaryPath = (mTraceMode == TraceMode::MeshSDF);
+    if (!sdfPrimaryPath)
     {
-        pRenderContext->copyResource(mpLumenGICountersReadback.get(), mpLumenGICounters.get());
-        mCounterReadbackPending = true;
+        // The counters must be cleared before each dispatch; they accumulate
+        // across the frame and are copied to the readback buffer afterwards.
+        if (mpLumenGICounters)
+            pRenderContext->clearUAV(mpLumenGICounters->getUAV().get(), uint4(0));
+
+        mpScene->raytrace(pRenderContext, mTracer.pProgram.get(), mTracer.pVars, uint3(mFrameDim, 1));
+
+        if (mpLumenGICounters && mpLumenGICountersReadback)
+        {
+            pRenderContext->copyResource(mpLumenGICountersReadback.get(), mpLumenGICounters.get());
+            mCounterReadbackPending = true;
+        }
     }
 
     // S2: Surface Cache / Cards capture. Pure additive work gated behind mUseSurfaceCache;
@@ -624,6 +1088,41 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     // the graph allocating both temporalFiltered and spatialFiltered (no-ops otherwise).
     if (mUseSpatialFilter)
         runSpatialFilter(pRenderContext, renderData);
+
+    // S6: Mesh SDF / Global Distance Field pipeline. Active ONLY when explicitly enabled
+    // (mUseGDF). The TraceMode::MeshSDF/Hybrid values remain a UI/API placeholder that falls
+    // back to the HWRT path (todo.md: the software path is not implemented yet) so toggling
+    // them never runs the half-integrated GDF compose pass (which currently lacks the atlas
+    // resource bindings and aborts at dispatch with E_INVALIDARG). Every frame when enabled:
+    //   * the camera anchor is pushed into the CPU clipmap (GDF scroll bookkeeping),
+    //   * resident Mesh SDF instances are composed into the GDF clipmap textures
+    //     (LumenGDFCompose.cs.slang) over the dirty regions only,
+    //   * the GDF sphere trace (LumenGDFTrace.cs.slang) runs over the screen: in MeshSDF mode it
+    //     REPLACES the S1 outputs (diffuseGI / diffuseRadianceHitDist / confidence), in Hybrid /
+    //     HardwareRT-with-GDF mode it writes the optional "gdfTrace" diagnostic channel only.
+    if (mUseGDF)
+    {
+        // S6-in-progress guard: the compose pass reads the mesh-SDF atlas resources that the
+        // host wiring does not create yet; dispatching with them unbound aborts E_INVALIDARG.
+        // Skip the whole S6 path until the full data pipeline is wired.
+        if (mSDF.pFineAtlas && mSDF.pCoarseAtlas && mSDF.pPageTable && mSDF.pVolumes && mSDF.pAtlasInstances)
+        {
+            if (!mSDF.pScene)
+                ensureMeshSDFScene();
+            if (mSDF.pScene)
+            {
+                ensureGDFResources(pRenderContext);
+                runGDFCompose(pRenderContext);
+                runGDFSphereTrace(pRenderContext, renderData);
+                readbackGDFTraceStats(pRenderContext);
+                mSDF.pScene->endFrame();
+            }
+        }
+        else
+        {
+            logWarning("LumenGI: GDF pipeline skipped (mesh-SDF atlas resources not wired yet; S6 integration pending).");
+        }
+    }
 
     if (!mpDebugPass)
         createDebugPass();
@@ -694,7 +1193,7 @@ void LumenGI::execute(RenderContext* pRenderContext, const RenderData& renderDat
     ++mFrameIndex;
 }
 
-void LumenGI::renderUI(Gui::Widgets& widget)
+void LumenGIPass::renderUI(Gui::Widgets& widget)
 {
     bool dirty = false;
     dirty |= widget.checkbox("Enabled", mEnabled);
@@ -841,7 +1340,7 @@ void LumenGI::renderUI(Gui::Widgets& widget)
     }
 }
 
-void LumenGI::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
+void LumenGIPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
     mUpdateFlagsConnection = {};
     mSceneUpdates = IScene::UpdateFlags::None;
@@ -867,6 +1366,9 @@ void LumenGI::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     mScreenProbes.pFinalize = nullptr;
     mScreenProbes.pIntegrate = nullptr;
     mScreenProbes.pInterpolate = nullptr;
+    // S6: the Mesh SDF scene + GDF are scene-scoped; drop everything and re-materialize lazily
+    // from the disk cache on the next execute (a cache HIT after reload, never a rebuild).
+    invalidateMeshSDF();
     if (pRenderContext)
     {
         for (const ref<Texture>& pIndirect : mCacheLighting.pIndirect)
@@ -898,7 +1400,7 @@ void LumenGI::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
     }
 }
 
-void LumenGI::onHotReload(HotReloadFlags reloaded)
+void LumenGIPass::onHotReload(HotReloadFlags reloaded)
 {
     if (is_set(reloaded, HotReloadFlags::Program))
     {
@@ -916,11 +1418,13 @@ void LumenGI::onHotReload(HotReloadFlags reloaded)
     mScreenProbes.pInterpolate = nullptr;
     mTemporalFilter.pFilter = nullptr; // pure compute, no scene deps; recreated lazily.
     mSpatialFilter.pFilter = nullptr;  // pure compute, no scene deps; recreated lazily.
+    mSDF.pCompose = nullptr;           // S6: pure compute, no scene deps; recreated lazily.
+    mSDF.pTrace = nullptr;
     resetHistory();
     }
 }
 
-void LumenGI::resetHistory()
+void LumenGIPass::resetHistory()
 {
     mFrameIndex = 0;
     // S5-A1: mark the prev history/depth double buffer for a hard clear (camera cut / resize /
@@ -931,7 +1435,7 @@ void LumenGI::resetHistory()
     mTemporalFilter.historyResetPending = true;
 }
 
-void LumenGI::clearOutputs(RenderContext* pRenderContext, const RenderData& renderData) const
+void LumenGIPass::clearOutputs(RenderContext* pRenderContext, const RenderData& renderData) const
 {
     for (const auto& channel : kOutputChannels)
     {
@@ -940,12 +1444,12 @@ void LumenGI::clearOutputs(RenderContext* pRenderContext, const RenderData& rend
     }
 }
 
-void LumenGI::createDebugPass(const DefineList& defines)
+void LumenGIPass::createDebugPass(const DefineList& defines)
 {
     mpDebugPass = ComputePass::create(mpDevice, kShaderFile, "main", defines);
 }
 
-void LumenGI::createTraceProgram()
+void LumenGIPass::createTraceProgram()
 {
     mTracer.pProgram = nullptr;
     mTracer.pBindingTable = nullptr;
@@ -1001,7 +1505,7 @@ void LumenGI::createTraceProgram()
     mTracer.pProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
 }
 
-void LumenGI::prepareTraceVars()
+void LumenGIPass::prepareTraceVars()
 {
     FALCOR_ASSERT(mpScene && mTracer.pProgram && mTracer.pBindingTable);
     mTracer.pProgram->addDefines(mpSampleGenerator->getDefines());
@@ -1010,7 +1514,7 @@ void LumenGI::prepareTraceVars()
     mpSampleGenerator->bindShaderData(mTracer.pVars->getRootVar());
 }
 
-void LumenGI::ensureTraceResources()
+void LumenGIPass::ensureTraceResources()
 {
     // One uint4 per LumenGICounterIndex entry (NaN/Inf, firefly, negative,
     // traced rays). The shader defines the same layout in LumenGIData.slang.
@@ -1020,14 +1524,14 @@ void LumenGI::ensureTraceResources()
         mpLumenGICounters = mpDevice->createStructuredBuffer(
             sizeof(uint4), kCounterCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mpLumenGICounters->setName("LumenGI::Counters");
+        mpLumenGICounters->setName("LumenGIPass::Counters");
     }
     if (!mpLumenGICountersReadback)
     {
         mpLumenGICountersReadback = mpDevice->createStructuredBuffer(
             sizeof(uint4), kCounterCount, ResourceBindFlags::None, MemoryType::ReadBack
         );
-        mpLumenGICountersReadback->setName("LumenGI::CountersReadback");
+        mpLumenGICountersReadback->setName("LumenGIPass::CountersReadback");
     }
 
     if (!mpLightingComponents && any(mFrameDim > 0u))
@@ -1036,11 +1540,11 @@ void LumenGI::ensureTraceResources()
             mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mpLightingComponents->setName("LumenGI::LightingComponents");
+        mpLightingComponents->setName("LumenGIPass::LightingComponents");
     }
 }
 
-void LumenGI::readbackCounters(RenderContext* pRenderContext)
+void LumenGIPass::readbackCounters(RenderContext* pRenderContext)
 {
     if (!mCounterReadbackPending || !mpLumenGICountersReadback)
         return;
@@ -1061,7 +1565,7 @@ void LumenGI::readbackCounters(RenderContext* pRenderContext)
 // S2: Surface Cache / Cards capture host
 // ------------------------------------------------------------------------------------------
 
-std::map<std::string, double> LumenGI::getSurfaceCacheStats() const
+std::map<std::string, double> LumenGIPass::getSurfaceCacheStats() const
 {
     std::map<std::string, double> stats;
     stats["frameIndex"] = (double)mFrameIndex;
@@ -1135,7 +1639,7 @@ std::map<std::string, double> LumenGI::getSurfaceCacheStats() const
     return stats;
 }
 
-void LumenGI::invalidateCaptureResources()
+void LumenGIPass::invalidateCaptureResources()
 {
     // Drop every capture resource that is scene-scoped or program-scoped. The atlas textures
     // are deliberately kept: they are fixed-size and their pages are re-captured on demand.
@@ -1157,7 +1661,7 @@ void LumenGI::invalidateCaptureResources()
     mCacheLighting.pPass = nullptr;
 }
 
-void LumenGI::ensureCaptureResources(RenderContext* pRenderContext)
+void LumenGIPass::ensureCaptureResources(RenderContext* pRenderContext)
 {
     if (!mpScene || !mpCardScene)
         return;
@@ -1171,7 +1675,7 @@ void LumenGI::ensureCaptureResources(RenderContext* pRenderContext)
             mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::RGBA8Unorm, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mCapture.pMaterialAtlas->setName("LumenGI::Capture::MaterialAtlas"); // RGBA8, 4 B/texel, atlas lifetime.
+        mCapture.pMaterialAtlas->setName("LumenGIPass::Capture::MaterialAtlas"); // RGBA8, 4 B/texel, atlas lifetime.
         pRenderContext->clearUAV(mCapture.pMaterialAtlas->getUAV().get(), float4(0.f));
     }
     if (!mCapture.pRadianceAtlas)
@@ -1180,7 +1684,7 @@ void LumenGI::ensureCaptureResources(RenderContext* pRenderContext)
             mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::RGBA16Float, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mCapture.pRadianceAtlas->setName("LumenGI::Capture::RadianceAtlas"); // RGBA16F, 8 B/texel, atlas lifetime.
+        mCapture.pRadianceAtlas->setName("LumenGIPass::Capture::RadianceAtlas"); // RGBA16F, 8 B/texel, atlas lifetime.
         pRenderContext->clearUAV(mCapture.pRadianceAtlas->getUAV().get(), float4(0.f));
     }
     if (!mCapture.pMetadataAtlas)
@@ -1189,7 +1693,7 @@ void LumenGI::ensureCaptureResources(RenderContext* pRenderContext)
             mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::RGBA16Float, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mCapture.pMetadataAtlas->setName("LumenGI::Capture::MetadataAtlas"); // RGBA16F, 8 B/texel, atlas lifetime.
+        mCapture.pMetadataAtlas->setName("LumenGIPass::Capture::MetadataAtlas"); // RGBA16F, 8 B/texel, atlas lifetime.
         pRenderContext->clearUAV(mCapture.pMetadataAtlas->getUAV().get(), float4(0.f));
     }
 
@@ -1201,11 +1705,11 @@ void LumenGI::ensureCaptureResources(RenderContext* pRenderContext)
     if (cardCount > 0 && (!mCapture.pCards || mCapture.pCards->getElementCount() != cardCount))
     {
         mCapture.pCards = mpDevice->createStructuredBuffer(sizeof(LumenCard), cardCount, ResourceBindFlags::ShaderResource);
-        mCapture.pCards->setName("LumenGI::Capture::Cards"); // StructuredBuffer<LumenCard>, 96 B stride, scene-scoped.
+        mCapture.pCards->setName("LumenGIPass::Capture::Cards"); // StructuredBuffer<LumenCard>, 96 B stride, scene-scoped.
         mCardPageTable.assign(cardCount, kLumenCardInvalidID);
         mCardPageGeneration.assign(cardCount, 0u);
         mCapture.pPageTable = mpDevice->createStructuredBuffer(sizeof(uint32_t), cardCount, ResourceBindFlags::ShaderResource);
-        mCapture.pPageTable->setName("LumenGI::Capture::PageTable"); // cardIndex -> pageID, uint32, scene-scoped.
+        mCapture.pPageTable->setName("LumenGIPass::Capture::PageTable"); // cardIndex -> pageID, uint32, scene-scoped.
     }
 
     // Indirect draw argument blob: one 20-byte argument per command. Capacity = the per-frame
@@ -1217,14 +1721,14 @@ void LumenGI::ensureCaptureResources(RenderContext* pRenderContext)
         mCapture.pDrawArgs = mpDevice->createBuffer(
             (size_t)maxCommands * kCaptureDrawArgBytes, ResourceBindFlags::IndirectArg, MemoryType::DeviceLocal, nullptr
         );
-        mCapture.pDrawArgs->setName("LumenGI::Capture::DrawArgs"); // DrawIndexedArguments/DrawArguments blob, scene-scoped.
+        mCapture.pDrawArgs->setName("LumenGIPass::Capture::DrawArgs"); // DrawIndexedArguments/DrawArguments blob, scene-scoped.
     }
 
     if (!mCapture.pProgram)
         createCaptureProgram();
 }
 
-void LumenGI::runSurfaceCacheCapture(RenderContext* pRenderContext, IScene::UpdateFlags updateFlags)
+void LumenGIPass::runSurfaceCacheCapture(RenderContext* pRenderContext, IScene::UpdateFlags updateFlags)
 {
     if (!mpScene || !mpCardScene)
         return;
@@ -1296,7 +1800,7 @@ void LumenGI::runSurfaceCacheCapture(RenderContext* pRenderContext, IScene::Upda
     mCaptureScheduler.completeCaptures(frame.commands);
 }
 
-void LumenGI::runCapturePass(RenderContext* pRenderContext, const LumenCaptureFrame& frame)
+void LumenGIPass::runCapturePass(RenderContext* pRenderContext, const LumenCaptureFrame& frame)
 {
     FALCOR_ASSERT(mCapture.pState && mCapture.pVars && mCapture.pCards && mCapture.pDrawArgs);
     const uint32_t commandCount = (uint32_t)frame.commands.size();
@@ -1369,7 +1873,7 @@ void LumenGI::runCapturePass(RenderContext* pRenderContext, const LumenCaptureFr
     }
 }
 
-void LumenGI::createCaptureProgram()
+void LumenGIPass::createCaptureProgram()
 {
     FALCOR_ASSERT(mpScene && mpCardScene);
 
@@ -1419,7 +1923,7 @@ void LumenGI::createCaptureProgram()
         mCapture.pInstanceIDs = mpDevice->createBuffer(
             instanceCount * sizeof(uint32_t), ResourceBindFlags::Vertex, MemoryType::DeviceLocal, identity.data()
         );
-        mCapture.pInstanceIDs->setName("LumenGI::Capture::InstanceIDs"); // R32Uint identity map, scene-scoped.
+        mCapture.pInstanceIDs->setName("LumenGIPass::Capture::InstanceIDs"); // R32Uint identity map, scene-scoped.
 
         ref<VertexLayout> pLayout = VertexLayout::create();
         ref<VertexBufferLayout> pStaticLayout = VertexBufferLayout::create();
@@ -1458,7 +1962,7 @@ void LumenGI::createCaptureProgram()
 // S3: Surface Cache direct lighting host (S3-B1)
 // ------------------------------------------------------------------------------------------
 
-uint32_t LumenGI::cacheLightingSamplesPerTexel() const
+uint32_t LumenGIPass::cacheLightingSamplesPerTexel() const
 {
     // LumenCacheLightingQuality mapping (LumenSurfaceCacheLightingData.slang):
     // Low/Medium/High/Reference -> 1/2/4/8 NEE draws per texel per technique.
@@ -1477,7 +1981,7 @@ uint32_t LumenGI::cacheLightingSamplesPerTexel() const
     }
 }
 
-uint32_t LumenGI::buildCacheLightingRenderData()
+uint32_t LumenGIPass::buildCacheLightingRenderData()
 {
     // Rebuild pageID -> cardIndex from the host card->page mirror (maintained from the
     // scheduler command stream in runSurfaceCacheCapture) plus the page cache residency and
@@ -1528,7 +2032,7 @@ uint32_t LumenGI::buildCacheLightingRenderData()
     return (uint32_t)mRenderListData.size();
 }
 
-void LumenGI::createCacheLightingProgram()
+void LumenGIPass::createCacheLightingProgram()
 {
     FALCOR_ASSERT(mpScene);
 
@@ -1546,7 +2050,7 @@ void LumenGI::createCacheLightingProgram()
     mCacheLighting.pPass = ComputePass::create(mpDevice, desc, defines, /*createVars=*/true);
 }
 
-void LumenGI::ensureCacheLightingResources(RenderContext* pRenderContext)
+void LumenGIPass::ensureCacheLightingResources(RenderContext* pRenderContext)
 {
     // Visibility/confidence atlas: R16F, atlas-lifetime (kept across scene changes like the
     // capture atlases; contents are re-written every dispatch).
@@ -1556,7 +2060,7 @@ void LumenGI::ensureCacheLightingResources(RenderContext* pRenderContext)
             mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::R16Float, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mCacheLighting.pVisibilityAtlas->setName("LumenGI::CacheLighting::VisibilityAtlas"); // R16F, atlas lifetime.
+        mCacheLighting.pVisibilityAtlas->setName("LumenGIPass::CacheLighting::VisibilityAtlas"); // R16F, atlas lifetime.
         pRenderContext->clearUAV(mCacheLighting.pVisibilityAtlas->getUAV().get(), float4(0.f));
     }
 
@@ -1568,14 +2072,14 @@ void LumenGI::ensureCacheLightingResources(RenderContext* pRenderContext)
         mCacheLighting.pPageToCard = mpDevice->createStructuredBuffer(
             sizeof(uint32_t), pageCount + 1, ResourceBindFlags::ShaderResource
         );
-        mCacheLighting.pPageToCard->setName("LumenGI::CacheLighting::PageToCard"); // gLumenPageToCard, uint32, atlas lifetime.
+        mCacheLighting.pPageToCard->setName("LumenGIPass::CacheLighting::PageToCard"); // gLumenPageToCard, uint32, atlas lifetime.
     }
     if (!mCacheLighting.pRenderList || mCacheLighting.pRenderList->getElementCount() != pageCount)
     {
         mCacheLighting.pRenderList = mpDevice->createStructuredBuffer(
             sizeof(uint32_t), pageCount, ResourceBindFlags::ShaderResource
         );
-        mCacheLighting.pRenderList->setName("LumenGI::CacheLighting::RenderList"); // gLumenRenderList, uint32, atlas lifetime.
+        mCacheLighting.pRenderList->setName("LumenGIPass::CacheLighting::RenderList"); // gLumenRenderList, uint32, atlas lifetime.
     }
 
     // Independent cache-lighting counters (see the header comment: separate from the trace
@@ -1586,14 +2090,14 @@ void LumenGI::ensureCacheLightingResources(RenderContext* pRenderContext)
         mpCacheLightingCounters = mpDevice->createStructuredBuffer(
             sizeof(uint4), kCounterCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mpCacheLightingCounters->setName("LumenGI::CacheLighting::Counters");
+        mpCacheLightingCounters->setName("LumenGIPass::CacheLighting::Counters");
     }
     if (!mpCacheLightingCountersReadback)
     {
         mpCacheLightingCountersReadback = mpDevice->createStructuredBuffer(
             sizeof(uint4), kCounterCount, ResourceBindFlags::None, MemoryType::ReadBack
         );
-        mpCacheLightingCountersReadback->setName("LumenGI::CacheLighting::CountersReadback");
+        mpCacheLightingCountersReadback->setName("LumenGIPass::CacheLighting::CountersReadback");
     }
 
     // S3-B2 multi-bounce feedback resources: two indirect atlases (RGBA16F, same format as the
@@ -1610,7 +2114,7 @@ void LumenGI::ensureCacheLightingResources(RenderContext* pRenderContext)
                 ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
             );
             mCacheLighting.pIndirect[i]->setName(
-                std::string("LumenGI::CacheLighting::Indirect") + (i == 0 ? "A" : "B")
+                std::string("LumenGIPass::CacheLighting::Indirect") + (i == 0 ? "A" : "B")
             ); // RGBA16F, atlas lifetime, S3-B2 double buffer.
             pRenderContext->clearUAV(mCacheLighting.pIndirect[i]->getUAV().get(), float4(0.f));
         }
@@ -1621,7 +2125,7 @@ void LumenGI::ensureCacheLightingResources(RenderContext* pRenderContext)
             mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::R32Uint, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mCacheLighting.pBounceCount->setName("LumenGI::CacheLighting::BounceCount"); // R32Uint, atlas lifetime, S3-B2.
+        mCacheLighting.pBounceCount->setName("LumenGIPass::CacheLighting::BounceCount"); // R32Uint, atlas lifetime, S3-B2.
         pRenderContext->clearUAV(mCacheLighting.pBounceCount->getUAV().get(), uint4(0));
     }
 
@@ -1629,7 +2133,7 @@ void LumenGI::ensureCacheLightingResources(RenderContext* pRenderContext)
         createCacheLightingProgram();
 }
 
-void LumenGI::runCacheLighting(RenderContext* pRenderContext)
+void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
 {
     // Read back the previous dispatch's counters (one-frame lag, same as the trace path).
     if (mCacheLightingCounterReadbackPending && mpCacheLightingCountersReadback)
@@ -1777,7 +2281,7 @@ void LumenGI::runCacheLighting(RenderContext* pRenderContext)
     mLastCacheLightingPageCount = renderPageCount;
 }
 
-void LumenGI::exportCacheDirectRadiance(RenderContext* pRenderContext, const RenderData& renderData)
+void LumenGIPass::exportCacheDirectRadiance(RenderContext* pRenderContext, const RenderData& renderData)
 {
     const ref<Texture> pCacheDirect = renderData.getTexture(kCacheDirectRadiance);
     if (!pCacheDirect)
@@ -1798,12 +2302,12 @@ void LumenGI::exportCacheDirectRadiance(RenderContext* pRenderContext, const Ren
 // S4: hierarchical screen-space trace host (S4-A1)
 // ------------------------------------------------------------------------------------------
 
-void LumenGI::createHZBBuildProgram()
+void LumenGIPass::createHZBBuildProgram()
 {
     mScreenTrace.pHZBBuild = ComputePass::create(mpDevice, kHZBBuildShaderFile, "main");
 }
 
-void LumenGI::createScreenTraceProgram()
+void LumenGIPass::createScreenTraceProgram()
 {
     // The screen trace shader gates its inputs through the is_valid_g* defines (default 0);
     // all three resources are bound every dispatch, so all three are forced on.
@@ -1814,7 +2318,7 @@ void LumenGI::createScreenTraceProgram()
     mScreenTrace.pTrace = ComputePass::create(mpDevice, kScreenTraceShaderFile, "main", defines);
 }
 
-void LumenGI::ensureScreenTraceResources(RenderContext* pRenderContext)
+void LumenGIPass::ensureScreenTraceResources(RenderContext* pRenderContext)
 {
     if (any(mFrameDim == uint2(0u, 0u)))
         return;
@@ -1841,7 +2345,7 @@ void LumenGI::ensureScreenTraceResources(RenderContext* pRenderContext)
                 ResourceFormat::R32Float, 1, 1, nullptr,
                 ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
             );
-            pLevel->setName("LumenGI::ScreenTrace::HZB::" + std::to_string(mip)); // R32F level, SRV + UAV.
+            pLevel->setName("LumenGIPass::ScreenTrace::HZB::" + std::to_string(mip)); // R32F level, SRV + UAV.
             mScreenTrace.pHZBMips.push_back(pLevel);
         }
     }
@@ -1860,13 +2364,13 @@ void LumenGI::ensureScreenTraceResources(RenderContext* pRenderContext)
             mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA32Float, 1, 1, data.data(),
             ResourceBindFlags::ShaderResource
         );
-        mScreenTrace.pRayDirection->setName("LumenGI::ScreenTrace::RayDirection"); // RGBA32F view-space dir, per-resize.
+        mScreenTrace.pRayDirection->setName("LumenGIPass::ScreenTrace::RayDirection"); // RGBA32F view-space dir, per-resize.
     }
 
     mScreenTrace.resourceDim = mFrameDim;
 }
 
-void LumenGI::runScreenTrace(RenderContext* pRenderContext, const RenderData& renderData)
+void LumenGIPass::runScreenTrace(RenderContext* pRenderContext, const RenderData& renderData)
 {
     const ref<Texture> pLinearZ = renderData.getTexture("linearZ");
     const ref<Texture> pResult = renderData.getTexture("screenTrace");
@@ -1942,7 +2446,7 @@ void LumenGI::runScreenTrace(RenderContext* pRenderContext, const RenderData& re
 // S4.2: screen probe gather host (S4-A2/B2)
 // ------------------------------------------------------------------------------------------
 
-void LumenGI::createScreenProbePrograms()
+void LumenGIPass::createScreenProbePrograms()
 {
     FALCOR_ASSERT(mpScene);
 
@@ -1982,7 +2486,7 @@ void LumenGI::createScreenProbePrograms()
     mScreenProbes.pInterpolate = createProbeCompute(kScreenProbeInterpolateShaderFile, "main");
 }
 
-void LumenGI::ensureScreenProbeResources(RenderContext* pRenderContext)
+void LumenGIPass::ensureScreenProbeResources(RenderContext* pRenderContext)
 {
     if (any(mFrameDim == uint2(0u, 0u)))
         return;
@@ -2004,21 +2508,21 @@ void LumenGI::ensureScreenProbeResources(RenderContext* pRenderContext)
             sizeof(LumenScreenProbe::Meta), probeCount,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mScreenProbes.pMetadata->setName("LumenGI::ScreenProbe::Metadata"); // LumenScreenProbe::Meta, 64 B, frame-scoped.
+        mScreenProbes.pMetadata->setName("LumenGIPass::ScreenProbe::Metadata"); // LumenScreenProbe::Meta, 64 B, frame-scoped.
         mScreenProbes.pHitRecords = mpDevice->createStructuredBuffer(
             sizeof(LumenScreenProbe::Hit), (size_t)probeCount * LumenScreenProbe::kMaxDirectionsPerProbe,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mScreenProbes.pHitRecords->setName("LumenGI::ScreenProbe::HitRecords"); // LumenScreenProbe::Hit, 32 B, frame-scoped.
+        mScreenProbes.pHitRecords->setName("LumenGIPass::ScreenProbe::HitRecords"); // LumenScreenProbe::Hit, 32 B, frame-scoped.
         mScreenProbes.pCounters = mpDevice->createStructuredBuffer(
             sizeof(LumenScreenProbe::Counters), 1u,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mScreenProbes.pCounters->setName("LumenGI::ScreenProbe::Counters");
+        mScreenProbes.pCounters->setName("LumenGIPass::ScreenProbe::Counters");
         mScreenProbes.pCountersReadback = mpDevice->createStructuredBuffer(
             sizeof(LumenScreenProbe::Counters), 1u, ResourceBindFlags::None, MemoryType::ReadBack
         );
-        mScreenProbes.pCountersReadback->setName("LumenGI::ScreenProbe::CountersReadback");
+        mScreenProbes.pCountersReadback->setName("LumenGIPass::ScreenProbe::CountersReadback");
 
         // Native floor-halved R32F mip chain for the probe march (gHZBMips): a real D3D12 mip
         // chain is floor-sized, and the probe shader indexes it with explicit mip levels
@@ -2028,7 +2532,7 @@ void LumenGI::ensureScreenProbeResources(RenderContext* pRenderContext)
             mFrameDim.x, mFrameDim.y, ResourceFormat::R32Float, 1, hzbMipCount, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mScreenProbes.pHZBNative->setName("LumenGI::ScreenProbe::HZBNative"); // R32F native mip chain, frame-scoped.
+        mScreenProbes.pHZBNative->setName("LumenGIPass::ScreenProbe::HZBNative"); // R32F native mip chain, frame-scoped.
 
         // S4.3 internal integrated-probe radiance (gProbeRadiance for the integrate/interpolate
         // passes). Full-res RGBA16F, sparse writes at the probe tile-center texel: RGB = incident
@@ -2038,7 +2542,7 @@ void LumenGI::ensureScreenProbeResources(RenderContext* pRenderContext)
             mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
-        mScreenProbes.pRadiance->setName("LumenGI::ScreenProbe::RadianceInternal"); // RGBA16F, frame-scoped.
+        mScreenProbes.pRadiance->setName("LumenGIPass::ScreenProbe::RadianceInternal"); // RGBA16F, frame-scoped.
 
         // Prefill the static probe positions (tile centers). Everything else is zero
         // (the update pass resamples active/depth/normal/worldPos every frame).
@@ -2058,7 +2562,7 @@ void LumenGI::ensureScreenProbeResources(RenderContext* pRenderContext)
     }
 }
 
-void LumenGI::readbackScreenProbeCounters(RenderContext* pRenderContext)
+void LumenGIPass::readbackScreenProbeCounters(RenderContext* pRenderContext)
 {
     if (!mScreenProbes.counterReadbackPending || !mScreenProbes.pCountersReadback)
         return;
@@ -2085,7 +2589,7 @@ void LumenGI::readbackScreenProbeCounters(RenderContext* pRenderContext)
     mScreenProbes.counterReadbackPending = false;
 }
 
-void LumenGI::runScreenProbeTrace(RenderContext* pRenderContext, const RenderData& renderData)
+void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const RenderData& renderData)
 {
     if (!mpScene)
         return;
@@ -2360,7 +2864,7 @@ void LumenGI::runScreenProbeTrace(RenderContext* pRenderContext, const RenderDat
 // S5: temporal filter host (S5-A1 history double buffer + S5-B1 pass wiring)
 // ------------------------------------------------------------------------------------------
 
-void LumenGI::createTemporalFilterProgram()
+void LumenGIPass::createTemporalFilterProgram()
 {
     // S5-B1 temporal filter (LumenTemporalFilter.cs.slang, entry "main"). The REQUIRED inputs are
     // always bound every dispatch (gLinearZ / gCurrent / gMotionVector / gPrevDepth / gPrevGI /
@@ -2383,7 +2887,7 @@ void LumenGI::createTemporalFilterProgram()
     mTemporalFilter.pFilter = ComputePass::create(mpDevice, kTemporalFilterShaderFile, "main", defines);
 }
 
-void LumenGI::ensureTemporalFilterResources(RenderContext* pRenderContext)
+void LumenGIPass::ensureTemporalFilterResources(RenderContext* pRenderContext)
 {
     if (any(mFrameDim == uint2(0u, 0u)))
         return;
@@ -2404,7 +2908,7 @@ void LumenGI::ensureTemporalFilterResources(RenderContext* pRenderContext)
                 ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
             );
             mTemporalFilter.pHistory[i]->setName(
-                "LumenGI::TemporalFilter::History" + std::string(i == 0 ? "A" : "B")
+                "LumenGIPass::TemporalFilter::History" + std::string(i == 0 ? "A" : "B")
             ); // RGBA16F (RGB = irradiance, A = history length), frame-scoped, S5-A1 double buffer.
             pRenderContext->clearUAV(mTemporalFilter.pHistory[i]->getUAV().get(), float4(0.f));
         }
@@ -2415,7 +2919,7 @@ void LumenGI::ensureTemporalFilterResources(RenderContext* pRenderContext)
             mFrameDim.x, mFrameDim.y, ResourceFormat::R32Float, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess | ResourceBindFlags::RenderTarget
         );
-        mTemporalFilter.pPrevDepth->setName("LumenGI::TemporalFilter::PrevDepth"); // R32F, frame-scoped.
+        mTemporalFilter.pPrevDepth->setName("LumenGIPass::TemporalFilter::PrevDepth"); // R32F, frame-scoped.
         pRenderContext->clearUAV(mTemporalFilter.pPrevDepth->getUAV().get(), float4(0.f));
 
         mTemporalFilter.historyCurrIndex = 0;
@@ -2424,7 +2928,7 @@ void LumenGI::ensureTemporalFilterResources(RenderContext* pRenderContext)
     }
 }
 
-void LumenGI::runTemporalFilter(RenderContext* pRenderContext, const RenderData& renderData)
+void LumenGIPass::runTemporalFilter(RenderContext* pRenderContext, const RenderData& renderData)
 {
     // Allocation gates: gCurrent is the S4.3 interpolate graph output (only produced when the
     // probe path ran), gTemporalOutput is the S5 graph output this pass feeds. The graph channel
@@ -2532,7 +3036,7 @@ void LumenGI::runTemporalFilter(RenderContext* pRenderContext, const RenderData&
 // S5: spatial filter host (S5-B2 pass wiring + S5-A2 reconstruction CB)
 // ------------------------------------------------------------------------------------------
 
-void LumenGI::createSpatialFilterProgram()
+void LumenGIPass::createSpatialFilterProgram()
 {
     // S5-B2 variance-guided spatial filter (LumenSpatialFilter.cs.slang, entry "main"). The
     // REQUIRED resources (gGIInput / gLinearZ / gFilteredOutput) are always bound every dispatch,
@@ -2555,13 +3059,13 @@ void LumenGI::createSpatialFilterProgram()
     mSpatialFilter.pFilter = ComputePass::create(mpDevice, kSpatialFilterShaderFile, "main", defines);
 }
 
-void LumenGI::ensureSpatialFilterResources(RenderContext* pRenderContext)
+void LumenGIPass::ensureSpatialFilterResources(RenderContext* pRenderContext)
 {
     if (!mSpatialFilter.pFilter)
         createSpatialFilterProgram();
 }
 
-void LumenGI::runSpatialFilter(RenderContext* pRenderContext, const RenderData& renderData)
+void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderData& renderData)
 {
     // Allocation gates: gGIInput is the S5-B1 temporalFiltered graph output (the S5 main output),
     // gFilteredOutput is the S5-B2 spatialFiltered graph output this pass feeds. The graph channel
@@ -2669,4 +3173,672 @@ void LumenGI::runSpatialFilter(RenderContext* pRenderContext, const RenderData& 
         ((mFrameDim.y + 7u) / 8u) * 8u,
         1
     );
+}
+
+// =====================================================================================
+// S6: Mesh SDF + Global Distance Field host implementation
+// -------------------------------------------------------------------------------------
+// Data pipeline (S6-A):  scene static instances -> LumenMeshSDFScene (S6-A2 disk cache ->
+// builder -> volume -> atlas -> instance table) -> GPU atlas textures/buffers.
+// GDF compose (S6-B3):     LumenGlobalDistanceField clipmap -> dirty regions -> instance list ->
+//                          LumenGDFCompose.cs.slang dispatch into the GDF clipmap textures.
+// Sphere trace (S6-B4):    LumenGDFTrace.cs.slang over the screen; TraceMode::MeshSDF writes the
+//                          S1 outputs (primary software path), Hybrid writes the gdfTrace channel.
+// =====================================================================================
+
+void LumenGIPass::invalidateMeshSDF()
+{
+    mSDF = {};
+}
+
+void LumenGIPass::ensureMeshSDFScene()
+{
+    namespace s6 = LumenGI::MeshSDF;
+    namespace s6scene = LumenGI::MeshSDF::Scene;
+    if (mSDF.pScene || !mpScene)
+        return;
+
+    const std::filesystem::path cacheDir =
+        mMeshSDFCacheDir.empty() ? s6::Cache::defaultCacheDir() : mMeshSDFCacheDir;
+
+    auto pScene = std::make_unique<s6scene::LumenMeshSDFScene>(
+        cacheDir, mMeshSDFBudgetBytes, 0, s6::kLumenMeshSDFAtlasDefaultMinResidencyFrames
+    );
+
+    // Builder selection: external MeshSDFBuilder.exe when configured and present (runs on a box OBJ
+    // derived from the mesh's padded object AABB), otherwise the built-in analytic box-SDF builder.
+    if (!mMeshSDFBuilderPath.empty() && std::filesystem::exists(mMeshSDFBuilderPath))
+    {
+        const std::filesystem::path exe = mMeshSDFBuilderPath;
+        pScene->setBuilder(
+            [exe](const s6scene::LumenMeshSDFSceneMeshDesc& mesh, const std::filesystem::path& target, std::string& err) {
+                return s6ExternalMeshSDFBuilder(exe, mesh, target, err);
+            }
+        );
+    }
+    else
+    {
+        pScene->setBuilder(&s6BoxSDFBuilder);
+    }
+
+    // Register static triangle-mesh instances (mirrors LumenCardScene::rebuild(): instance loop,
+    // global-matrix transform, static-only filter). Non-triangle, dynamic or missing-transform
+    // instances are skipped with a warning (the S6 "unsupported geometry falls back" rule).
+    const Falcor::AnimationController* pAnimationController = mpScene->getAnimationController();
+    std::vector<Falcor::float4x4> emptyMatrices;
+    const std::vector<Falcor::float4x4>& globalMatrices =
+        pAnimationController ? pAnimationController->getGlobalMatrices() : emptyMatrices;
+
+    const uint32_t res = meshSDFResolution();
+    const s6::Quality quality = meshSDFQuality();
+    const uint32_t instanceCount = mpScene->getGeometryInstanceCount();
+    std::string err;
+
+    std::vector<uint32_t> handles;
+    std::vector<s6scene::LumenMeshSDFSceneMeshDesc> descs;
+    handles.reserve(instanceCount);
+    descs.reserve(instanceCount);
+
+    for (uint32_t si = 0; si < instanceCount; ++si)
+    {
+        const Falcor::GeometryInstanceData& inst = mpScene->getGeometryInstance(si);
+        if (inst.getType() != Falcor::Scene::GeometryType::TriangleMesh &&
+            inst.getType() != Falcor::Scene::GeometryType::DisplacedTriangleMesh)
+            continue;
+        if (inst.globalMatrixID >= globalMatrices.size())
+            continue;
+        if (inst.isDynamic())
+            continue;
+        const Falcor::MeshDesc& mesh = mpScene->getMesh(Falcor::MeshID::fromSlang(inst.geometryID));
+        if (mesh.isDynamic())
+            continue;
+        const Falcor::AABB oabb = mpScene->getMeshBounds(inst.geometryID);
+        if (!oabb.valid() || !std::isfinite(oabb.minPoint.x) || !std::isfinite(oabb.maxPoint.x))
+            continue;
+
+        s6scene::LumenMeshSDFSceneMeshDesc desc;
+        desc.meshContentHash = s6MeshContentHash(inst.geometryID, oabb, mesh.vertexCount, mesh.indexCount);
+        desc.cacheParams.resolution = {res, res, res};
+        desc.cacheParams.quality = quality;
+        desc.cacheParams.pooling = s6::MipPooling::MinAbs;
+        desc.cacheParams.gridBounds = s6PaddedGridBounds(oabb, res, mMeshSDFPadding);
+
+        s6::LumenMeshSDFAtlasInstanceDesc transform;
+        const Falcor::float4x4& t = globalMatrices[inst.globalMatrixID];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+                transform.forwardLinear[r * 3 + c] = t[r][c];
+        transform.forwardTranslation = {t[0][3], t[1][3], t[2][3]};
+
+        // Static meshes feed BOTH the camera-centered dynamic level 0 AND the origin-anchored
+        // static levels (the mesh/GDF layer bits coincide; see LumenMeshSDFScene.h). Dynamic
+        // instances are excluded, so the static far field can never be polluted by them.
+        const uint32_t handle = pScene->addInstance(desc, transform, s6::kLumenMeshSDFLayerMaskAll, err);
+        if (handle == s6::kLumenMeshSDFAtlasInvalidID)
+        {
+            logWarning("LumenGI S6: skipped scene instance {} ({})", si, err);
+            continue;
+        }
+        handles.push_back(handle);
+        descs.push_back(desc);
+    }
+
+    const Falcor::float3 camPos = mpScene->getCamera()->getPosition();
+    const float cam[3] = {camPos.x, camPos.y, camPos.z};
+    pScene->setCamera(cam);
+
+    mSDF.pScene = std::move(pScene);
+    mSDF.sceneInstanceHandles = std::move(handles);
+    mSDF.sceneMeshDescs = std::move(descs);
+    mSDF.atlasPagesPerSide = mSDF.pScene->instanceTable().atlas().pagesPerSide();
+    mSDF.needsFullCompose = true;
+    mSDF.gdfInstanceVersion = 0;
+    mSDF.sceneStats = mSDF.pScene->getStats();
+
+    rebuildMeshSDFAtlasImages();
+}
+
+void LumenGIPass::rebuildMeshSDFAtlasImages()
+{
+    namespace s6 = LumenGI::MeshSDF;
+    namespace s6scene = LumenGI::MeshSDF::Scene;
+    if (!mSDF.pScene)
+        return;
+
+    s6::LumenMeshSDFInstanceTable& table = mSDF.pScene->instanceTable();
+    s6::LumenMeshSDFAtlas& atlas = table.atlas();
+    const std::vector<s6::LumenMeshSDFAtlasInstance>& instTable = atlas.getInstanceTable();
+    const std::vector<uint32_t>& pageTable = atlas.getPageTableBuffer();
+    const std::vector<s6::LumenMeshSDFVolumeDescriptor>& volumes = atlas.getVolumeDescriptors();
+
+    const uint32_t meshCount = static_cast<uint32_t>(volumes.size());
+    mSDF.meshMipFloats.assign(meshCount, {});
+    std::vector<bool> parsed(meshCount, false);
+
+    const uint32_t P = std::max<uint32_t>(mSDF.atlasPagesPerSide, 1u);
+    const size_t cap = size_t(P) * P * P;
+    constexpr size_t pageVox = size_t(s6::kLumenMeshSDFAtlasPageSize) * s6::kLumenMeshSDFAtlasPageSize *
+                               s6::kLumenMeshSDFAtlasPageSize;
+    const size_t atlasVox = cap * pageVox;
+    mSDF.fineImage.assign(atlasVox, 0.f);
+    mSDF.coarseImage.assign(atlasVox, 0.f);
+
+    // Parse each unique mesh volume from the disk cache + reference-convert to mip floats
+    // (the exact encoding the atlas textures hold: fine = raw float, coarse = clamp(d/R,-1,1)).
+    for (size_t h = 0; h < mSDF.sceneInstanceHandles.size(); ++h)
+    {
+        const uint32_t handle = mSDF.sceneInstanceHandles[h];
+        const s6::LumenMeshSDFInstanceAtlasMapping map = mSDF.pScene->instanceToAtlas(handle);
+        if (map.meshID == s6::kLumenMeshSDFAtlasInvalidID || map.meshID >= meshCount)
+            continue;
+        if (parsed[map.meshID])
+            continue;
+        parsed[map.meshID] = true;
+
+        const s6scene::LumenMeshSDFSceneMeshDesc& desc = mSDF.sceneMeshDescs[h];
+        const std::string key = s6scene::LumenMeshSDFScene::meshKey(desc);
+        const std::filesystem::path path = mSDF.pScene->cacheDirectory() / (key + ".msdf");
+        s6::MSDFParseResult parsedVol;
+        std::string perr;
+        if (!s6::Cache::findCached(path, parsedVol, perr))
+        {
+            logWarning("LumenGI S6: cannot parse cached volume {} ({})", path.string(), perr);
+            continue;
+        }
+        s6::BuildParams bp;
+        bp.quality = desc.cacheParams.quality;
+        bp.pooling = desc.cacheParams.pooling;
+        bp.meshContentHash = desc.meshContentHash;
+        s6scene::LumenMeshSDFConvertedVolume cv;
+        std::string cerr;
+        if (!s6scene::referenceConverter(parsedVol, bp, cv, cerr))
+        {
+            logWarning("LumenGI S6: reference conversion failed for {} ({})", path.string(), cerr);
+            continue;
+        }
+        mSDF.meshMipFloats[map.meshID] = std::move(cv.mipFloats);
+    }
+
+    // Tile into the host atlas images (GPU layout: page slot s -> brick origin
+    // (s % P, (s / P) % P, s / (P*P)) * pageSize; matches the fixed atlas sampler).
+    for (size_t i = 0; i < instTable.size(); ++i)
+    {
+        const s6::LumenMeshSDFAtlasInstance& inst = instTable[i];
+        if (inst.meshID == s6::kLumenMeshSDFAtlasInvalidID || inst.meshID >= meshCount)
+            continue;
+        const auto& mips = mSDF.meshMipFloats[inst.meshID];
+        if (mips.empty())
+            continue;
+        const s6::LumenMeshSDFVolumeDescriptor& vd = volumes[inst.meshID];
+        const uint32_t mipCount = std::min<uint32_t>(vd.mipCount, static_cast<uint32_t>(mips.size()));
+        for (uint32_t m = 0; m < mipCount; ++m)
+        {
+            const uint32_t baseSlot = pageTable[i * s6::kLumenMeshSDFMaxMipCount + m];
+            if (baseSlot == s6::kLumenMeshSDFNotResident)
+                continue;
+            const bool fine = (m == 0 && vd.formatMip0 == static_cast<uint32_t>(s6::VolumeFormat::R16Float));
+            std::vector<float>& image = fine ? mSDF.fineImage : mSDF.coarseImage;
+            s6TileMipIntoAtlasImage(
+                mips[m], std::array<uint32_t, 3>{vd.resolution[0], vd.resolution[1], vd.resolution[2]}, m, baseSlot, P, image
+            );
+        }
+    }
+
+    ++mSDF.atlasUploadVersion;
+}
+
+void LumenGIPass::ensureGDFResources(RenderContext* pRenderContext)
+{
+    namespace s6 = LumenGI::MeshSDF;
+    namespace s6gdf = LumenGI::GlobalDistanceField;
+    if (!mSDF.pScene)
+        return;
+
+    // (Re)build the CPU clipmap when the config changed.
+    if (!mSDF.gdf || mSDF.gdf->getLevelCount() != mGDFLevelCount || mSDF.gdf->getResolution() != mGDFResolution)
+    {
+        mSDF.gdf = std::make_unique<s6gdf::LumenGlobalDistanceField>(mGDFBaseExtent, mGDFLevelCount, mGDFResolution);
+        mSDF.needsFullCompose = true;
+    }
+
+    const uint32_t levelCount = mSDF.gdf->getLevelCount();
+    const uint32_t res = mSDF.gdf->getResolution();
+
+    // GDF clipmap textures. ALL levels use R32Float: the compose shader binds gGDFLevels as a
+    // single RWTexture3D<float>[kLumenGDFMaxLevels] array, which requires every element to share
+    // one format AND a format the untyped-float UAV type accepts (R32F is the Falcor-tested one
+    // for float UAV arrays). The encode/decode is then the identity (raw world distance).
+    if (mSDF.levels.size() != levelCount || (!mSDF.levels.empty() && mSDF.levels[0]->getWidth() != res))
+    {
+        mSDF.levels.clear();
+        for (uint32_t m = 0; m < levelCount; ++m)
+        {
+            auto pTex = mpDevice->createTexture3D(
+                res, res, res, ResourceFormat::R32Float, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+            pTex->setName("LumenGI::GDFLevel" + std::to_string(m));
+            mSDF.levels.push_back(pTex);
+        }
+        mSDF.needsFullCompose = true;
+    }
+
+    if (!mSDF.pLevelTable)
+        mSDF.pLevelTable = mpDevice->createStructuredBuffer(
+            sizeof(LumenGDFLevelParamsHost), levelCount, ResourceBindFlags::ShaderResource
+        );
+    if (!mSDF.pGDFInstances)
+        mSDF.pGDFInstances = mpDevice->createStructuredBuffer(
+            sizeof(LumenGI::MeshSDF::Scene::LumenMeshSDFGDFInstance), s6::kLumenMeshSDFAtlasMaxInstances,
+            ResourceBindFlags::ShaderResource
+        );
+    if (!mSDF.pDirtyRegions)
+        mSDF.pDirtyRegions = mpDevice->createStructuredBuffer(
+            sizeof(LumenGDFDirtyRegionHost), 64, ResourceBindFlags::ShaderResource
+        );
+    if (!mSDF.pTraceStats)
+    {
+        mSDF.pTraceStats = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), kGDFTraceStatCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mSDF.pTraceStatsReadback = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), kGDFTraceStatCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        pRenderContext->clearUAV(mSDF.pTraceStats->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mSDF.pTraceStatsReadback->getUAV().get(), uint4(0));
+    }
+
+    // Mesh SDF atlas GPU mirror (fine = R16Float mip0 pages, coarse = R8Snorm mips >= 1).
+    const uint32_t P = std::max<uint32_t>(mSDF.atlasPagesPerSide, 1u);
+    const uint32_t texels = P * s6::kLumenMeshSDFAtlasPageSize;
+    if (!mSDF.pFineAtlas || mSDF.pFineAtlas->getWidth() != texels)
+    {
+        mSDF.pFineAtlas = mpDevice->createTexture3D(
+            texels, texels, texels, ResourceFormat::R16Float, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mSDF.pFineAtlas->setName("LumenGIPass::MSDFFineAtlas");
+        mSDF.pCoarseAtlas = mpDevice->createTexture3D(
+            texels, texels, texels, ResourceFormat::R8Snorm, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mSDF.pCoarseAtlas->setName("LumenGIPass::MSDFCoarseAtlas");
+    }
+    if (!mSDF.pPageTable)
+        mSDF.pPageTable = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), s6::kLumenMeshSDFAtlasMaxInstances * s6::kLumenMeshSDFMaxMipCount,
+            ResourceBindFlags::ShaderResource
+        );
+    if (!mSDF.pVolumes)
+        mSDF.pVolumes = mpDevice->createStructuredBuffer(
+            sizeof(s6::LumenMeshSDFVolumeDescriptor), 256, ResourceBindFlags::ShaderResource
+        );
+    if (!mSDF.pAtlasInstances)
+        mSDF.pAtlasInstances = mpDevice->createStructuredBuffer(
+            sizeof(s6::LumenMeshSDFAtlasInstance), s6::kLumenMeshSDFAtlasMaxInstances,
+            ResourceBindFlags::ShaderResource
+        );
+
+    // Compose pass (LumenGDFCompose.cs.slang, entry "main"). The trace pass is created lazily by
+    // runGDFSphereTrace because its is_valid defines depend on the graph channel allocation.
+    if (!mSDF.pCompose)
+        mSDF.pCompose = ComputePass::create(mpDevice, kGDFComposeShaderFile, "main", DefineList());
+
+    uploadMeshSDFAtlas(pRenderContext);
+}
+
+void LumenGIPass::uploadMeshSDFAtlas(RenderContext* pRenderContext)
+{
+    namespace s6 = LumenGI::MeshSDF;
+    if (!mSDF.pScene || !mSDF.pFineAtlas)
+        return;
+    if (mSDF.atlasUploadVersion == mSDF.uploadedAtlasVersion)
+        return;
+
+    s6::LumenMeshSDFAtlas& atlas = mSDF.pScene->instanceTable().atlas();
+
+    // Upload the host atlas images (fine = R16Float f16 bits, coarse = R8Snorm int8 codes).
+    if (!mSDF.fineImage.empty())
+    {
+        std::vector<uint16_t> f16(mSDF.fineImage.size());
+        for (size_t i = 0; i < mSDF.fineImage.size(); ++i)
+            f16[i] = Falcor::math::float32ToFloat16(mSDF.fineImage[i]);
+        pRenderContext->updateTextureData(mSDF.pFineAtlas.get(), f16.data());
+    }
+    if (!mSDF.coarseImage.empty())
+    {
+        std::vector<int8_t> codes;
+        s6CoarseImageToCodes(mSDF.coarseImage, codes);
+        pRenderContext->updateTextureData(mSDF.pCoarseAtlas.get(), codes.data());
+    }
+
+    // Upload the page table, volume descriptors and the atlas instance table.
+    const std::vector<uint32_t>& pageTable = atlas.getPageTableBuffer();
+    if (!pageTable.empty())
+        pRenderContext->updateBuffer(mSDF.pPageTable.get(), pageTable.data(), 0, pageTable.size() * sizeof(uint32_t));
+    const std::vector<s6::LumenMeshSDFVolumeDescriptor>& volumes = atlas.getVolumeDescriptors();
+    if (!volumes.empty())
+        pRenderContext->updateBuffer(
+            mSDF.pVolumes.get(), volumes.data(), 0, volumes.size() * sizeof(s6::LumenMeshSDFVolumeDescriptor)
+        );
+    const std::vector<s6::LumenMeshSDFAtlasInstance>& instTable = atlas.getInstanceTable();
+    if (!instTable.empty())
+        pRenderContext->updateBuffer(
+            mSDF.pAtlasInstances.get(), instTable.data(), 0, instTable.size() * sizeof(s6::LumenMeshSDFAtlasInstance)
+        );
+
+    mSDF.uploadedAtlasVersion = mSDF.atlasUploadVersion;
+}
+
+void LumenGIPass::runGDFCompose(RenderContext* pRenderContext)
+{
+    namespace s6 = LumenGI::MeshSDF;
+    namespace s6scene = LumenGI::MeshSDF::Scene;
+    namespace s6gdf = LumenGI::GlobalDistanceField;
+    if (!mSDF.pScene || !mSDF.gdf || !mSDF.pCompose)
+        return;
+
+    // S6-in-progress guard: the compose pass currently reads the mesh-SDF atlas resources
+    // (gFineAtlas / gCoarseAtlas / gPageTable / gVolumes / gInstances) that the host wiring
+    // does not create yet. Dispatching with them unbound aborts with D3D12 E_INVALIDARG.
+    // Skip the dispatch (and the dependent trace) until the full S6 data pipeline is wired.
+    if (!mSDF.pFineAtlas || !mSDF.pCoarseAtlas || !mSDF.pPageTable || !mSDF.pVolumes || !mSDF.pAtlasInstances)
+    {
+        logWarning("LumenGI: GDF compose skipped (mesh-SDF atlas resources not wired yet; S6 integration pending).");
+        return;
+    }
+
+    // Push the camera anchor into the clipmap (scroll bookkeeping; static levels never scroll).
+    const Falcor::float3 camPos = mpScene->getCamera()->getPosition();
+    mSDF.gdf->setCamera(s6gdf::float3(camPos.x, camPos.y, camPos.z));
+    const float cam[3] = {camPos.x, camPos.y, camPos.z};
+    mSDF.pScene->setCamera(cam);
+
+    // GDF instance list (resident instances; the compose filter layer = All).
+    const std::vector<s6scene::LumenMeshSDFGDFInstance> gdfInstances =
+        mSDF.pScene->buildGDFInstanceList(s6::kLumenMeshSDFLayerMaskAll);
+
+    // Dirty regions: full-level compose on the first frame / instance-list change, otherwise the
+    // scroll slabs (added + removed) of the dynamic level only.
+    const uint32_t R = mSDF.gdf->getResolution();
+    const uint32_t levelCount = mSDF.gdf->getLevelCount();
+    std::vector<LumenGDFDirtyRegionHost> regions;
+    if (mSDF.needsFullCompose)
+    {
+        regions.reserve(levelCount);
+        for (uint32_t level = 0; level < levelCount; ++level)
+        {
+            LumenGDFDirtyRegionHost r;
+            r.level = level;
+            r.axis = 0xFFFFFFFFu;
+            r.min[0] = r.min[1] = r.min[2] = 0;
+            r.max[0] = r.max[1] = r.max[2] = static_cast<int32_t>(R - 1u);
+            r.flags = kLumenGDFDirtyFlagAdded;
+            regions.push_back(r);
+        }
+        mSDF.needsFullCompose = false;
+    }
+    else
+    {
+        for (uint32_t level = 0; level < levelCount; ++level)
+        {
+            for (const s6gdf::VoxelRange& vr : mSDF.gdf->dirtyRegions(level))
+            {
+                LumenGDFDirtyRegionHost r;
+                r.level = level;
+                r.axis = static_cast<uint32_t>(vr.axis);
+                r.min[0] = vr.min.x;
+                r.min[1] = vr.min.y;
+                r.min[2] = vr.min.z;
+                r.max[0] = vr.max.x;
+                r.max[1] = vr.max.y;
+                r.max[2] = vr.max.z;
+                r.flags = vr.added ? kLumenGDFDirtyFlagAdded : kLumenGDFDirtyFlagRemoved;
+                regions.push_back(r);
+            }
+            for (const s6gdf::VoxelRange& vr : mSDF.gdf->removedRegions(level))
+            {
+                LumenGDFDirtyRegionHost r;
+                r.level = level;
+                r.axis = static_cast<uint32_t>(vr.axis);
+                r.min[0] = vr.min.x;
+                r.min[1] = vr.min.y;
+                r.min[2] = vr.min.z;
+                r.max[0] = vr.max.x;
+                r.max[1] = vr.max.y;
+                r.max[2] = vr.max.z;
+                r.flags = kLumenGDFDirtyFlagRemoved;
+                regions.push_back(r);
+            }
+        }
+    }
+
+    // Level table (LumenGDFLevelParams per level).
+    std::vector<LumenGDFLevelParamsHost> levelTable(levelCount);
+    for (uint32_t m = 0; m < levelCount; ++m)
+    {
+        const s6gdf::LumenGDFLevel& lvl = mSDF.gdf->getLevel(m);
+        levelTable[m].resolution = lvl.resolution;
+        levelTable[m].format = static_cast<uint32_t>(s6::VolumeFormat::R16Float); // homogeneous R16Float clipmap (see ensureGDFResources).
+        levelTable[m].worldExtent = lvl.worldExtent;
+        levelTable[m].voxelSize = lvl.voxelSize;
+        const float emptyDist = std::max(mGDFEmptyDistanceScale * lvl.voxelSize, 1e-6f);
+        levelTable[m].emptyDistance = emptyDist;
+        levelTable[m].quantRange = 0.f; // R16Float codec is the identity; no R8Snorm scale.
+    }
+
+    // Upload the small host buffers.
+    if (!levelTable.empty())
+        pRenderContext->updateBuffer(
+            mSDF.pLevelTable.get(), levelTable.data(), 0, levelTable.size() * sizeof(LumenGDFLevelParamsHost)
+        );
+    if (!gdfInstances.empty())
+        pRenderContext->updateBuffer(
+            mSDF.pGDFInstances.get(), gdfInstances.data(), 0,
+            gdfInstances.size() * sizeof(LumenGI::MeshSDF::Scene::LumenMeshSDFGDFInstance)
+        );
+    if (!regions.empty())
+        pRenderContext->updateBuffer(
+            mSDF.pDirtyRegions.get(), regions.data(), 0, regions.size() * sizeof(LumenGDFDirtyRegionHost)
+        );
+
+    if (regions.empty())
+        return; // no dirty voxels this frame (static camera, no instance changes).
+
+    // Bind the compose pass.
+    ShaderVar var = mSDF.pCompose->getRootVar();
+    ShaderVar cb = var["LumenGDFComposeCB"];
+    ShaderVar clip = cb["gClipmap"];
+    clip["cameraCenter"] = float3(mSDF.gdf->getCameraCenter().x, mSDF.gdf->getCameraCenter().y, mSDF.gdf->getCameraCenter().z);
+    clip["emptyDistance"] = 0.f; // levels set their own emptyDistance.
+    clip["levelCount"] = levelCount;
+    clip["dynamicLevelCount"] = s6gdf::kDynamicLevels;
+    clip["resolution"] = R;
+    clip["instanceCount"] = static_cast<uint32_t>(gdfInstances.size());
+    clip["dirtyRegionCount"] = static_cast<uint32_t>(regions.size());
+    clip["frameIndex"] = mFrameIndex;
+    const s6gdf::index3 scroll = mSDF.gdf->scrollFromCameraMove();
+    clip["scroll"] = int3(scroll.x, scroll.y, scroll.z);
+
+    // FIXME(S6-diag): strip to CB + UAV array only.
+    // var["gGDFLevelTable"] = mSDF.pLevelTable;
+    // var["gGDFInstances"] = mSDF.pGDFInstances;
+    // var["gGDFDirtyRegions"] = mSDF.pDirtyRegions;
+    // Fill EVERY slot of the gGDFLevels[kLumenGDFMaxLevels] array (repeat the last level) so no
+    // descriptor is left invalid: D3D12 validates the whole UAV array at dispatch and a null
+    // entry aborts with E_INVALIDARG. Only [0, levelCount) is ever accessed by the shader.
+    // Assignment (not setUav) is the Falcor binding contract for texture arrays (TextureArrays test).
+    for (uint32_t m = 0; m < kLumenGDFMaxLevelsHost; ++m)
+        var["gGDFLevels"][m] = mSDF.levels[std::min<uint32_t>(m, levelCount - 1u)];
+    // var["gFineAtlas"] = mSDF.pFineAtlas;
+    // var["gCoarseAtlas"] = mSDF.pCoarseAtlas;
+    // var["gPageTable"] = mSDF.pPageTable;
+    // var["gVolumes"] = mSDF.pVolumes;
+    // var["gInstances"] = mSDF.pAtlasInstances;
+    // var["gAtlasInstanceCount"] = mSDF.pScene->instanceTable().instanceCount();
+    // var["gAtlasVolumeCount"] = mSDF.pScene->instanceTable().meshCount();
+    // var["gAtlasPagesPerSide"] = mSDF.atlasPagesPerSide;
+
+    // Dispatch: (ceil(maxRegionDimsX / 8), regionCount, ceil(maxRegionDimsYZ / 8)) with
+    // numthreads(8, 1, 8); the shader bounds-checks every thread against its region.
+    uint32_t maxDx = 1u, maxDyz = 1u;
+    for (const LumenGDFDirtyRegionHost& r : regions)
+    {
+        const uint32_t dx = static_cast<uint32_t>(std::max(0, r.max[0] - r.min[0] + 1));
+        const uint32_t dyz = static_cast<uint32_t>(std::max(0, r.max[1] - r.min[1] + 1)) *
+                             static_cast<uint32_t>(std::max(0, r.max[2] - r.min[2] + 1));
+        maxDx = std::max(maxDx, std::max(dx, 1u));
+        maxDyz = std::max(maxDyz, std::max(dyz, 1u));
+    }
+    logInfo("S6 compose dispatch: x={} y={} z={} (regions={}, maxDx={}, maxDyz={})", ((maxDx + 7u) / 8u) * 8u, static_cast<uint32_t>(regions.size()), ((maxDyz + 7u) / 8u) * 8u, regions.size(), maxDx, maxDyz);
+    // FIXME(S6-diag): minimal dispatch to isolate E_INVALIDARG (binding vs dims).
+    mSDF.pCompose->execute(pRenderContext, 8u, 1u, 8u);
+
+    mSDF.sceneStats = mSDF.pScene->getStats();
+}
+
+void LumenGIPass::runGDFSphereTrace(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    namespace s6 = LumenGI::MeshSDF;
+    if (!mSDF.pScene || !mSDF.gdf || !mSDF.pCompose || mSDF.levels.empty())
+        return;
+
+    const bool primary = (mTraceMode == TraceMode::MeshSDF);
+    const bool hasDebug = renderData.getTexture(kGDFTrace) != nullptr;
+    if (!primary && !hasDebug)
+        return; // nothing to write (Hybrid without the diagnostic channel).
+
+    // The trace pass is specialized per config (primary writes the S1 outputs; the diagnostic
+    // channel is bound only when the graph allocates it). Recreate on config change.
+    const uint32_t config = (primary ? 1u : 0u) | (hasDebug ? 2u : 0u);
+    if (!mSDF.pTrace)
+    {
+        DefineList defines;
+        defines.add("is_valid_gDiffuseGI", primary ? "1" : "0");
+        defines.add("is_valid_gDiffuseRadianceHitDist", primary ? "1" : "0");
+        defines.add("is_valid_gConfidence", primary ? "1" : "0");
+        defines.add("is_valid_gGDFTraceDebug", hasDebug ? "1" : "0");
+        mSDF.pTrace = ComputePass::create(mpDevice, kGDFTraceShaderFile, "main", defines);
+    }
+
+    const uint32_t R = mSDF.gdf->getResolution();
+    const uint32_t levelCount = mSDF.gdf->getLevelCount();
+
+    // Clear + readback the sphere-trace counters.
+    pRenderContext->clearUAV(mSDF.pTraceStats->getUAV().get(), uint4(0));
+
+    const ref<Camera>& pCamera = mpScene->getCamera();
+    const float focalLengthPx = pCamera->getFocalLength() * (float)mFrameDim.y / pCamera->getFrameHeight();
+    const float3 camPos = pCamera->getPosition();
+    const float3 camForward = normalize(camPos - pCamera->getTarget());
+    const float3 camRight = normalize(cross(pCamera->getUpVector(), camForward));
+    const float3 camUp = cross(camForward, camRight);
+
+    ShaderVar var = mSDF.pTrace->getRootVar();
+    ShaderVar cb = var["LumenGDFTraceCB"];
+    ShaderVar clip = cb["gClipmap"];
+    clip["cameraCenter"] = float3(mSDF.gdf->getCameraCenter().x, mSDF.gdf->getCameraCenter().y, mSDF.gdf->getCameraCenter().z);
+    clip["emptyDistance"] = 0.f;
+    clip["levelCount"] = levelCount;
+    clip["dynamicLevelCount"] = LumenGI::GlobalDistanceField::kDynamicLevels;
+    clip["resolution"] = R;
+    clip["instanceCount"] = 0; // not used by the trace pass.
+    clip["dirtyRegionCount"] = 0;
+    clip["frameIndex"] = mFrameIndex;
+    const LumenGI::GlobalDistanceField::index3 scroll = mSDF.gdf->scrollFromCameraMove();
+    clip["scroll"] = int3(scroll.x, scroll.y, scroll.z);
+    cb["gCameraPosW"] = camPos;
+    cb["gCameraFocalPx"] = focalLengthPx;
+    cb["gPrincipalPoint"] = float2(0.5f * (float)mFrameDim.x, 0.5f * (float)mFrameDim.y);
+    cb["gFrameDim"] = mFrameDim;
+    cb["gMaxSteps"] = mGDFTraceMaxSteps;
+    cb["gCameraRightW"] = camRight;
+    cb["gCameraUpW"] = camUp;
+    cb["gCameraForwardW"] = camForward;
+    cb["gTraceMaxDistance"] = mGDFTraceMaxDistance;
+
+    var["gGDFLevelTable"] = mSDF.pLevelTable;
+    for (uint32_t m = 0; m < kLumenGDFMaxLevelsHost; ++m)
+        var["gGDFLevels"][m] = mSDF.levels[std::min<uint32_t>(m, levelCount - 1u)];
+    if (renderData.getTexture("linearZ"))
+        var["gLinearZ"] = renderData.getTexture("linearZ");
+    if (primary)
+    {
+        var["gDiffuseGI"] = renderData.getTexture("diffuseGI");
+        var["gDiffuseRadianceHitDist"] = renderData.getTexture("diffuseRadianceHitDist");
+        var["gConfidence"] = renderData.getTexture("confidence");
+    }
+    if (hasDebug)
+        var["gGDFTraceDebug"] = renderData.getTexture(kGDFTrace);
+    var["gGDFTraceStats"] = mSDF.pTraceStats;
+
+    mSDF.pTrace->execute(
+        pRenderContext,
+        ((mFrameDim.x + 7u) / 8u) * 8u,
+        ((mFrameDim.y + 7u) / 8u) * 8u,
+        1
+    );
+
+    if (mSDF.pTraceStats && mSDF.pTraceStatsReadback)
+    {
+        pRenderContext->copyResource(mSDF.pTraceStatsReadback.get(), mSDF.pTraceStats.get());
+        mSDF.traceStatsReadbackPending = true;
+    }
+}
+
+void LumenGIPass::readbackGDFTraceStats(RenderContext* pRenderContext)
+{
+    if (!mSDF.traceStatsReadbackPending || !mSDF.pTraceStatsReadback)
+        return;
+    mSDF.traceStatsReadbackPending = false;
+    const uint32_t* pData = static_cast<const uint32_t*>(mSDF.pTraceStatsReadback->map());
+    if (!pData)
+        return;
+    for (uint32_t i = 0; i < kGDFTraceStatCount && i < mSDF.traceStats.size(); ++i)
+        mSDF.traceStats[i] = pData[i];
+    mSDF.pTraceStatsReadback->unmap();
+}
+
+std::map<std::string, double> LumenGIPass::getGDFStats() const
+{
+    std::map<std::string, double> stats;
+    stats["active"] = (mUseGDF || mTraceMode != TraceMode::HardwareRT) ? 1.0 : 0.0;
+    stats["traceMode"] = static_cast<double>(static_cast<uint32_t>(mTraceMode));
+    stats["useGDF"] = mUseGDF ? 1.0 : 0.0;
+
+    if (mSDF.pScene)
+    {
+        const LumenGI::MeshSDF::Scene::LumenMeshSDFSceneStats& s = mSDF.sceneStats;
+        stats["registeredMeshes"] = (double)s.registeredMeshes;
+        stats["activeInstances"] = (double)s.activeInstances;
+        stats["residentInstances"] = (double)s.residentInstances;
+        stats["evictedInstances"] = (double)s.evictedInstances;
+        stats["cacheLookups"] = (double)s.cacheLookups;
+        stats["cacheHits"] = (double)s.cacheHits;
+        stats["cacheMisses"] = (double)s.cacheMisses;
+        stats["corruptionsDetected"] = (double)s.corruptionsDetected;
+        stats["builds"] = (double)s.builds;
+        stats["conversions"] = (double)s.conversions;
+        stats["evictions"] = (double)s.evictions;
+        stats["restores"] = (double)s.restores;
+        stats["estimatedGpuBytes"] = (double)s.estimatedGpuBytes;
+        stats["residentBytes"] = (double)s.residentBytes;
+        stats["budgetBytes"] = (double)s.budgetBytes;
+    }
+
+    if (mSDF.gdf)
+    {
+        stats["gdfLevelCount"] = (double)mSDF.gdf->getLevelCount();
+        stats["gdfResolution"] = (double)mSDF.gdf->getResolution();
+        stats["gdfBaseExtent"] = (double)mSDF.gdf->getBaseExtent();
+    }
+
+    const uint32_t traced = mSDF.traceStats[0];
+    stats["sphereTraced"] = (double)traced;
+    stats["sphereHit"] = (double)mSDF.traceStats[1];
+    stats["sphereMiss"] = (double)mSDF.traceStats[2];
+    stats["sphereMaxSteps"] = (double)mSDF.traceStats[3];
+    stats["sphereNoGrid"] = (double)mSDF.traceStats[4];
+    stats["sphereHitRate"] = traced > 0 ? (double)mSDF.traceStats[1] / (double)traced : 0.0;
+    return stats;
 }

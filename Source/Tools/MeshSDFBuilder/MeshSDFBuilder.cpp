@@ -423,27 +423,42 @@ private:
 
     uint32_t build(uint32_t begin, uint32_t end)
     {
+        // IMPORTANT: never hold a `Node&` reference across the recursive build() calls below -
+        // each recursive push can reallocate m_nodes and invalidate any reference taken before it
+        // (the node must be re-fetched by index after the recursion).
         const uint32_t nodeIdx = uint32_t(m_nodes.size());
         m_nodes.push_back(Node{});
-        Node& n = m_nodes[nodeIdx];
 
-        n.lo = m_centroids[m_order[begin]];
-        n.hi = m_centroids[m_order[begin]];
-        for (uint32_t i = begin + 1; i < end; ++i)
+        // Node AABB from the ACTUAL triangle bounds (not centroids). A centroid-only AABB prunes
+        // rays that hit a triangle far from its centroid, which breaks the ray/triangle counting
+        // (parity sign) and the nearest-distance query. Per level this scans the node's range, so
+        // the total build cost stays O(n log n).
+        const TriangleIndex& t0 = m_mesh.triangles[m_tris[m_order[begin]]];
+        Vec3 lo = m_mesh.positions[t0.a];
+        Vec3 hi = m_mesh.positions[t0.a];
+        auto grow = [&](const Vec3& p)
         {
-            const Vec3& c = m_centroids[m_order[i]];
-            n.lo = {std::min(n.lo.x, c.x), std::min(n.lo.y, c.y), std::min(n.lo.z, c.z)};
-            n.hi = {std::max(n.hi.x, c.x), std::max(n.hi.y, c.y), std::max(n.hi.z, c.z)};
+            lo = {std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
+            hi = {std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
+        };
+        for (uint32_t i = begin; i < end; ++i)
+        {
+            const TriangleIndex& t = m_mesh.triangles[m_tris[m_order[i]]];
+            grow(m_mesh.positions[t.a]);
+            grow(m_mesh.positions[t.b]);
+            grow(m_mesh.positions[t.c]);
         }
+        m_nodes[nodeIdx].lo = lo;
+        m_nodes[nodeIdx].hi = hi;
 
         if (end - begin <= 4)
         {
-            n.first = begin;
-            n.count = end - begin;
+            m_nodes[nodeIdx].first = begin;
+            m_nodes[nodeIdx].count = end - begin;
             return nodeIdx;
         }
 
-        const Vec3 extent = n.hi - n.lo;
+        const Vec3 extent = hi - lo;
         const int axis = (extent.x >= extent.y && extent.x >= extent.z) ? 0 : (extent.y >= extent.z ? 1 : 2);
         const uint32_t mid = begin + (end - begin) / 2;
         std::nth_element(
@@ -452,8 +467,8 @@ private:
             m_order.begin() + end,
             [this, axis](uint32_t a, uint32_t b) { return m_centroids[a][axis] < m_centroids[b][axis]; }
         );
-        n.left = build(begin, mid);
-        n.right = build(mid, end);
+        m_nodes[nodeIdx].left = build(begin, mid);
+        m_nodes[nodeIdx].right = build(mid, end);
         return nodeIdx;
     }
 

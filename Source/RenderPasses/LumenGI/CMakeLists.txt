@@ -32,6 +32,19 @@ target_sources(LumenGI PRIVATE
     Spatial/LumenSpatialFilterData.slang
     Spatial/LumenSpatialFilter.cs.slang
     Spatial/LumenReconstruction.h
+    MeshSDF/LumenMeshSDF.h
+    MeshSDF/LumenMeshSDFCache.h
+    MeshSDF/LumenMeshSDFAtlas.h
+    MeshSDF/LumenMeshSDFInstanceTable.h
+    MeshSDF/LumenMeshSDFScene.h
+    MeshSDF/LumenGlobalDistanceField.h
+    MeshSDF/LumenMeshSDFData.slang
+    MeshSDF/LumenMeshSDFSampling.slang
+    MeshSDF/LumenMeshSDFAtlas.slang
+    MeshSDF/LumenGDFData.slang
+    MeshSDF/LumenGDFCompose.cs.slang
+    MeshSDF/LumenGDFSphereTrace.3d.slang
+    MeshSDF/LumenGDFTrace.cs.slang
 )
 
 target_copy_shaders(LumenGI RenderPasses/LumenGI)
