@@ -196,8 +196,9 @@ static inline uint32_t directionSlot(uint32_t probeIndex, uint32_t dirIndex, uin
 static inline float2 directionSample2D(uint32_t probeIndex, uint32_t dirIndex, uint32_t frameIndex, uint32_t n, uint32_t seed)
 {
     const uint32_t j = directionSlot(probeIndex, dirIndex, frameIndex, n, seed);
-    // Per-probe jitter: two Wang-hash outputs of the probe index.
-    uint32_t a = probeIndex;
+    // Per-probe, per-frame jitter. The frame term mirrors the shader's
+    // Cranley-Patterson rotation so the direction union grows over time.
+    uint32_t a = probeIndex ^ (frameIndex * 0x9e3779b9u);
     a = (a ^ 61u) ^ (a >> 16u);
     a = a * 9u + 0x85ebca6bu;
     a = a ^ (a >> 13u);

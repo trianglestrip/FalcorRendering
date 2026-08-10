@@ -111,6 +111,7 @@
  */
 
 #include "LumenScreenProbeData.slang"
+import RenderPasses.LumenGI.Capture.LumenCardCaptureData;
 
 // Optional-resource guards. Falcor specializes is_valid_<name> when it binds
 // the resource; local defaults keep the module compilable standalone and every
@@ -124,8 +125,70 @@
 #ifndef is_valid_gProbeRadiance
 #define is_valid_gProbeRadiance 0
 #endif
+#ifndef is_valid_gProbeRadianceHistory
+#define is_valid_gProbeRadianceHistory 0
+#endif
 
 #define is_valid(name) (is_valid_##name != 0)
+
+#ifndef LUMEN_GI_PROBE_CACHE_LOOKUP
+#define LUMEN_GI_PROBE_CACHE_LOOKUP 0
+#endif
+
+#if LUMEN_GI_PROBE_CACHE_LOOKUP
+StructuredBuffer<LumenCard> gProbeCards;
+StructuredBuffer<uint> gProbeCardPageTable;
+Texture2D<float4> gProbeRadianceAtlas;
+Texture2D<float> gProbeVisibilityAtlas;
+
+cbuffer LumenProbeCacheCB
+{
+    uint gProbeCacheCardCount;
+    uint gProbeCachePagesPerSide;
+    uint2 gProbeCacheAtlasSize;
+};
+
+bool tryLookupSurfaceCache(const float3 hitPosition, out float3 radiance, out float confidence)
+{
+    radiance = float3(0.f);
+    confidence = 0.f;
+    const float eps = 0.04f;
+    for (uint cardIndex = 0u; cardIndex < gProbeCacheCardCount; ++cardIndex)
+    {
+        const uint pageID = gProbeCardPageTable[cardIndex];
+        if (pageID == kInvalidPageID)
+            continue;
+        const LumenCard card = gProbeCards[cardIndex];
+        const uint axis = lumenCardFaceAxis(card.faceIndex);
+        const bool positive = lumenCardFaceIsPositive(card.faceIndex);
+        const float3 extent = max(card.extent, float3(1e-5f));
+        const float3 local = hitPosition - card.center;
+        const float plane = positive ? 0.5f * lumenCardComponent(extent, axis)
+                                     : -0.5f * lumenCardComponent(extent, axis);
+        if (abs(lumenCardComponent(local, axis) - plane) > eps)
+            continue;
+        const uint2 axes = lumenCardFacePerpendicularAxes(card.faceIndex);
+        if (abs(lumenCardComponent(local, axes.x)) > 0.5f * lumenCardComponent(extent, axes.x) + eps ||
+            abs(lumenCardComponent(local, axes.y)) > 0.5f * lumenCardComponent(extent, axes.y) + eps)
+            continue;
+
+        float3 viewDir, right, up;
+        lumenCardFaceBasis(card.faceIndex, viewDir, right, up);
+        const float halfW = 0.5f * lumenCardComponent(extent, axes.x);
+        const float halfH = 0.5f * lumenCardComponent(extent, axes.y);
+        const float2 uv = saturate(float2(dot(local, right) / max(halfW, 1e-5f), dot(local, up) / max(halfH, 1e-5f)) * 0.5f + 0.5f);
+        const uint2 origin = lumenCardPageTexelOrigin(pageID, gProbeCachePagesPerSide);
+        const uint2 texel = min(origin + uint2(uv * float(kLumenSurfaceCacheTileSize - 1u)), gProbeCacheAtlasSize - 1u);
+        const float vis = saturate(gProbeVisibilityAtlas[texel]);
+        if (vis <= 0.f)
+            continue;
+        radiance = max(gProbeRadianceAtlas[texel].rgb, float3(0.f));
+        confidence = vis;
+        return true;
+    }
+    return false;
+}
+#endif
 
 // Radiance ceiling mirrored from LumenGIData.slang (kLumenGIMaxRadiance),
 // overridable by the host through the same define. Applied per direction
@@ -193,7 +256,8 @@ float3 lumenProbeIntegrateSampleDirection(
     const uint n = max(1u, gDirectionsPerProbe);
     const uint rot = (probeIndex * 2654435761u + frameIndex * 1140071481u + gSeed) % n;
     const uint j = (dirIndex + rot) % n;
-    float2 u = frac(lumenProbeIntegrateHammersley(j, n) + lumenProbeIntegrateHash2(probeIndex) * (1.0 / float(n)));
+    float2 u = frac(lumenProbeIntegrateHammersley(j, n) +
+                    lumenProbeIntegrateHash2(probeIndex ^ (frameIndex * 0x9e3779b9u)) * (1.0 / float(n)));
 
     const float3 N = any(isnan(normalW)) ? float3(0.f, 1.f, 0.f) : normalize(normalW);
     const float3 helper = abs(N.z) < 0.999f ? float3(0.f, 0.f, 1.f) : float3(1.f, 0.f, 0.f);
@@ -250,7 +314,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     if (probeIndex >= gProbeCount)
         return;
 
-    if (!is_valid(gProbeMeta) || !is_valid(gProbeHitRecords) || !is_valid(gProbeRadiance))
+    if (!is_valid(gProbeMeta) || !is_valid(gProbeHitRecords) || !is_valid(gProbeRadiance) ||
+        !is_valid(gProbeRadianceHistory))
         return; // Unconfigured pass: never dereference an unbound resource.
 
     const LumenScreenProbeMeta meta = gProbeMeta[probeIndex];
@@ -265,8 +330,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     if (meta.active == 0u)
     {
         gProbeRadiance[outPixel] = float4(0.f, 0.f, 0.f, 0.f);
+        gProbeRadianceHistory[outPixel] = float4(0.f, 0.f, 0.f, 0.f);
         return;
     }
+
+    // The trace/finalize stages use a round-robin budget. A skipped probe must
+    // preserve its previous history and probe radiance; integrating its stale hit
+    // records with the current frame's direction sequence would falsely claim new
+    // samples and corrupt the cross-frame estimator.
+    const uint interval = max(1u, gUpdateInterval);
+    const bool due = (meta.flags & kLumenScreenProbeMetaFlagDirty) != 0u ||
+                     (probeIndex % interval) == (gFrameIndex % interval);
+    if (!due)
+        return;
 
     const float3 probeNormal = normalize(meta.normalW);
     const uint n = max(1u, gDirectionsPerProbe);
@@ -285,7 +361,21 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         if ((hit.flags & (kLumenProbeHitFlagScreenHit | kLumenProbeHitFlagHWRTHit)) == 0u)
             continue; // Traced but no radiance (screen miss / fallback miss): Li = 0, lowers confidence via hit fraction.
 
-        const float3 li = lumenScreenProbeSanitizeRadiance(hit.radiance);
+        float3 li = lumenScreenProbeSanitizeRadiance(hit.radiance);
+#if LUMEN_GI_PROBE_CACHE_LOOKUP
+        // Surface Cache is authoritative when a valid captured card/page covers
+        // this hit. A partial visibility value blends cache and HWRT radiance,
+        // while a stale/invalid page naturally falls back to the hit record.
+        const float3 hitPosition = meta.worldPos + lumenProbeIntegrateSampleDirection(
+            probeIndex, dir, gFrameIndex, probeNormal
+        ) * max(hit.hitDistance, 0.f);
+        float3 cacheRadiance;
+        float cacheConfidence;
+        if (tryLookupSurfaceCache(hitPosition, cacheRadiance, cacheConfidence))
+        {
+            li = lerp(li, cacheRadiance, cacheConfidence);
+        }
+#endif
         if (!any(li > float3(0.f)))
             continue; // Zero / sanitized radiance: same as a miss for the estimator and confidence.
         ++validHitCount;
@@ -310,5 +400,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     const float3 irradiance = (accWeight > 0.f)
         ? lumenScreenProbeSanitizeRadiance(accRadiance)
         : float3(0.f);
-    gProbeRadiance[outPixel] = float4(irradiance, confidence);
+
+    // C7 cross-frame accumulation. The history stores a running mean in RGB and
+    // the number of traced directions in A. Each frame contributes a complete
+    // N-direction estimator (including misses), so the estimator remains unbiased
+    // while the effective direction union grows beyond the fixed per-frame set.
+    const float4 previous = gProbeRadianceHistory[outPixel];
+    const float previousCount = max(previous.a, 0.f);
+    const float currentCount = float(tracedCount);
+    const float totalCount = min(previousCount + currentCount, 65504.f);
+    const float currentWeight = currentCount / max(totalCount, 1.f);
+    const float3 accumulated = (previousCount > 0.f)
+        ? lerp(max(previous.rgb, float3(0.f)), irradiance, currentWeight)
+        : irradiance;
+    gProbeRadiance[outPixel] = float4(lumenScreenProbeSanitizeRadiance(accumulated), confidence);
+    gProbeRadianceHistory[outPixel] = float4(lumenScreenProbeSanitizeRadiance(accumulated), totalCount);
 }

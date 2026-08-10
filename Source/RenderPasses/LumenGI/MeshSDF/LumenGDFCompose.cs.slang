@@ -55,7 +55,8 @@
 //
 //  DISTANCE CODE (mirror S6-B1)
 //  -------------------------------------------------------------------------------------
-//  Per level: R16Float (level 0 default) or R8Snorm with a per-level quantRange. See
+//  Per logical level: identity distance values with a per-level quantRange codec. The
+//  runtime staging atlas views below are R32Float and preserve the source values directly.
 //  LumenGDFData.slang for the exact encode. The atlas sample returns OUTPUT units; the
 //  instance's worldScalePerOutput converts to world units (exact for similarities,
 //  conservative max-axis factor for non-uniformly scaled instances - matching the atlas).
@@ -66,7 +67,7 @@
 //  gGDFLevelTable              - StructuredBuffer<LumenGDFLevelParams>[levelCount]
 //  gGDFInstances               - StructuredBuffer<LumenGDFInstance>[instanceCount]
 //  gGDFDirtyRegions            - StructuredBuffer<LumenGDFDirtyRegion>[dirtyRegionCount]
-//  gGDFLevels[]                - RWTexture3D<float>[levelCount] UAVs (R16Float / R8Snorm)
+//  gGDFLevel                   - RWTexture3D<float> UAV for the level in the current batch.
 //  gFineAtlas / gCoarseAtlas   - S6-B2 atlas textures (SRV)
 //  gPageTable / gVolumes / gInstances / gAtlas* scalars - S6-B2 atlas bindings (SRV)
 // =====================================================================================
@@ -78,8 +79,8 @@
 // compose pass needs is required, so default everything to 1 so the file is statically
 // compilable before the host binds anything. Any resource a host truly wants optional
 // must define is_valid_<name> 0 BEFORE including this file.
-#ifndef is_valid_gGDFLevels
-#define is_valid_gGDFLevels 1
+#ifndef is_valid_gGDFLevel
+#define is_valid_gGDFLevel 1
 #endif
 #ifndef is_valid_gGDFLevelTable
 #define is_valid_gGDFLevelTable 1
@@ -124,16 +125,15 @@ StructuredBuffer<LumenGDFLevelParams> gGDFLevelTable;
 StructuredBuffer<LumenGDFInstance> gGDFInstances;
 StructuredBuffer<LumenGDFDirtyRegion> gGDFDirtyRegions;
 
-// One 3D texture per clipmap level. Level 0 is R16Float by default; levels >= 1 are
-// R8Snorm (see LumenGDFData.slang). The host creates the R16_FLOAT / R8_SNORM UAVs and
-// binds them into this array (format is a property of the resource view, not the shader).
-RWTexture3D<float> gGDFLevels[kLumenGDFMaxLevels];
+// One 3D texture per clipmap level. The host uses R32_FLOAT typed UAVs and applies the
+// logical level codec in lumenGDFEncode/lumenGDFDecode.
+RWTexture3D<float> gGDFLevel;
 
 // S6-B2 atlas bindings, bound as flat globals so each one can be is_valid-guarded and so
 // the aggregate below constructs the LumenMeshSDFAtlasBindings value lumenMeshSDFAtlasSample
 // expects. Field order must match LumenMeshSDFAtlasBindings exactly.
-Texture3D<float> gFineAtlas;                    ///< R16Float mip0 pages of High-quality volumes.
-Texture3D<float> gCoarseAtlas;                  ///< R8Snorm pages (mips >= 1, Low-quality mip0).
+Texture3D<float> gFineAtlas;                    ///< R32Float staging view of fine source values.
+Texture3D<float> gCoarseAtlas;                  ///< R32Float staging view of normalized coarse values.
 StructuredBuffer<uint> gPageTable;              ///< [instanceID * 12 + mip] = base page slot.
 StructuredBuffer<LumenMeshSDFVolumeDescriptor> gVolumes; ///< Per mesh (deduplicated).
 StructuredBuffer<LumenMeshSDFAtlasInstance> gInstances;  ///< Per registered instance.
@@ -159,7 +159,7 @@ bool lumenGDFVoxelOverlapsInstance(LumenGDFInstance inst, float3 voxelMin, float
 ///     is stored; a voxel with no contributing instance stores the empty distance.
 void lumenGDFComposeVoxel(LumenGDFClipmapParams c, uint level, int3 voxel, uint regionFlags)
 {
-    if (!is_valid(gGDFLevels) || !is_valid(gGDFLevelTable) || !is_valid(gGDFInstances))
+    if (!is_valid(gGDFLevel) || !is_valid(gGDFLevelTable) || !is_valid(gGDFInstances))
         return;
     if (level >= c.levelCount)
         return;
@@ -170,7 +170,7 @@ void lumenGDFComposeVoxel(LumenGDFClipmapParams c, uint level, int3 voxel, uint 
     // Removed/stale slab: clear to empty so recycled voxels never serve stale surface data.
     if ((regionFlags & kLumenGDFDirtyFlagRemoved) != 0u)
     {
-        gGDFLevels[level][uint3(voxel)] = lumenGDFEncode(lp, emptyDistance);
+        gGDFLevel[uint3(voxel)] = lumenGDFEncode(lp, emptyDistance);
         return;
     }
 
@@ -178,7 +178,7 @@ void lumenGDFComposeVoxel(LumenGDFClipmapParams c, uint level, int3 voxel, uint 
     // must bind the S6-B2 atlas before dispatching the compose pass).
     if (!is_valid(gFineAtlas) || !is_valid(gCoarseAtlas) || !is_valid(gPageTable) || !is_valid(gVolumes))
     {
-        gGDFLevels[level][uint3(voxel)] = lumenGDFEncode(lp, emptyDistance);
+        gGDFLevel[uint3(voxel)] = lumenGDFEncode(lp, emptyDistance);
         return;
     }
 
@@ -230,7 +230,7 @@ void lumenGDFComposeVoxel(LumenGDFClipmapParams c, uint level, int3 voxel, uint 
         }
     }
 
-    gGDFLevels[level][uint3(voxel)] = lumenGDFEncode(lp, best);
+    gGDFLevel[uint3(voxel)] = lumenGDFEncode(lp, best);
 }
 
 // -------------------------------------------------------------------------------------

@@ -35,8 +35,8 @@
 //  FROZEN LAYOUT (see LumenMeshSDFAtlas.h for the full argument)
 //  -------------------------------------------------------------------------------------
 //  * Two shared 3D atlases (mixed mip formats force separate textures):
-//        fine   : R16Float, hosts mip 0 of High-quality volumes (R16Float mip0)
-//        coarse : R8Snorm,  hosts mips >= 1 and Low-quality mip 0
+//        fine   : R32Float runtime staging view of mip 0 of High-quality volumes
+//        coarse : R32Float runtime staging view of normalized coarse values
 //  * Page = 32^3 texels (kLumenMeshSDFAtlasPageSize). Atlas geometry is
 //    pagesPerSide^3 page slots (default 8^3 = 512 slots per atlas).
 //  * A volume's mip m has dims d(m) = max(1, ceil(d(m-1)/2)) and is tiled into a
@@ -63,8 +63,8 @@
 //      uMip = u / 2^mip
 //  Cells are clamped to [0, d(m)-1] exactly like LumenMeshSDFSampling.slang, then
 //  each integer corner voxel maps through the brick grid to a page + texel.
-//  Decode: fine atlas Load is float (R16Float); coarse atlas Load is R8_SNORM
-//  converted (code/127) and is scaled by quantRange - identical to S6-B1. The final
+//  Decode: both runtime atlas Loads are float; coarse values are already normalized and
+//  are scaled by quantRange - identical to S6-B1. The final
 //  distance is flipped to the math convention (positive outside) via signConvention.
 //
 //  NON-UNIFORM SCALE

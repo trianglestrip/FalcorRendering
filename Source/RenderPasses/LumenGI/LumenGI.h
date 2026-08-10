@@ -143,6 +143,9 @@ class LumenGIPass : public RenderPass
     ///< counters. Values are doubles so the map converts losslessly to a Python dict.
     std::map<std::string, double> getGDFStats() const;
 
+    ///< Scriptable S4/C2/C7 probe-resource and counter snapshot (screenProbeStats).
+    std::map<std::string, double> getScreenProbeStats() const;
+
 private:
     void parseProperties(const Properties& props);
     void resetHistory();
@@ -205,6 +208,7 @@ private:
     void createSpatialFilterProgram();
     void ensureSpatialFilterResources(RenderContext* pRenderContext);
     void runSpatialFilter(RenderContext* pRenderContext, const RenderData& renderData);
+    void runFinalResolve(RenderContext* pRenderContext, const RenderData& renderData);
 
     // ------------------------------------------------------------------------------------------
     // S6: Mesh SDF + Global Distance Field host (S6-A data pipeline, S6-B3 compose, S6-B4 sphere
@@ -348,9 +352,17 @@ private:
         ///< Written by pIntegrate, read by pInterpolate. Distinct from the graph "probeRadiance"
         ///< output (Z1's finalize naive average, consumed by run_probe.py).
         ref<Texture> pRadiance;
+        ///< C8 internal full-resolution interpolated incident irradiance. The graph
+        ///< probeInterpolated output is only an optional mirror of this resource.
+        ref<Texture> pInterpolated;
+        ///< C7 cross-frame accumulated probe estimate. RGB stores the running mean incident
+        ///< irradiance and A stores the accumulated traced-direction count (up to RGBA16F max).
+        ref<Texture> pRadianceHistory;
         uint32_t probeCount = 0;     ///< Probe count the buffers were sized for (0 = not created).
         uint2 resourceDim = {0, 0};  ///< Frame dims the resources were built for.
         bool counterReadbackPending = false;
+        bool historyResetPending = true;
+        bool producedThisFrame = false; ///< Interpolate completed for the current frame.
     } mScreenProbes;
 
     ///< Scriptable S4.2 probe gate channel: probe grid radiance (RGB avg radiance, A hit
@@ -363,6 +375,11 @@ private:
     ///< A = confidence in [0, 1] (0 = sky / no valid tap). Probed by
     ///< tests/lumengi/run_probe_interp.py (V1/V2) and consumed by the S5-B1 filter.
     static constexpr const char* kProbeInterpolated = "probeInterpolated";
+
+    ///< C7 diagnostic mirror of the internal cross-frame probe history. RGB is the running
+    ///< incident-irradiance mean and A is the accumulated traced-direction count. This channel
+    ///< is never consumed by the production resolve; it exists for the 8/32/96-frame gate.
+    static constexpr const char* kProbeHistory = "probeHistory";
 
     ///< S4.2 probe configuration. Directions per probe default 16 (fixed hit-record stride
     ///< 32); maxProbesPerFrame default 0 = all probes every frame (updateInterval 1).
@@ -394,11 +411,15 @@ private:
     static constexpr const char* kTemporalAlpha = "temporalAlpha";
     ///< gTemporalConfidence (R32F): updated confidence, the S5-B2 spatial-filter input.
     static constexpr const char* kTemporalConfidence = "temporalConfidence";
+    ///< C8 diagnostic running luminance moments (.x = mean, .y = mean square).
+    static constexpr const char* kTemporalMoments = "temporalMoments";
     ///< Scriptable S5-B2 gate channel (spatialFiltered): full-res RGBA16F, RGB = variance-guided
     ///< spatially filtered incident irradiance, A = FILTERED confidence in [0,1] (carried from
     ///< gConfidenceInput / the S5-B1 temporalConfidence, blended by the pass). This is the S5
     ///< final filtered output; probed by tests/lumengi/run_spatial_gate.py / run_spatial_ghost.py.
     static constexpr const char* kSpatialFiltered = "spatialFiltered";
+    ///< C8 diagnostic combined variance written by the spatial filter (R32F).
+    static constexpr const char* kFilteredVariance = "filteredVariance";
 
     ///< S5-B1 temporal filter GPU resources. Created lazily by ensureTemporalFilterResources(),
     ///< frame-dim-scoped (recreated on resize). The pass compiles LumenTemporalFilter.cs.slang.
@@ -410,6 +431,9 @@ private:
         ///< slot [historyCurrIndex] (the two must be distinct resources); the host flips the index
         ///< after every dispatch so the buffer written this frame is the previous frame's input next.
         ref<Texture> pHistory[2];
+        ///< C8 running luminance moments (RG32F: mean and mean square), updated alongside
+        ///< the temporal history so the spatial filter can use a true temporal variance.
+        ref<Texture> pMoments;
         ref<Texture> pPrevDepth;          ///< S5-A1 previous-frame linear depth (R32F, blit of linearZ.x).
         uint32_t historyCurrIndex = 0;    ///< History slot written this frame (flipped after each dispatch).
         uint2 resourceDim = {0, 0};       ///< Frame dims the resources were built for.
@@ -418,6 +442,7 @@ private:
         ///< only fires on hard invalidations, never on camera-movement-only updates, so smooth
         ///< motion reuses history through the motion-vector reprojection.
         bool historyResetPending = true;
+        bool producedThisFrame = false;   ///< Temporal dispatch completed for the current frame.
     } mTemporalFilter;
 
     ///< S5-B1 tuning (LumenTemporalFilterCB; defaults frozen with Z5's LumenTemporalFilterData.slang).
@@ -442,7 +467,22 @@ private:
     {
         ///< LumenSpatialFilter.cs.slang, entry "main" (8x8 threads, variance-guided bilateral).
         ref<ComputePass> pFilter;
+        ref<Texture> pOutput; ///< C8 internal spatial result; graph output is an optional mirror.
+        ref<Texture> pVariance; ///< C8 internal combined variance; graph output is an optional mirror.
+        uint2 resourceDim = {0, 0};
+        bool producedThisFrame = false; ///< Spatial dispatch completed for the current frame.
     } mSpatialFilter;
+
+    // C9: production Final Resolve. Probe/temporal/spatial stages store incident
+    // irradiance, while the public diffuseGI contract is modulated linear diffuse
+    // radiance. Resolve is written into an internal texture first so the source and
+    // destination may legally alias the graph's diffuseGI output.
+    struct
+    {
+        ref<ComputePass> pPass;
+        ref<Texture> pResolved;
+        uint2 resourceDim = {0, 0};
+    } mFinalResolve;
 
     ///< S5-B2 tuning (LumenSpatialFilterCB; defaults frozen with LumenSpatialFilterData.slang and
     ///< mirrored by LumenReconstruction::SpatialFilterConstantBuffer). Every field below is set on
@@ -594,7 +634,8 @@ private:
         ///< S6-B4 sphere-trace pass (LumenGDFTrace.cs.slang).
         ref<ComputePass> pTrace;
 
-        ///< GDF clipmap textures: level 0 R16Float, levels >= 1 R8Snorm (levelCount entries).
+        ///< GDF clipmap textures: runtime staging uses R32Float for all levels; the logical
+        ///< level-table format remains the identity codec for compatibility (levelCount entries).
         std::vector<ref<Texture>> levels;
         ///< StructuredBuffer<LumenGDFLevelParams> (levelCount entries).
         ref<Buffer> pLevelTable;
@@ -609,7 +650,8 @@ private:
         ///< Last completed sphere-trace dispatch counters [traced, hit, miss, maxSteps, noGrid].
         std::array<uint32_t, 5> traceStats = {};
 
-        ///< Mesh SDF atlas GPU mirror (S6-B2): fine = R16Float mip0 pages, coarse = R8Snorm.
+        ///< Mesh SDF atlas GPU mirror (S6-B2): both physical SRVs are R32Float staging views;
+        ///< source quality metadata remains fine R16Float/coarse R8Snorm.
         ref<Texture> pFineAtlas;
         ref<Texture> pCoarseAtlas;
         ///< StructuredBuffer<uint> page table (atlas-instance * kLumenMeshSDFMaxMipCount).

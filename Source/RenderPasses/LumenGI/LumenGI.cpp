@@ -57,6 +57,7 @@ const char kScreenProbeIntegrateShaderFile[] = "RenderPasses/LumenGI/ScreenProbe
 const char kScreenProbeInterpolateShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeInterpolate.cs.slang";
 const char kTemporalFilterShaderFile[] = "RenderPasses/LumenGI/Temporal/LumenTemporalFilter.cs.slang";
 const char kSpatialFilterShaderFile[] = "RenderPasses/LumenGI/Spatial/LumenSpatialFilter.cs.slang";
+const char kFinalResolveShaderFile[] = "RenderPasses/LumenGI/Resolve/LumenFinalResolve.cs.slang";
 
 ///< S5-B1 LumenTemporalFilterCB fields that are not exposed as tunable members; defaults frozen
 ///< with Z5's LumenTemporalFilterData.slang comments (all but the last three are inert while the
@@ -149,6 +150,13 @@ const uint32_t kTraceRecursionDepth = 1u;
 ///< support a fixed seed). The shader rotates it per frame with kLumenGICacheSeedFrameStride,
 ///< so adjacent frames sample different points while the sequence stays reproducible.
 const uint32_t kCacheLightingSeed = 0x51B8DC0Du;
+
+// C1 safety fallback: the D3D12 cache-lighting dispatch currently rejects the
+// optional EnvMapSampler resource variant (E_INVALIDARG) even with a valid
+// 16x16 group shape and populated descriptor inputs. Keep environment lighting
+// enabled via the shader's unbiased uniform-sphere path until the sampler
+// descriptor issue is isolated; do not claim importance-sampler coverage.
+constexpr bool kUseCacheLightingEnvImportanceSampler = false;
 
 const char kEnabled[] = "enabled";
 const char kTraceMode[] = "traceMode";
@@ -266,10 +274,14 @@ const ChannelList kOutputChannels = {
     { "screenTrace",                   "gScreenTraceResult",             "S4 screen-space trace: RGB=hitUV/distance, A=confidence or -(reason+1)", true, ResourceFormat::RGBA16Float },
     { "probeRadiance",                 "gProbeRadiance",                 "S4.2 screen probe grid: RGB=avg radiance at the probe, A=hit fraction (sparse)", true, ResourceFormat::RGBA16Float },
     { "probeInterpolated",             "gGIOutput",                      "S4.3 probe interpolate: RGB=incident irradiance E, A=confidence in [0,1]. S5-B1 temporal-filter input.", true, ResourceFormat::RGBA16Float },
+    { "probeHistory",                  "gProbeHistory",                  "C7 diagnostic probe history mirror: RGB=running incident-irradiance mean, A=accumulated traced-direction count.", true, ResourceFormat::RGBA16Float },
     { "temporalFiltered",              "gTemporalOutput",                "S5-B1 temporal filter: RGB=temporally filtered incident irradiance, A=NEW history length (capped). S5 main output.", true, ResourceFormat::RGBA16Float },
     { "temporalAlpha",                 "gTemporalAlpha",                 "S5-B1 effective EMA alpha (1 = full reject / reset). Accept/reject cross-check.", true, ResourceFormat::R32Float },
     { "temporalConfidence",            "gTemporalConfidence",            "S5-B1 updated confidence; input to the S5-B2 spatial filter.", true, ResourceFormat::R32Float },
+    { "temporalMoments",               "gTemporalMoments",               "C8 diagnostic running luminance moments: R=mean, G=mean square.", true, ResourceFormat::RG32Float },
     { "spatialFiltered",               "gSpatialOutput",                 "S5-B2 spatial filter: RGB=variance-guided filtered incident irradiance, A=filtered confidence. Consumes temporalFiltered + temporalConfidence.", true, ResourceFormat::RGBA16Float },
+    { "filteredVariance",              "gFilteredVariance",               "C8 diagnostic combined temporal/spatial luminance variance.", true, ResourceFormat::R32Float },
+    { "resolvedDiffuseGI",             "gResolvedDiffuseGI",              "C9 final resolve: filtered incident irradiance modulated by diffuse reflectance / PI, or HWRT radiance passthrough.", true, ResourceFormat::RGBA16Float },
     { "gdfTrace",                      "gGDFTraceOutput",                "S6-B4 GDF sphere trace: RGB=(t/tMax, |SDF| at surface/voxel, t), A=hit. Scriptable S6 gate channel.", true, ResourceFormat::RGBA16Float },
     // clang-format on
 };
@@ -611,8 +623,8 @@ void s6TileMipIntoAtlasImage(
             }
 }
 
-/// Convert a float atlas image in [-1, 1] into int8 R8_SNORM codes (the coarse-atlas upload
-/// representation; matches the GPU R8_SNORM float<->code/127 conversion).
+/// Legacy CPU helper for the source R8_SNORM cache codec. Runtime atlas staging now uploads
+/// normalized floats into R32Float views, so this helper is retained only for diagnostics.
 void s6CoarseImageToCodes(const std::vector<float>& image, std::vector<int8_t>& out)
 {
     out.resize(image.size());
@@ -631,6 +643,8 @@ void registerBindings(pybind11::module& m)
     pass.def_property_readonly("surfaceCacheStats", &LumenGIPass::getSurfaceCacheStats);
     // Scriptable S6 gate snapshot: read as m.activeGraph.getPass("LumenGI").gdfStats.
     pass.def_property_readonly("gdfStats", &LumenGIPass::getGDFStats);
+    // Scriptable S4/C2/C7 probe-resource and counter snapshot.
+    pass.def_property_readonly("screenProbeStats", &LumenGIPass::getScreenProbeStats);
     // Compatibility alias for the Z15 S6-C2 atlas test skeleton (run_sdf_atlas.py) which probes
     // a `meshSDFSceneStats` dict binding; the scene-pipeline counters live in gdfStats.
     pass.def_property_readonly("meshSDFSceneStats", &LumenGIPass::getGDFStats);
@@ -930,6 +944,9 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
     }
 
     clearOutputs(pRenderContext, renderData);
+    mScreenProbes.producedThisFrame = false;
+    mTemporalFilter.producedThisFrame = false;
+    mSpatialFilter.producedThisFrame = false;
     if (!mEnabled || !mpScene)
         return;
 
@@ -1015,12 +1032,12 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
     if (mpLightingComponents)
         pRenderContext->clearUAV(mpLightingComponents->getUAV().get(), float4(0.f));
 
-    // S6: TraceMode::MeshSDF makes the GDF sphere trace the PRIMARY path (the S6-B4
-    // pass writes the S1 outputs below). The HWRT raytrace is skipped so the pass output
-    // is genuinely software-traced (no DXR in the hot path); the tracer program/vars are
-    // still maintained so toggling back to HardwareRT stays instant. In every other mode
-    // the S1 raytrace runs exactly as before.
-    const bool sdfPrimaryPath = (mTraceMode == TraceMode::MeshSDF);
+    // S6 fallback contract: the current GDF shader produces geometry distance/debug
+    // data, not material-lighted radiance. Keep the HWRT radiance path alive for
+    // MeshSDF/Hybrid until a real GDF hit-lighting router is available; this avoids
+    // turning a valid trace mode into a black frame.
+    constexpr bool kGDFProvidesDiffuseRadiance = false;
+    const bool sdfPrimaryPath = (mTraceMode == TraceMode::MeshSDF) && kGDFProvidesDiffuseRadiance;
     if (!sdfPrimaryPath)
     {
         // The counters must be cleared before each dispatch; they accumulate
@@ -1053,6 +1070,23 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
     // Scriptable S3 gate channel: copy the internal radiance atlas into the optional graph
     // output (atlas-sized) so tests/lumengi can read the cache-direct radiance directly.
     exportCacheDirectRadiance(pRenderContext, renderData);
+
+    // S6: build/trace the GDF before Screen Probe integration so backend hits are
+    // available to the probe router. MeshSDF still falls back to HWRT for radiance
+    // until a material-lighting contract exists; GDF remains a backend diagnostic.
+    if (mUseGDF)
+    {
+        if (!mSDF.pScene)
+            ensureMeshSDFScene();
+        if (mSDF.pScene)
+        {
+            ensureGDFResources(pRenderContext);
+            runGDFCompose(pRenderContext);
+            runGDFSphereTrace(pRenderContext, renderData);
+            readbackGDFTraceStats(pRenderContext);
+            mSDF.pScene->endFrame();
+        }
+    }
 
     // S4: hierarchical screen-space trace (S4-A1). Builds the HZB chain from GBufferRT.linearZ
     // and dispatches the screen trace into the optional "screenTrace" output. Reads only
@@ -1089,35 +1123,10 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
     if (mUseSpatialFilter)
         runSpatialFilter(pRenderContext, renderData);
 
-    // S6: Mesh SDF / Global Distance Field pipeline. Active ONLY when explicitly enabled
-    // (mUseGDF). When mUseGDF is off, TraceMode::MeshSDF/Hybrid falls back to the HWRT path
-    // exactly like before. Every frame when enabled:
-    //   * the camera anchor is pushed into the CPU clipmap (GDF scroll bookkeeping),
-    //   * resident Mesh SDF instances are composed into the GDF clipmap textures
-    //     (LumenGDFCompose.cs.slang) over the dirty regions only,
-    //   * the GDF sphere trace (LumenGDFTrace.cs.slang) runs over the screen: in MeshSDF mode it
-    //     REPLACES the S1 outputs (diffuseGI / diffuseRadianceHitDist / confidence), in Hybrid /
-    //     HardwareRT-with-GDF mode it writes the optional "gdfTrace" diagnostic channel only.
-    if (mUseGDF)
-    {
-        // S6: Mesh SDF / Global Distance Field pipeline. ensureMeshSDFScene() builds the
-        // scene -> cache -> builder -> volume -> atlas -> instance table chain on first use;
-        // ensureGDFResources() creates the GDF clipmap + mesh-SDF atlas GPU resources and the
-        // compose/trace passes (and uploads the atlas pages); runGDFCompose() composes the
-        // clipmap dirty regions; runGDFSphereTrace() runs the screen trace (TraceMode::MeshSDF
-        // writes the S1 outputs). The whole path self-guards: a scene with no registered
-        // resident instances simply composes empty GDF levels.
-        if (!mSDF.pScene)
-            ensureMeshSDFScene();
-        if (mSDF.pScene)
-        {
-            ensureGDFResources(pRenderContext);
-            runGDFCompose(pRenderContext);
-            runGDFSphereTrace(pRenderContext, renderData);
-            readbackGDFTraceStats(pRenderContext);
-            mSDF.pScene->endFrame();
-        }
-    }
+    // C9: resolve the selected production irradiance chain back into the public
+    // diffuseGI contract. This is intentionally after all optional producers,
+    // including GDF fallback/debug work, so graph consumers see one stable output.
+    runFinalResolve(pRenderContext, renderData);
 
     if (!mpDebugPass)
         createDebugPass();
@@ -1409,10 +1418,11 @@ void LumenGIPass::onHotReload(HotReloadFlags reloaded)
         mScreenProbes.pUpdate = nullptr;
         mScreenProbes.pTrace = nullptr;
         mScreenProbes.pFinalize = nullptr;
-    mScreenProbes.pIntegrate = nullptr;
-    mScreenProbes.pInterpolate = nullptr;
-    mTemporalFilter.pFilter = nullptr; // pure compute, no scene deps; recreated lazily.
-    mSpatialFilter.pFilter = nullptr;  // pure compute, no scene deps; recreated lazily.
+        mScreenProbes.pIntegrate = nullptr;
+        mScreenProbes.pInterpolate = nullptr;
+        mTemporalFilter.pFilter = nullptr; // pure compute, no scene deps; recreated lazily.
+        mSpatialFilter.pFilter = nullptr;  // pure compute, no scene deps; recreated lazily.
+        mFinalResolve.pPass = nullptr;     // C9 pure compute pass; recreated lazily.
     mSDF.pCompose = nullptr;           // S6: pure compute, no scene deps; recreated lazily.
     mSDF.pTrace = nullptr;
     resetHistory();
@@ -1428,6 +1438,7 @@ void LumenGIPass::resetHistory()
     // prev buffers makes every pixel take the disocclusion path for one frame (prev depth 0 =>
     // validation weight 0), which is the "history immediately invalid after a cut" gate.
     mTemporalFilter.historyResetPending = true;
+    mScreenProbes.historyResetPending = true;
 }
 
 void LumenGIPass::clearOutputs(RenderContext* pRenderContext, const RenderData& renderData) const
@@ -2042,6 +2053,30 @@ void LumenGIPass::createCacheLightingProgram()
     DefineList defines;
     defines.add(mpScene->getSceneDefines());
     defines.add(mpSampleGenerator->getDefines()); // SAMPLE_GENERATOR_TYPE selects the shader RNG type.
+    // Freeze the resource-shape defines at program creation.  In particular,
+    // EnvMapSampler is a conditional global parameter; creating the pass with
+    // the default (sampler absent) layout and changing it only after the first
+    // compile can leave D3D12's root object/pipeline layout out of sync.
+    defines.add("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
+    defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
+    defines.add("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
+    defines.add(
+        "LUMEN_GI_HAS_ENVIRONMENT_SAMPLER",
+        (kUseCacheLightingEnvImportanceSampler && mpEnvMapSampler) ? "1" : "0"
+    );
+    defines.add("LUMEN_GI_HAS_EMISSIVE_SAMPLER", mpEmissiveLightSampler ? "1" : "0");
+    if (mpEmissiveLightSampler)
+        defines.add(mpEmissiveLightSampler->getDefines());
+    else
+        defines.add("_EMISSIVE_LIGHT_SAMPLER_TYPE", "255");
+    defines.add("is_valid_gMaterialParamsAtlas", "0");
+    defines.add("is_valid_gLumenVisibilityAtlas", "1");
+    defines.add("is_valid_gLumenGICounters", mpCacheLightingCounters ? "1" : "0");
+    defines.add("is_valid_gDebugTexture", "0");
+    const bool feedbackOn = mCacheLightingFeedbackEnabled && mUseCacheLighting && mUseSurfaceCache;
+    defines.add("is_valid_gIndirectPrev", feedbackOn ? "1" : "0");
+    defines.add("is_valid_gIndirectCurr", "1");
+    defines.add("is_valid_gBounceCountAtlas", "1");
     mCacheLighting.pPass = ComputePass::create(mpDevice, desc, defines, /*createVars=*/true);
 }
 
@@ -2188,7 +2223,10 @@ void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
     programChanged |= pProgram->addDefine("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
     programChanged |= pProgram->addDefine("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
     programChanged |= pProgram->addDefine("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
-    programChanged |= pProgram->addDefine("LUMEN_GI_HAS_ENVIRONMENT_SAMPLER", mpEnvMapSampler ? "1" : "0");
+    programChanged |= pProgram->addDefine(
+        "LUMEN_GI_HAS_ENVIRONMENT_SAMPLER",
+        (kUseCacheLightingEnvImportanceSampler && mpEnvMapSampler) ? "1" : "0"
+    );
     programChanged |= pProgram->addDefine("LUMEN_GI_HAS_EMISSIVE_SAMPLER", mpEmissiveLightSampler ? "1" : "0");
     if (mpEmissiveLightSampler)
         programChanged |= pProgram->addDefines(mpEmissiveLightSampler->getDefines());
@@ -2233,7 +2271,7 @@ void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
         cacheVar["gIndirectPrev"] = mCacheLighting.pIndirect[1 - mCacheLighting.indirectCurrIndex];
     cacheVar["gIndirectCurr"] = mCacheLighting.pIndirect[mCacheLighting.indirectCurrIndex];
     cacheVar["gBounceCountAtlas"] = mCacheLighting.pBounceCount;
-    if (mpEnvMapSampler)
+    if (kUseCacheLightingEnvImportanceSampler && mpEnvMapSampler)
         mpEnvMapSampler->bindShaderData(cacheVar["envMapSampler"]);
     if (mpEmissiveLightSampler)
         mpEmissiveLightSampler->bindShaderData(cacheVar["emissiveSampler"]);
@@ -2260,9 +2298,37 @@ void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
     // count is nThreads / threadGroupSize. Passing (renderPageCount, 1, 1) threads would give
     // ceil(renderPageCount/16) groups (wrong); multiply the X axis by the tile size so the
     // dispatch issues exactly renderPageCount threadgroups (SV_GroupID.x == page index).
-    mCacheLighting.pPass->execute(
-        pRenderContext, uint3(renderPageCount * kLumenSurfaceCacheTileSize, kLumenSurfaceCacheTileSize, 1)
+    const uint3 dispatchThreads(renderPageCount * kLumenSurfaceCacheTileSize, kLumenSurfaceCacheTileSize, 1u);
+    const uint3 threadGroupSize = mCacheLighting.pPass->getThreadGroupSize();
+    if (threadGroupSize.x == 0u || threadGroupSize.y == 0u || threadGroupSize.z == 0u)
+    {
+        logWarning("LumenGI cache lighting skipped: invalid shader thread-group size ({}, {}, {}).", threadGroupSize.x,
+                   threadGroupSize.y, threadGroupSize.z);
+        return;
+    }
+    const uint3 dispatchGroups = div_round_up(dispatchThreads, threadGroupSize);
+    logInfo(
+        "LumenGI cache lighting dispatch: frame={} pages={} threads=({}, {}, {}) groups=({}, {}, {}) tg=({}, {}, {}) "
+        "env={} analytic={} emissive={} envSampler={} emissiveSampler={} tlas={} visibility={} pageToCard={} renderList={} "
+        "indirectCurr={} indirectPrev={} bounceCount={} feedback={}",
+        mFrameIndex, renderPageCount, dispatchThreads.x, dispatchThreads.y, dispatchThreads.z, dispatchGroups.x,
+        dispatchGroups.y, dispatchGroups.z, threadGroupSize.x, threadGroupSize.y, threadGroupSize.z,
+        mpScene->useEnvLight() ? 1u : 0u, mpScene->useAnalyticLights() ? 1u : 0u,
+        mpScene->useEmissiveLights() ? 1u : 0u,
+        (kUseCacheLightingEnvImportanceSampler && mpEnvMapSampler) ? 1u : 0u, mpEmissiveLightSampler ? 1u : 0u,
+        mpScene->getSceneStats().tlasCount ? 1u : 0u, mCacheLighting.pVisibilityAtlas ? 1u : 0u,
+        mCacheLighting.pPageToCard ? 1u : 0u, mCacheLighting.pRenderList ? 1u : 0u,
+        mCacheLighting.pIndirect[mCacheLighting.indirectCurrIndex] ? 1u : 0u,
+        mCacheLighting.pIndirect[1u - mCacheLighting.indirectCurrIndex] ? 1u : 0u,
+        mCacheLighting.pBounceCount ? 1u : 0u, feedbackOn ? 1u : 0u
     );
+    if (dispatchGroups.x > 65535u || dispatchGroups.y > 65535u || dispatchGroups.z > 65535u)
+    {
+        logWarning("LumenGI cache lighting skipped: dispatch groups exceed D3D12 limits ({}, {}, {}).", dispatchGroups.x,
+                   dispatchGroups.y, dispatchGroups.z);
+        return;
+    }
+    mCacheLighting.pPass->execute(pRenderContext, dispatchThreads);
 
     // Flip the S3-B2 indirect double buffer: the buffer just written becomes the previous
     // frame's input on the next dispatch (feedback on or off).
@@ -2395,7 +2461,7 @@ void LumenGIPass::runScreenTrace(RenderContext* pRenderContext, const RenderData
             hzbVar["gLinearZSource"] = pLinearZ;
         else
             hzbVar["gHZBSource"].setSrv(mScreenTrace.pHZBMips[d.mip - 1]->getSRV(0, 1));
-        hzbVar["gHZBTarget"].setUav(mScreenTrace.pHZBMips[d.mip]->getUAV(0, 1));
+        hzbVar["gHZBTarget"].setUav(mScreenTrace.pHZBMips[d.mip]->getUAV(0));
         // ComputePass::execute takes THREAD counts; 16x16 threads per group -> exactly the
         // groupsX x groupsY thread groups the frozen LumenHZB dispatch contract requires.
         mScreenTrace.pHZBBuild->execute(
@@ -2471,14 +2537,16 @@ void LumenGIPass::createScreenProbePrograms()
     // are created WITHOUT the scene shader modules / type conformances / gScene binding.
     // LUMEN_GI_PROBE_SCENE_TRACE=1 skips the data module's #if !LUMEN_GI_PROBE_SCENE_TRACE
     // gProbeTLAS declaration (no TLAS is ever bound to these passes).
-    const auto createProbeCompute = [&](const char* shaderFile, const char* entry)
+    const auto createProbeCompute = [&](const char* shaderFile, const char* entry, bool enableHistory)
     {
         DefineList defines;
         defines.add("LUMEN_GI_PROBE_SCENE_TRACE", "1");
+        if (enableHistory)
+            defines.add("LUMEN_GI_PROBE_HISTORY", "1");
         return ComputePass::create(mpDevice, shaderFile, entry, defines);
     };
-    mScreenProbes.pIntegrate = createProbeCompute(kScreenProbeIntegrateShaderFile, "main");
-    mScreenProbes.pInterpolate = createProbeCompute(kScreenProbeInterpolateShaderFile, "main");
+    mScreenProbes.pIntegrate = createProbeCompute(kScreenProbeIntegrateShaderFile, "main", true);
+    mScreenProbes.pInterpolate = createProbeCompute(kScreenProbeInterpolateShaderFile, "main", false);
 }
 
 void LumenGIPass::ensureScreenProbeResources(RenderContext* pRenderContext)
@@ -2493,7 +2561,13 @@ void LumenGIPass::ensureScreenProbeResources(RenderContext* pRenderContext)
     if (!mScreenProbes.pTrace)
         return; // scene not ready.
 
-    if (!mScreenProbes.pMetadata || !mScreenProbes.pHitRecords || mScreenProbes.probeCount != probeCount)
+    // Probe count alone is not a sufficient resize key: ceil(frameDim / tileSize)
+    // can stay constant while the aspect ratio changes (for example 640x360 ->
+    // 640x352).  Recreate all screen-probe resources whenever either the grid
+    // cardinality or the backing frame dimensions change, otherwise the old
+    // metadata/HZB/radiance dimensions are reused with a new dispatch shape.
+    if (!mScreenProbes.pMetadata || !mScreenProbes.pHitRecords || mScreenProbes.probeCount != probeCount ||
+        any(mScreenProbes.resourceDim != mFrameDim))
     {
         // gProbeMeta: LumenScreenProbe::Meta (64 B) per probe. gProbeHitRecords:
         // LumenScreenProbe::Hit (32 B) per (probe, direction), fixed stride
@@ -2538,6 +2612,16 @@ void LumenGIPass::ensureScreenProbeResources(RenderContext* pRenderContext)
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
         mScreenProbes.pRadiance->setName("LumenGIPass::ScreenProbe::RadianceInternal"); // RGBA16F, frame-scoped.
+        mScreenProbes.pInterpolated = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mScreenProbes.pInterpolated->setName("LumenGIPass::ScreenProbe::InterpolatedInternal");
+        mScreenProbes.pRadianceHistory = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mScreenProbes.pRadianceHistory->setName("LumenGIPass::ScreenProbe::RadianceHistory"); // RGB mean, A sample count.
 
         // Prefill the static probe positions (tile centers). Everything else is zero
         // (the update pass resamples active/depth/normal/worldPos every frame).
@@ -2551,9 +2635,12 @@ void LumenGIPass::ensureScreenProbeResources(RenderContext* pRenderContext)
         mScreenProbes.pMetadata->setBlob(metas.data(), 0, metas.size() * sizeof(LumenScreenProbe::Meta));
         pRenderContext->clearUAV(mScreenProbes.pHitRecords->getUAV().get(), uint4(0));
         pRenderContext->clearUAV(mScreenProbes.pCounters->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mScreenProbes.pRadianceHistory->getUAV().get(), float4(0.f));
+        pRenderContext->clearUAV(mScreenProbes.pInterpolated->getUAV().get(), float4(0.f));
 
         mScreenProbes.probeCount = probeCount;
         mScreenProbes.resourceDim = mFrameDim;
+        mScreenProbes.historyResetPending = true;
     }
 }
 
@@ -2608,6 +2695,7 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
     if (!mScreenProbes.pUpdate || !mScreenProbes.pTrace || !mScreenProbes.pFinalize ||
         !mScreenProbes.pIntegrate || !mScreenProbes.pInterpolate ||
         !mScreenProbes.pMetadata || !mScreenProbes.pHitRecords || !mScreenProbes.pRadiance ||
+        !mScreenProbes.pRadianceHistory || !mScreenProbes.pInterpolated ||
         mScreenProbes.probeCount == 0)
     {
         return;
@@ -2631,8 +2719,11 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
     const bool hasScreenTrace = renderData.getTexture("screenTrace") != nullptr;
     const bool hasProbeRadiance = renderData.getTexture("probeRadiance") != nullptr;
     const bool hasProbeInterpolated = renderData.getTexture("probeInterpolated") != nullptr;
+    const bool hasProbeHistory = renderData.getTexture(kProbeHistory) != nullptr;
     const bool hasNormal = renderData.getTexture("normWRoughnessMaterialID") != nullptr;
     const bool hasDiffuseRadiance = renderData.getTexture("diffuseRadianceHitDist") != nullptr;
+    const bool hasSurfaceCacheLookup = mUseSurfaceCache && mUseCacheLighting && mCapture.pCards &&
+        mCapture.pPageTable && mCapture.pRadianceAtlas && mCacheLighting.pVisibilityAtlas;
 
     // Per-frame program specialization (all three trace passes share the same shader + defines).
     bool programChanged = false;
@@ -2651,7 +2742,7 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
     // is_valid defines are pinned to 1 (gProbeRadiance here is the INTERNAL pRadiance texture,
     // independent of the graph "probeRadiance" channel). gGIOutput is the graph-optional
     // "probeInterpolated" output; the passes are skipped entirely when it is not allocated.
-    if (hasProbeInterpolated && hasNormal)
+    if (hasNormal)
     {
         for (const ref<ComputePass>& pPass : {mScreenProbes.pIntegrate, mScreenProbes.pInterpolate})
         {
@@ -2659,10 +2750,16 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
             programChanged |= pProgram->addDefine("is_valid_gProbeMeta", "1");
             programChanged |= pProgram->addDefine("is_valid_gProbeHitRecords", "1");
             programChanged |= pProgram->addDefine("is_valid_gProbeRadiance", "1");
+            programChanged |= pProgram->addDefine("is_valid_gProbeRadianceHistory", "1");
             programChanged |= pProgram->addDefine("is_valid_gLinearZ", "1");
             programChanged |= pProgram->addDefine("is_valid_gNormalRoughnessMaterialID", "1");
             programChanged |= pProgram->addDefine("is_valid_gGIOutput", "1");
         }
+        programChanged |= mScreenProbes.pIntegrate->getProgram()->addDefine("LUMEN_GI_PROBE_HISTORY", "1");
+        programChanged |= mScreenProbes.pIntegrate->getProgram()->addDefine("is_valid_gProbeRadianceHistory", "1");
+        programChanged |= mScreenProbes.pIntegrate->getProgram()->addDefine(
+            "LUMEN_GI_PROBE_CACHE_LOOKUP", hasSurfaceCacheLookup ? "1" : "0"
+        );
     }
     if (programChanged)
     {
@@ -2696,7 +2793,7 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         hzbCb["gSourceIsLinearZ"] = 1u;
         hzbCb["gPad"] = 0u;
         hzbVar["gLinearZSource"] = pLinearZ;
-        hzbVar["gHZBTarget"].setUav(mScreenProbes.pHZBNative->getUAV(0, 1));
+        hzbVar["gHZBTarget"].setUav(mScreenProbes.pHZBNative->getUAV(0));
         mScreenTrace.pHZBBuild->execute(
             pRenderContext, ((mFrameDim.x + 15u) / 16u) * 16u, ((mFrameDim.y + 15u) / 16u) * 16u, 1
         );
@@ -2709,7 +2806,7 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
             hzbCb["gSourceIsLinearZ"] = 0u;
             hzbCb["gPad"] = 0u;
             hzbVar["gHZBSource"].setSrv(mScreenProbes.pHZBNative->getSRV(mip - 1u, 1));
-            hzbVar["gHZBTarget"].setUav(mScreenProbes.pHZBNative->getUAV(mip, 1));
+            hzbVar["gHZBTarget"].setUav(mScreenProbes.pHZBNative->getUAV(mip));
             mScreenTrace.pHZBBuild->execute(
                 pRenderContext, ((dstDims.x + 15u) / 16u) * 16u, ((dstDims.y + 15u) / 16u) * 16u, 1
             );
@@ -2786,12 +2883,12 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
     mScreenProbes.pFinalize->execute(pRenderContext, updateThreads, 1, 1);
 
     // ---- S4.3: probe integrate + interpolate (S4-B3) ---------------------------------
-    // Gate: the graph must allocate the "probeInterpolated" output (and the normal input is
-    // present -- the interpolate pass needs it for the normal/material weights). The radiance
-    // intermediate is the INTERNAL pRadiance texture (not the graph "probeRadiance" channel).
-    if (hasProbeInterpolated && hasNormal)
+    // The production chain always computes an internal interpolated resource. The
+    // graph probeInterpolated output is an optional mirror for diagnostics/capture;
+    // filters no longer depend on markOutput() to execute.
+    if (hasNormal)
     {
-        const ref<Texture> pGIOutput = renderData.getTexture("probeInterpolated");
+        const ref<Texture> pGIOutput = mScreenProbes.pInterpolated;
 
         // Shared CB + shared inputs for the S4.3 passes (mirror the trace bindings; gProbeRadiance
         // is the internal integrate output). No scene block: these passes have no scene imports.
@@ -2821,7 +2918,27 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
             var["gProbeMeta"] = mScreenProbes.pMetadata;
             var["gProbeHitRecords"] = mScreenProbes.pHitRecords;
             var["gProbeRadiance"] = mScreenProbes.pRadiance;
+            if (pPass.get() == mScreenProbes.pIntegrate.get())
+            {
+                var["gProbeRadianceHistory"] = mScreenProbes.pRadianceHistory;
+                if (hasSurfaceCacheLookup)
+                {
+                    var["LumenProbeCacheCB"]["gProbeCacheCardCount"] = mpCardScene->getCardCount();
+                    var["LumenProbeCacheCB"]["gProbeCachePagesPerSide"] = mCapturePagesPerSide;
+                    var["LumenProbeCacheCB"]["gProbeCacheAtlasSize"] = uint2(mAtlasSizeTexels, mAtlasSizeTexels);
+                    var["gProbeCards"] = mCapture.pCards;
+                    var["gProbeCardPageTable"] = mCapture.pPageTable;
+                    var["gProbeRadianceAtlas"] = mCapture.pRadianceAtlas;
+                    var["gProbeVisibilityAtlas"] = mCacheLighting.pVisibilityAtlas;
+                }
+            }
         };
+
+        if (mScreenProbes.historyResetPending)
+        {
+            pRenderContext->clearUAV(mScreenProbes.pRadianceHistory->getUAV().get(), float4(0.f));
+            mScreenProbes.historyResetPending = false;
+        }
 
         bindProbeCompute(mScreenProbes.pIntegrate);
         mScreenProbes.pIntegrate->execute(pRenderContext, updateThreads, 1, 1);
@@ -2846,6 +2963,11 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         const uint32_t interpThreadsX = ((mFrameDim.x + 7u) / 8u) * 8u;
         const uint32_t interpThreadsY = ((mFrameDim.y + 7u) / 8u) * 8u;
         mScreenProbes.pInterpolate->execute(pRenderContext, interpThreadsX, interpThreadsY, 1);
+        mScreenProbes.producedThisFrame = true;
+        if (hasProbeInterpolated)
+            pRenderContext->copyResource(renderData.getTexture("probeInterpolated").get(), pGIOutput.get());
+        if (hasProbeHistory)
+            pRenderContext->copyResource(renderData.getTexture(kProbeHistory).get(), mScreenProbes.pRadianceHistory.get());
     }
 
     if (mScreenProbes.pCounters && mScreenProbes.pCountersReadback)
@@ -2879,6 +3001,7 @@ void LumenGIPass::createTemporalFilterProgram()
     defines.add("is_valid_gTemporalOutput", "1");
     defines.add("is_valid_gTemporalAlpha", "0");
     defines.add("is_valid_gTemporalConfidence", "0");
+    defines.add("is_valid_gMoments", "1");
     mTemporalFilter.pFilter = ComputePass::create(mpDevice, kTemporalFilterShaderFile, "main", defines);
 }
 
@@ -2891,7 +3014,8 @@ void LumenGIPass::ensureTemporalFilterResources(RenderContext* pRenderContext)
         createTemporalFilterProgram();
 
     const bool sizeChanged = any(mTemporalFilter.resourceDim != mFrameDim);
-    if (!mTemporalFilter.pHistory[0] || !mTemporalFilter.pHistory[1] || !mTemporalFilter.pPrevDepth || sizeChanged)
+    if (!mTemporalFilter.pHistory[0] || !mTemporalFilter.pHistory[1] || !mTemporalFilter.pPrevDepth ||
+        !mTemporalFilter.pMoments || sizeChanged)
     {
         // S5-A1 history ping-pong: RGBA16F (RGB = smoothed irradiance, A = history length),
         // full-res, SRV + UAV (the filter reads the previous slot and writes the current slot).
@@ -2917,7 +3041,15 @@ void LumenGIPass::ensureTemporalFilterResources(RenderContext* pRenderContext)
         mTemporalFilter.pPrevDepth->setName("LumenGIPass::TemporalFilter::PrevDepth"); // R32F, frame-scoped.
         pRenderContext->clearUAV(mTemporalFilter.pPrevDepth->getUAV().get(), float4(0.f));
 
+        mTemporalFilter.pMoments = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::RG32Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mTemporalFilter.pMoments->setName("LumenGIPass::TemporalFilter::Moments");
+        pRenderContext->clearUAV(mTemporalFilter.pMoments->getUAV().get(), float4(0.f));
+
         mTemporalFilter.historyCurrIndex = 0;
+        mTemporalFilter.historyResetPending = true;
         mTemporalFilter.resourceDim = mFrameDim;
         mTemporalFilter.historyResetPending = true; // fresh zeroed buffers == reset state.
     }
@@ -2928,9 +3060,14 @@ void LumenGIPass::runTemporalFilter(RenderContext* pRenderContext, const RenderD
     // Allocation gates: gCurrent is the S4.3 interpolate graph output (only produced when the
     // probe path ran), gTemporalOutput is the S5 graph output this pass feeds. The graph channel
     // names mirror kOutputChannels, so renderData.getTexture() resolves them by name.
-    const ref<Texture> pCurrent = renderData.getTexture(kProbeInterpolated);
+    // The internal probe interpolation is the producer consumed by the filter
+    // chain. The graph channel is only a diagnostic mirror and may be allocated
+    // but unwritten when the caller does not markOutput() it.
+    const ref<Texture> pCurrent = mScreenProbes.pInterpolated
+        ? mScreenProbes.pInterpolated
+        : renderData.getTexture(kProbeInterpolated);
     const ref<Texture> pOutput = renderData.getTexture(kTemporalFiltered);
-    if (!pCurrent || !pOutput)
+    if (!pCurrent)
         return;
 
     const ref<Texture> pLinearZ = renderData.getTexture("linearZ");
@@ -2940,7 +3077,7 @@ void LumenGIPass::runTemporalFilter(RenderContext* pRenderContext, const RenderD
 
     ensureTemporalFilterResources(pRenderContext);
     if (!mTemporalFilter.pFilter || !mTemporalFilter.pHistory[0] || !mTemporalFilter.pHistory[1] ||
-        !mTemporalFilter.pPrevDepth)
+        !mTemporalFilter.pPrevDepth || !mTemporalFilter.pMoments)
     {
         return;
     }
@@ -2954,6 +3091,7 @@ void LumenGIPass::runTemporalFilter(RenderContext* pRenderContext, const RenderD
         for (const ref<Texture>& pHist : mTemporalFilter.pHistory)
             pRenderContext->clearUAV(pHist->getUAV().get(), float4(0.f));
         pRenderContext->clearUAV(mTemporalFilter.pPrevDepth->getUAV().get(), float4(0.f));
+        pRenderContext->clearUAV(mTemporalFilter.pMoments->getUAV().get(), float4(0.f));
         mTemporalFilter.historyResetPending = false;
     }
 
@@ -3004,6 +3142,7 @@ void LumenGIPass::runTemporalFilter(RenderContext* pRenderContext, const RenderD
     var["gPrevDepth"] = mTemporalFilter.pPrevDepth;
     var["gPrevGI"] = mTemporalFilter.pHistory[1 - mTemporalFilter.historyCurrIndex];
     var["gTemporalOutput"] = mTemporalFilter.pHistory[mTemporalFilter.historyCurrIndex];
+    var["gMoments"] = mTemporalFilter.pMoments;
     if (hasAlpha)
         var["gTemporalAlpha"] = renderData.getTexture(kTemporalAlpha);
     if (hasConfidence)
@@ -3017,12 +3156,16 @@ void LumenGIPass::runTemporalFilter(RenderContext* pRenderContext, const RenderD
         ((mFrameDim.y + 7u) / 8u) * 8u,
         1
     );
+    mTemporalFilter.producedThisFrame = true;
 
     // S5-A1 frame-end updates: copy the freshly filtered history into the graph "temporalFiltered"
     // output (same RGBA16F format -> full-resource copy) and blit the current linear depth into
     // pPrevDepth so the NEXT frame validates against THIS frame. Then flip the ping-pong: the slot
     // written this frame becomes the previous frame's input next frame.
-    pRenderContext->copyResource(pOutput.get(), mTemporalFilter.pHistory[mTemporalFilter.historyCurrIndex].get());
+    if (pOutput)
+        pRenderContext->copyResource(pOutput.get(), mTemporalFilter.pHistory[mTemporalFilter.historyCurrIndex].get());
+    if (const ref<Texture> pMomentsOutput = renderData.getTexture(kTemporalMoments))
+        pRenderContext->copyResource(pMomentsOutput.get(), mTemporalFilter.pMoments.get());
     pRenderContext->blit(pLinearZ->getSRV(), mTemporalFilter.pPrevDepth->getRTV());
     mTemporalFilter.historyCurrIndex ^= 1u;
 }
@@ -3058,6 +3201,22 @@ void LumenGIPass::ensureSpatialFilterResources(RenderContext* pRenderContext)
 {
     if (!mSpatialFilter.pFilter)
         createSpatialFilterProgram();
+    if (any(mSpatialFilter.resourceDim != mFrameDim) || !mSpatialFilter.pOutput || !mSpatialFilter.pVariance)
+    {
+        mSpatialFilter.pOutput = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mSpatialFilter.pOutput->setName("LumenGIPass::SpatialFilter::OutputInternal");
+        pRenderContext->clearUAV(mSpatialFilter.pOutput->getUAV().get(), float4(0.f));
+        mSpatialFilter.pVariance = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::R32Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mSpatialFilter.pVariance->setName("LumenGIPass::SpatialFilter::VarianceInternal");
+        pRenderContext->clearUAV(mSpatialFilter.pVariance->getUAV().get(), float4(0.f));
+        mSpatialFilter.resourceDim = mFrameDim;
+    }
 }
 
 void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderData& renderData)
@@ -3065,9 +3224,14 @@ void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderDa
     // Allocation gates: gGIInput is the S5-B1 temporalFiltered graph output (the S5 main output),
     // gFilteredOutput is the S5-B2 spatialFiltered graph output this pass feeds. The graph channel
     // names mirror kOutputChannels, so renderData.getTexture() resolves them by name.
-    const ref<Texture> pInput = renderData.getTexture(kTemporalFiltered);
-    const ref<Texture> pOutput = renderData.getTexture(kSpatialFiltered);
-    if (!pInput || !pOutput)
+    ref<Texture> pInput;
+    if (mTemporalFilter.producedThisFrame && mTemporalFilter.pHistory[0] && mTemporalFilter.pHistory[1])
+        pInput = mTemporalFilter.pHistory[1 - mTemporalFilter.historyCurrIndex];
+    if (!pInput && mScreenProbes.producedThisFrame)
+        pInput = renderData.getTexture(kProbeInterpolated) ? renderData.getTexture(kProbeInterpolated) : mScreenProbes.pInterpolated;
+    const ref<Texture> pGraphOutput = renderData.getTexture(kSpatialFiltered);
+    const ref<Texture> pGraphVariance = renderData.getTexture(kFilteredVariance);
+    if (!pInput)
         return;
 
     const ref<Texture> pLinearZ = renderData.getTexture("linearZ");
@@ -3075,8 +3239,11 @@ void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderDa
         return;
 
     ensureSpatialFilterResources(pRenderContext);
-    if (!mSpatialFilter.pFilter)
+    if (!mSpatialFilter.pFilter || !mSpatialFilter.pOutput)
         return;
+    // Always write the internal output. The graph output is an optional mirror
+    // and must not become the producer merely because it is allocated.
+    const ref<Texture> pOutput = mSpatialFilter.pOutput;
 
     // S5-B2 confidence source: the S5-A1 temporalConfidence R32F graph channel. This is the
     // chosen confidence source -- temporalFiltered.a carries the S5-B1 HISTORY LENGTH, not a
@@ -3085,6 +3252,7 @@ void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderDa
     // otherwise the pass falls back to gGIInput.a (degraded proxy).
     const bool hasConfidence = renderData.getTexture(kTemporalConfidence) != nullptr;
     const bool hasNormal = renderData.getTexture("normWRoughnessMaterialID") != nullptr;
+    const bool hasMoments = mTemporalFilter.producedThisFrame && mTemporalFilter.pMoments != nullptr;
 
     // Per-frame program specialization for the optional resources (graph allocation is fixed per
     // graph, so this changes only once per graph build).
@@ -3092,6 +3260,8 @@ void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderDa
     bool programChanged = false;
     programChanged |= pProgram->addDefine("is_valid_gNormalRoughnessMaterialID", hasNormal ? "1" : "0");
     programChanged |= pProgram->addDefine("is_valid_gConfidenceInput", hasConfidence ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gMoments", hasMoments ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gFilteredVariance", "1");
     if (programChanged)
         mSpatialFilter.pFilter->setVars(nullptr);
 
@@ -3155,10 +3325,13 @@ void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderDa
     var["gGIInput"] = pInput;
     if (hasConfidence)
         var["gConfidenceInput"] = renderData.getTexture(kTemporalConfidence);
+    if (hasMoments)
+        var["gMoments"] = mTemporalFilter.pMoments;
     var["gLinearZ"] = pLinearZ;
     if (hasNormal)
         var["gNormalRoughnessMaterialID"] = renderData.getTexture("normWRoughnessMaterialID");
     var["gFilteredOutput"] = pOutput;
+    var["gFilteredVariance"] = pGraphVariance ? pGraphVariance : mSpatialFilter.pVariance;
 
     // Dispatch ceil(gFrameDim / 8) x ceil(gFrameDim / 8) threads (8x8 thread groups per the frozen
     // LumenSpatialFilterData.slang contract). The pass self-guards out-of-frame threads.
@@ -3168,6 +3341,98 @@ void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderDa
         ((mFrameDim.y + 7u) / 8u) * 8u,
         1
     );
+    if (pGraphOutput && pGraphOutput != pOutput)
+        pRenderContext->copyResource(pGraphOutput.get(), pOutput.get());
+    if (pGraphVariance && pGraphVariance != mSpatialFilter.pVariance)
+        pRenderContext->copyResource(pGraphVariance.get(), mSpatialFilter.pVariance.get());
+    mSpatialFilter.producedThisFrame = true;
+}
+
+void LumenGIPass::runFinalResolve(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    const ref<Texture> pDiffuseGI = renderData.getTexture("diffuseGI");
+    if (!pDiffuseGI || any(mFrameDim == uint2(0u, 0u)))
+        return;
+
+    // Prefer the most reconstructed incident signal. The internal resources are
+    // always produced once the probe/filter chain is active, even when callers do
+    // not mark diagnostic graph outputs. If no reconstruction signal exists, the
+    // HWRT output is already modulated radiance and must pass through unchanged
+    // (otherwise albedo would be applied twice).
+    ref<Texture> pSource;
+    if (mSpatialFilter.producedThisFrame)
+        pSource = mSpatialFilter.pOutput;
+    if (!pSource && mSpatialFilter.producedThisFrame)
+        pSource = renderData.getTexture(kSpatialFiltered);
+    bool sourceIsIncident = pSource != nullptr;
+    if (!pSource && mTemporalFilter.producedThisFrame)
+    {
+        if (mTemporalFilter.pHistory[0] && mTemporalFilter.pHistory[1])
+            pSource = mTemporalFilter.pHistory[1 - mTemporalFilter.historyCurrIndex];
+        if (!pSource)
+            pSource = renderData.getTexture(kTemporalFiltered);
+        sourceIsIncident = pSource != nullptr;
+    }
+    if (!pSource && mScreenProbes.producedThisFrame)
+    {
+        pSource = mScreenProbes.pInterpolated;
+        if (!pSource)
+            pSource = renderData.getTexture(kProbeInterpolated);
+        sourceIsIncident = pSource != nullptr;
+    }
+    if (!pSource)
+    {
+        pSource = pDiffuseGI;
+        sourceIsIncident = false;
+    }
+    if (!pSource)
+        return;
+
+    if (!mFinalResolve.pPass)
+    {
+        DefineList defines;
+        defines.add("LUMEN_GI_RESOLVE_INCIDENT", "0");
+        defines.add("is_valid_gDiffuseOpacity", "0");
+        mFinalResolve.pPass = ComputePass::create(mpDevice, kFinalResolveShaderFile, "main", defines);
+    }
+
+    const bool hasDiffuseOpacity = renderData.getTexture("diffuseOpacity") != nullptr;
+    ref<Program> pProgram = mFinalResolve.pPass->getProgram();
+    bool programChanged = false;
+    programChanged |= pProgram->addDefine("LUMEN_GI_RESOLVE_INCIDENT", sourceIsIncident ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gDiffuseOpacity", hasDiffuseOpacity ? "1" : "0");
+    if (programChanged)
+        mFinalResolve.pPass->setVars(nullptr);
+
+    const bool sizeChanged = any(mFinalResolve.resourceDim != mFrameDim);
+    if (!mFinalResolve.pResolved || sizeChanged)
+    {
+        mFinalResolve.pResolved = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mFinalResolve.pResolved->setName("LumenGIPass::FinalResolve::ResolvedDiffuseGI");
+        mFinalResolve.resourceDim = mFrameDim;
+    }
+
+    ShaderVar var = mFinalResolve.pPass->getRootVar();
+    var["CB"]["gFrameDim"] = mFrameDim;
+    var["gSourceGI"] = pSource;
+    if (hasDiffuseOpacity)
+        var["gDiffuseOpacity"] = renderData.getTexture("diffuseOpacity");
+    var["gResolvedGI"] = mFinalResolve.pResolved;
+    mFinalResolve.pPass->execute(
+        pRenderContext,
+        ((mFrameDim.x + 7u) / 8u) * 8u,
+        ((mFrameDim.y + 7u) / 8u) * 8u,
+        1
+    );
+
+    // The public diffuseGI output is always the resolved production value. An
+    // optional graph output mirrors the same texture for capture/validation.
+    pRenderContext->copyResource(pDiffuseGI.get(), mFinalResolve.pResolved.get());
+    if (const ref<Texture> pResolvedOutput = renderData.getTexture("resolvedDiffuseGI"))
+        pRenderContext->copyResource(pResolvedOutput.get(), mFinalResolve.pResolved.get());
 }
 
 // =====================================================================================
@@ -3443,10 +3708,15 @@ void LumenGIPass::ensureGDFResources(RenderContext* pRenderContext)
         pRenderContext->clearUAV(mSDF.pTraceStatsReadback->getUAV().get(), uint4(0));
     }
 
-    // Mesh SDF atlas GPU mirror (fine = R16Float mip0 pages, coarse = R8Snorm mips >= 1).
+    // Mesh SDF atlas GPU mirror.  The CPU cache keeps the source quality metadata as
+    // R16Float/R8Snorm, but the runtime shader declares both atlas SRVs as Texture3D<float>.
+    // Use R32Float staging views here so the Slang typed view and D3D12 descriptor format
+    // agree; coarse values remain normalized in [-1,1] and are decoded by quantRange.
     const uint32_t P = std::max<uint32_t>(mSDF.atlasPagesPerSide, 1u);
     const uint32_t texels = P * s6::kLumenMeshSDFAtlasPageSize;
-    if (!mSDF.pFineAtlas || mSDF.pFineAtlas->getWidth() != texels)
+    if (!mSDF.pFineAtlas || mSDF.pFineAtlas->getWidth() != texels ||
+        mSDF.pFineAtlas->getFormat() != ResourceFormat::R32Float ||
+        !mSDF.pCoarseAtlas || mSDF.pCoarseAtlas->getFormat() != ResourceFormat::R32Float)
     {
         mSDF.pFineAtlas = mpDevice->createTexture3D(
             texels, texels, texels, ResourceFormat::R32Float, 1, nullptr,
@@ -3499,19 +3769,15 @@ void LumenGIPass::uploadMeshSDFAtlas(RenderContext* pRenderContext)
 
     s6::LumenMeshSDFAtlas& atlas = mSDF.pScene->instanceTable().atlas();
 
-    // Upload the host atlas images (fine = R16Float f16 bits, coarse = R8Snorm int8 codes).
+    // Upload raw float atlas images.  The physical staging resources are R32Float to match
+    // Texture3D<float>; coarseImage is already normalized and keeps its quantRange codec.
     if (!mSDF.fineImage.empty())
     {
-        std::vector<uint16_t> f16(mSDF.fineImage.size());
-        for (size_t i = 0; i < mSDF.fineImage.size(); ++i)
-            f16[i] = Falcor::math::float32ToFloat16(mSDF.fineImage[i]);
-        pRenderContext->updateTextureData(mSDF.pFineAtlas.get(), f16.data());
+        pRenderContext->updateTextureData(mSDF.pFineAtlas.get(), mSDF.fineImage.data());
     }
     if (!mSDF.coarseImage.empty())
     {
-        std::vector<int8_t> codes;
-        s6CoarseImageToCodes(mSDF.coarseImage, codes);
-        pRenderContext->updateTextureData(mSDF.pCoarseAtlas.get(), codes.data());
+        pRenderContext->updateTextureData(mSDF.pCoarseAtlas.get(), mSDF.coarseImage.data());
     }
 
     // Upload the page table, volume descriptors and the atlas instance table.
@@ -3629,11 +3895,6 @@ void LumenGIPass::runGDFCompose(RenderContext* pRenderContext)
             mSDF.pGDFInstances.get(), gdfInstances.data(), 0,
             gdfInstances.size() * sizeof(LumenGI::MeshSDF::Scene::LumenMeshSDFGDFInstance)
         );
-    if (!regions.empty())
-        pRenderContext->updateBuffer(
-            mSDF.pDirtyRegions.get(), regions.data(), 0, regions.size() * sizeof(LumenGDFDirtyRegionHost)
-        );
-
     if (regions.empty())
         return; // no dirty voxels this frame (static camera, no instance changes).
 
@@ -3654,7 +3915,6 @@ void LumenGIPass::runGDFCompose(RenderContext* pRenderContext)
     clip["dynamicLevelCount"] = s6gdf::kDynamicLevels;
     clip["resolution"] = R;
     clip["instanceCount"] = static_cast<uint32_t>(gdfInstances.size());
-    clip["dirtyRegionCount"] = static_cast<uint32_t>(regions.size());
     clip["frameIndex"] = mFrameIndex;
     const s6gdf::index3 scroll = mSDF.gdf->scrollFromCameraMove();
     clip["scroll"] = int3(scroll.x, scroll.y, scroll.z);
@@ -3662,13 +3922,6 @@ void LumenGIPass::runGDFCompose(RenderContext* pRenderContext)
     var["gGDFLevelTable"] = mSDF.pLevelTable;
     var["gGDFInstances"] = mSDF.pGDFInstances;
     var["gGDFDirtyRegions"] = mSDF.pDirtyRegions;
-    // Fill EVERY slot of the gGDFLevels[kLumenGDFMaxLevels] array (repeat the last level) so no
-    // descriptor is left invalid: D3D12 validates the whole UAV array at dispatch and a null
-    // entry aborts with E_INVALIDARG. Only [0, levelCount) is ever accessed by the shader.
-    // UAV arrays are bound with setUav (assignment binds an SRV descriptor, which a UAV array
-    // rejects at dispatch with E_INVALIDARG).
-    for (uint32_t m = 0; m < kLumenGDFMaxLevelsHost; ++m)
-        var["gGDFLevels"][m].setUav(mSDF.levels[std::min<uint32_t>(m, levelCount - 1u)]->getUAV(0, 1));
     // S6-B2 atlas bindings (SRV): fine/coarse atlas textures, page table, volume descriptors
     // and the instance table, plus the atlas-geometry scalars. Created + uploaded every frame
     // the atlas data is dirty in ensureGDFResources()/uploadMeshSDFAtlas().
@@ -3681,24 +3934,43 @@ void LumenGIPass::runGDFCompose(RenderContext* pRenderContext)
     var["gAtlasVolumeCount"] = mSDF.pScene->instanceTable().meshCount();
     var["gAtlasPagesPerSide"] = mSDF.atlasPagesPerSide;
 
-    // Dispatch: (ceil(maxRegionDimsX / 8), regionCount, ceil(maxRegionDimsYZ / 8)) with
-    // numthreads(8, 1, 8); the shader bounds-checks every thread against its region.
-    uint32_t maxDx = 1u, maxDyz = 1u;
-    for (const LumenGDFDirtyRegionHost& r : regions)
+    // A single RWTexture3D UAV is bound per dispatch. This avoids D3D12 rejecting
+    // a partially populated/mixed-format UAV descriptor array; regions are batched
+    // by clipmap level, and the shader still uses region.level for table lookup.
+    for (uint32_t level = 0; level < levelCount; ++level)
     {
-        const uint32_t dx = static_cast<uint32_t>(std::max(0, r.max[0] - r.min[0] + 1));
-        const uint32_t dyz = static_cast<uint32_t>(std::max(0, r.max[1] - r.min[1] + 1)) *
-                             static_cast<uint32_t>(std::max(0, r.max[2] - r.min[2] + 1));
-        maxDx = std::max(maxDx, std::max(dx, 1u));
-        maxDyz = std::max(maxDyz, std::max(dyz, 1u));
+        std::vector<LumenGDFDirtyRegionHost> batch;
+        for (const LumenGDFDirtyRegionHost& region : regions)
+            if (region.level == level)
+                batch.push_back(region);
+        if (batch.empty())
+            continue;
+
+        pRenderContext->updateBuffer(
+            mSDF.pDirtyRegions.get(), batch.data(), 0, batch.size() * sizeof(LumenGDFDirtyRegionHost)
+        );
+        clip["dirtyRegionCount"] = static_cast<uint32_t>(batch.size());
+        var["gGDFLevel"].setUav(mSDF.levels[level]->getUAV(0));
+
+        uint32_t maxDx = 1u, maxDyz = 1u;
+        for (const LumenGDFDirtyRegionHost& region : batch)
+        {
+            const uint32_t dx = static_cast<uint32_t>(std::max(0, region.max[0] - region.min[0] + 1));
+            const uint32_t dyz = static_cast<uint32_t>(std::max(0, region.max[1] - region.min[1] + 1)) *
+                                 static_cast<uint32_t>(std::max(0, region.max[2] - region.min[2] + 1));
+            maxDx = std::max(maxDx, std::max(dx, 1u));
+            maxDyz = std::max(maxDyz, std::max(dyz, 1u));
+        }
+        logInfo(
+            "S6 compose dispatch: level={} threads=({}, {}, {}) groups=({}, {}, {}) regions={}",
+            level, maxDx, static_cast<uint32_t>(batch.size()), maxDyz,
+            (maxDx + 7u) / 8u, static_cast<uint32_t>(batch.size()), (maxDyz + 7u) / 8u,
+            batch.size()
+        );
+        // ComputePass::execute takes logical thread counts and performs the
+        // ceil-divide using the reflected [numthreads(8, 1, 8)] declaration.
+        mSDF.pCompose->execute(pRenderContext, maxDx, static_cast<uint32_t>(batch.size()), maxDyz);
     }
-    logInfo("S6 compose dispatch: x={} y={} z={} (regions={}, maxDx={}, maxDyz={})", (maxDx + 7u) / 8u, static_cast<uint32_t>(regions.size()), (maxDyz + 7u) / 8u, regions.size(), maxDx, maxDyz);
-    mSDF.pCompose->execute(
-        pRenderContext,
-        (maxDx + 7u) / 8u,
-        static_cast<uint32_t>(regions.size()),
-        (maxDyz + 7u) / 8u
-    );
 
     mSDF.sceneStats = mSDF.pScene->getStats();
 }
@@ -3709,7 +3981,10 @@ void LumenGIPass::runGDFSphereTrace(RenderContext* pRenderContext, const RenderD
     if (!mSDF.pScene || !mSDF.gdf || !mSDF.pCompose || mSDF.levels.empty())
         return;
 
-    const bool primary = (mTraceMode == TraceMode::MeshSDF);
+    // The current GDF payload is a distance/hit diagnostic. It must not overwrite
+    // the already-produced HWRT diffuse radiance until a material-lighting router
+    // supplies a physically meaningful replacement.
+    constexpr bool primary = false;
     const bool hasDebug = renderData.getTexture(kGDFTrace) != nullptr;
     if (!primary && !hasDebug)
         return; // nothing to write (Hybrid without the diagnostic channel).
@@ -3778,12 +4053,11 @@ void LumenGIPass::runGDFSphereTrace(RenderContext* pRenderContext, const RenderD
         var["gGDFTraceDebug"] = renderData.getTexture(kGDFTrace);
     var["gGDFTraceStats"] = mSDF.pTraceStats;
 
-    mSDF.pTrace->execute(
-        pRenderContext,
-        (mFrameDim.x + 7u) / 8u,
-        (mFrameDim.y + 7u) / 8u,
-        1
-    );
+    // ComputePass::execute takes logical thread counts and performs the
+    // ceil-divide using the reflected [numthreads(8, 8, 1)] declaration. Do
+    // not pass pre-divided group counts here or the GDF trace covers only an
+    // eighth of the intended image in each axis.
+    mSDF.pTrace->execute(pRenderContext, mFrameDim.x, mFrameDim.y, 1);
 
     if (mSDF.pTraceStats && mSDF.pTraceStatsReadback)
     {
@@ -3808,9 +4082,23 @@ void LumenGIPass::readbackGDFTraceStats(RenderContext* pRenderContext)
 std::map<std::string, double> LumenGIPass::getGDFStats() const
 {
     std::map<std::string, double> stats;
-    stats["active"] = (mUseGDF || mTraceMode != TraceMode::HardwareRT) ? 1.0 : 0.0;
+    const bool gdfExecuted = mUseGDF && mSDF.pScene && mSDF.gdf && mSDF.pCompose && mSDF.pTrace;
+    stats["active"] = gdfExecuted ? 1.0 : 0.0;
+    stats["requestedActive"] = (mUseGDF || mTraceMode != TraceMode::HardwareRT) ? 1.0 : 0.0;
+    stats["gdfExecuted"] = gdfExecuted ? 1.0 : 0.0;
     stats["traceMode"] = static_cast<double>(static_cast<uint32_t>(mTraceMode));
     stats["useGDF"] = mUseGDF ? 1.0 : 0.0;
+    // C4/C5 routing telemetry. The current distance-field payload is diagnostic
+    // only; HWRT remains the authoritative material-lighting source until a
+    // shared hit-record router is implemented. Exposing this explicitly prevents
+    // a gdfTrace texture from being mistaken for selected GI radiance.
+    stats["hwrtPrimary"] = 1.0;
+    stats["gdfRadianceSelected"] = 0.0;
+    stats["hybridFallbackToHWRT"] = (mTraceMode == TraceMode::Hybrid || mTraceMode == TraceMode::MeshSDF) ? 1.0 : 0.0;
+    stats["probeFallbackAttempts"] = (double)mScreenProbeStats.fallbackAttempts;
+    stats["probeFallbackHits"] = (double)mScreenProbeStats.fallbackHits;
+    stats["probeFallbackMisses"] = (double)mScreenProbeStats.fallbackMisses;
+    stats["probeFallbackUnavailable"] = (double)mScreenProbeStats.fallbackUnavailable;
 
     if (mSDF.pScene)
     {
@@ -3846,5 +4134,30 @@ std::map<std::string, double> LumenGIPass::getGDFStats() const
     stats["sphereMaxSteps"] = (double)mSDF.traceStats[3];
     stats["sphereNoGrid"] = (double)mSDF.traceStats[4];
     stats["sphereHitRate"] = traced > 0 ? (double)mSDF.traceStats[1] / (double)traced : 0.0;
+    return stats;
+}
+
+std::map<std::string, double> LumenGIPass::getScreenProbeStats() const
+{
+    std::map<std::string, double> stats;
+    const uint2 grid = LumenScreenProbe::probeGridDims(mFrameDim);
+    stats["probeCount"] = (double)mScreenProbeStats.probeCount;
+    stats["resourceDimX"] = (double)mScreenProbes.resourceDim.x;
+    stats["resourceDimY"] = (double)mScreenProbes.resourceDim.y;
+    stats["probeGridX"] = (double)grid.x;
+    stats["probeGridY"] = (double)grid.y;
+    stats["directionsPerProbe"] = (double)mScreenProbeStats.directionsPerProbe;
+    stats["updateInterval"] = (double)mScreenProbeStats.updateInterval;
+    stats["expectedProbesPerFrame"] = (double)mScreenProbeStats.expectedProbesPerFrame;
+    stats["screenHits"] = (double)mScreenProbeStats.screenHits;
+    stats["fallbackAttempts"] = (double)mScreenProbeStats.fallbackAttempts;
+    stats["fallbackHits"] = (double)mScreenProbeStats.fallbackHits;
+    stats["fallbackMisses"] = (double)mScreenProbeStats.fallbackMisses;
+    stats["fallbackUnavailable"] = (double)mScreenProbeStats.fallbackUnavailable;
+    stats["inactiveProbes"] = (double)mScreenProbeStats.inactiveProbes;
+    stats["budgetSkipped"] = (double)mScreenProbeStats.budgetSkipped;
+    stats["directionsTraced"] = (double)mScreenProbeStats.directionsTraced;
+    stats["screenHitRate"] = (double)mScreenProbeStats.screenHitRate();
+    stats["fallbackHitRate"] = (double)mScreenProbeStats.fallbackHitRate();
     return stats;
 }

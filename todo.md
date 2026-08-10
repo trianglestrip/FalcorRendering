@@ -1,3 +1,70 @@
+# LumenGI 接手入口（2026-08-10 CodeGraph 复核）
+
+> [!IMPORTANT]
+> **当前唯一权威执行计划：[`docs/LumenGI_Production_Chain_Closure_Plan.md`](docs/LumenGI_Production_Chain_Closure_Plan.md)。**
+> 目标仍是实现借鉴 UE5 Lumen 公开架构思想的实时动态 GI；本次调整的是生产主链闭环、完成定义和执行顺序，不是把项目改成离线渲染或普通 HWRT 降噪器。
+
+> [!WARNING]
+> **当前权威状态以本节和上述生产主链计划为准。** 本文件后半部分保留的 2026-08-09 状态、Gate 结论、下一步和 agent 分工均为历史记录，仅用于追溯证据；即使旧段落写有“Gate 已关闭”“下一步”或可直接复制的开场指令，也不得据此跳过新的 C0→C12 执行顺序。
+
+## 当前权威状态
+
+| 原阶段 | 2026-08-10 状态 | 当前可采信结论 |
+|---|---|---|
+| S0 工程骨架 | **完成** | 构建、基础测试和诊断骨架证据可保留。 |
+| S1 HWRT Baseline | **完成** | 单反弹 HWRT 基线可作为回退和对照；不代表完整 LumenGI。 |
+| S2 Cards / Surface Cache | **组件完成，生产集成未闭环** | Cards、capture、atlas/页管理证据可保留；cache radiance 尚未证明被最终 GI 消费。 |
+| S3 Cache Lighting | **组件完成，C1 部分执行；生产集成未闭环** | env importance sampler 变体仍触发 `E_INVALIDARG`；当前使用 uniform-environment fallback，all-on 可运行但不能关闭 Gate。 |
+| S4 Screen Trace / Screen Probe | **组件完成，生产集成未闭环** | HZB、screen trace、probe trace/integrate/interpolate 可运行；命中辐射来源与场景追踪路由仍不完整。 |
+| S5 Temporal / Spatial | **组件完成，生产集成未闭环** | 时域、空域组件测试可保留；滤波结果尚未通过 Final Resolve 成为最终 `diffuseGI`。 |
+| S6 Mesh SDF / GDF / Hybrid | **未完成：控制流和 Hybrid 错误** | 组件存在，但 GDF 执行顺序、MeshSDF fallback 和真正 Hybrid 都必须重做并重验。 |
+| S7 Radiance Cache / Far Field | **CPU-only** | 仅 CPU 数据结构/单测可采信；GPU 生产主链尚未接线。 |
+| S8 Quality Preset / 优化 | **部分接线** | preset 表存在，运行时主要只接入 cache-lighting samples/texel；probe、分辨率、预算和重建等参数尚未完整生效。 |
+| S9 发布 Gate | **未开始** | 必须等待生产主链、画质、动态稳定、性能和多场景多视角证据全部闭环。 |
+
+当前准确名称是：**LumenGI 组件原型 + HWRT Baseline，生产主链尚未闭环**。组件文件存在、debug 输出非零、CPU 单测通过或 checkbox 可切换，都不能单独关闭 Production Integration Gate。
+
+## 下一步：严格按 C0→C12 推进
+
+详细任务、修改范围、Gate、证据目录和回滚条件均以 [`docs/LumenGI_Production_Chain_Closure_Plan.md`](docs/LumenGI_Production_Chain_Closure_Plan.md) 为准；本表只作为接手导航。
+
+| 顺序 | 闭环项 | 最小完成判据 |
+|---|---|---|
+| C0 | 冻结失败复现与可信截图/参考协议 | C0.1 已记录稳定失败和 dispatch telemetry；C0.2 capture 已生成 raw/probe/temporal/spatial/PT，resolved/final 明确 SKIP。 |
+| C1 | 修复 Arcade cache-lighting `E_INVALIDARG`（当前为 env sampler fallback） | 重新启用 environment importance sampler 后，Arcade 解析光、环境光、发光同时开启且 validation 无新增错误。 |
+| C2 | 修复 800x450/非 8 倍数分辨率问题 | 640x360、800x450、1280x720 均稳定运行且资源/dispatch 边界正确。 |
+| C3 | 修复 MeshSDF 无 GDF 时的黑帧回退 | trace mode × feature toggle 矩阵无黑帧，缺失能力明确回退 HWRT。 |
+| C4 | 重排 GDF 并建立 Trace Router 数据契约 | GDF/HWRT 等后端统一 hit record，GDF hit 在 Probe Integrate 前可见。 |
+| C5 | 实现真正 Hybrid 与 backend counters | 同帧可证明 SDF/GDF 命中和 HWRT fallback；GDF 不再只是 debug 输出。 |
+| C6 | 接入 Surface Cache radiance lookup、generation 与 fallback | cache radiance 被 Probe hit lighting 消费；开关/失效会对最终 GI 产生可解释差异。 |
+| C7 | 修复跨帧 Screen Probe 方向采样 | 方向集跨帧新增有效样本，8→32→96 帧误差持续下降。 |
+| C8 | 内部化生产中间资源 | 算法不依赖 RenderGraph `markOutput()`；export/debug 开关不改变最终数值。 |
+| C9 | Final Resolve 接入最终 `diffuseGI` | Probe→Temporal→Spatial/Upscale→Resolve 全链生效，输出完成材质调制并进入最终合成。 |
+| C10 | Radiance Cache/Far Field GPU 接线 | query/refresh/fallback/预算进入最终 GI，cache miss 不黑屏且无持续显存增长。 |
+| C11 | 完整 Quality Preset 与性能优化 | Low/Medium/High/Reference 参数单调、热切换稳定，画质和性能均有证据。 |
+| C12 | 完整发布矩阵 | 多场景三视角、动态、validation、三轮性能和 30min/2h soak 全部通过。 |
+
+## 2026-08-10 runtime evidence delta
+
+The implementation pass has now exercised the executable C0-C9 work in order.
+Use the detailed table in the production plan as the authority:
+
+- C2 has a current GPU matrix; C7 has history/count evidence but its direction-union gate is still open; C8/C9 have current host/runtime evidence with the mark-off endpoint contract still open.
+- C1 is still partial because the environment importance sampler remains on the safe fallback (`envSampler=0`).
+- C3 fallback is usable, but C4/C5 are blocked by `E_INVALIDARG` in `runGDFCompose` with `useGDF=true`; MeshSDF/GDF must not be marked complete.
+- C6 has host lookup/history wiring but still needs an on/off invalidation comparison.
+- The final showcase is a resolved indirect-radiance composite preview. `finalColor` is intentionally not claimed until a production composite exists.
+- C10-C12 remain deferred until the open C1/C4/C5 gates are closed; do not start Radiance Cache GPU work early.
+
+执行约束：C0–C12 的生产依赖默认串行；仅互不写同一文件的诊断、测试资产和证据整理可并行。仓库级 MSBuild 与 GPU 测试仍由 root 各自单路调度。C0–C9 完成前不得接 C10–C12，禁止以降低画质阈值代替修复。
+
+---
+
+# 历史快照：2026-08-09 交接单（只读追溯，不再作为执行入口）
+
+> [!CAUTION]
+> 以下内容原样保留用于追溯旧证据、旧文件位置和历史决策，其中的状态表、S0→S9 顺序、下一步清单、并行 agent 分工及开场指令均已被上方权威入口取代。
+
 # LumenGI 继续实现 TODO / 对话交接单
 
 > 最后整理：2026-08-09。本文记录当前工作区的**实际状态**和下一步入口；完整设计与全阶段拆解分别见 `docs/LumenGI_Technical_Roadmap.md` 和 `task.md`。新对话应先读本文，再按 `task.md` 的 S0→S9 Gate 顺序继续。
@@ -269,3 +336,12 @@ tools\.packman\cmake\bin\cmake.exe --build build\windows-vs2022 `
 ```text
 继续 F:\project\FalcorRendering 的 codex/lumen-gi 分支。先完整阅读 todo.md、task.md 和 docs/LumenGI_Technical_Roadmap.md；当前所有改动未提交，不要 reset/clean/stage/commit。先用 CodeGraph 核实 LumenGI 当前调用路径和 Falcor API，再关闭 todo.md 中剩余的 S0 Gate，补完 S1 HWRT Baseline Gate，然后按 S2-S9 最大化三路 subagent 并行开发、root 单点集成和逐阶段回归。一次只允许一个 MSBuild，所有新 Shader 必须通过 Mogwai 真实运行时编译。持续执行到所有 Gate 完成；不要把当前原型提前称为完整 Lumen。
 ```
+## Runtime evidence delta (2026-08-11)
+
+- C1: fallback-only production state reverified. Keep `kUseCacheLightingEnvImportanceSampler=false` until the enabled variant stops returning D3D12 `E_INVALIDARG`.
+- C4/C5: E0 `(1,1,1)` compose experiment still fails, so the next bounded task is no-op shader + single-UAV descriptor bisection. Do not start C10.
+- C4 source follow-up: MeshSDF fine/coarse runtime atlas staging is now R32Float with raw float uploads to match `Texture3D<float>`; rebuild and runtime-compile before treating the fix as valid. E1/E2 diagnostic shaders exist, but host wiring is still pending.
+- C6: surface-cache lookup/invalidation/low-budget GPU Gate PASS; artifact `artifacts/lumengi/C6/surfacecache-effect-20260811`.
+- C8/C9: mark-on/export equivalence PASS for both filter policies in `artifacts/lumengi/C8/export-equivalence-20260811d/export-equivalence.json`; mark-off cases are correctly `BLOCKED` because direct production endpoints are unavailable without graph marking. Sentinel data is diagnostic only; `finalColor` is still SKIP.
+- Host fix: GDF sphere trace now receives logical frame dimensions; rerun only after compose dispatch is fixed.
+- Latest GPU evidence: fresh R32Float atlas build still returns `E_INVALIDARG` in `artifacts/lumengi/C4/r32-verified-20260811.log`; E1/E2 compile PASS is recorded in `artifacts/lumengi/C4/gdf-diag-compile-20260811d.json` (the harness then hits shutdown-only DXGI_DEVICE_REMOVED). C7 history/count is finite and monotonic in `artifacts/lumengi/C7/probe-direction-union-20260811/probe-direction-union.json`, while `directionUnionGate=SKIP` until sample identity telemetry exists.

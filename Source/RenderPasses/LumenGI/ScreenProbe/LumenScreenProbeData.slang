@@ -35,6 +35,9 @@
 #ifndef LUMEN_GI_PROBE_SCENE_TRACE
 #define LUMEN_GI_PROBE_SCENE_TRACE 0
 #endif
+#ifndef LUMEN_GI_PROBE_HISTORY
+#define LUMEN_GI_PROBE_HISTORY 0
+#endif
 
 /** Frozen data contract for the S4.2 screen probe gather (S4-A2/B2, Agent Z1).
  *
@@ -255,6 +258,9 @@ RWStructuredBuffer<LumenScreenProbeMeta> gProbeMeta;
 RWStructuredBuffer<LumenProbeHit> gProbeHitRecords;
 RWStructuredBuffer<LumenScreenProbeCounters> gProbeCounters;
 RWTexture2D<float4> gProbeRadiance;
+#if LUMEN_GI_PROBE_HISTORY
+RWTexture2D<float4> gProbeRadianceHistory;
+#endif
 RWStructuredBuffer<float4> gProbeDebug; // Optional (tests only): per-probe march diagnostics.
 
 #endif // __LUMEN_SCREEN_PROBE_DATA_SLANG__

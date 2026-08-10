@@ -32,6 +32,7 @@ target_sources(LumenGI PRIVATE
     Spatial/LumenSpatialFilterData.slang
     Spatial/LumenSpatialFilter.cs.slang
     Spatial/LumenReconstruction.h
+    Resolve/LumenFinalResolve.cs.slang
     MeshSDF/LumenMeshSDF.h
     MeshSDF/LumenMeshSDFCache.h
     MeshSDF/LumenMeshSDFAtlas.h
@@ -43,6 +44,8 @@ target_sources(LumenGI PRIVATE
     MeshSDF/LumenMeshSDFAtlas.slang
     MeshSDF/LumenGDFData.slang
     MeshSDF/LumenGDFCompose.cs.slang
+    MeshSDF/LumenGDFComposeDiag.cs.slang
+    MeshSDF/LumenGDFComposeDiagAll.cs.slang
     MeshSDF/LumenGDFSphereTrace.3d.slang
     MeshSDF/LumenGDFTrace.cs.slang
 )

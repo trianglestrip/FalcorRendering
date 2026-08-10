@@ -153,6 +153,9 @@ import Utils.Math.MathHelpers; // oct_to_ndir_unorm
 #ifndef is_valid_gTemporalConfidence
 #define is_valid_gTemporalConfidence 0
 #endif
+#ifndef is_valid_gMoments
+#define is_valid_gMoments 0
+#endif
 
 #define is_valid(name) (is_valid_##name != 0)
 
@@ -469,6 +472,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             gTemporalAlpha[pixel] = 1.f;
         if (is_valid(gTemporalConfidence))
             gTemporalConfidence[pixel] = 0.f;
+        if (is_valid(gMoments))
+            gMoments[pixel] = float2(0.f);
         return;
     }
 
@@ -482,6 +487,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
             gTemporalAlpha[pixel] = 1.f;
         if (is_valid(gTemporalConfidence))
             gTemporalConfidence[pixel] = 0.f;
+        if (is_valid(gMoments))
+            gMoments[pixel] = float2(0.f);
         return;
     }
 
@@ -541,6 +548,28 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     // Output: RGB = smoothed irradiance, A = new history length (host stores it
     // for the next frame; the host accumulates its own history from gTemporalAlpha).
     gTemporalOutput[pixel] = float4(lumenTemporalSanitize(outRGB), outHist);
+    // C8 running luminance moments. The temporal output alpha is the accepted
+    // history length, so a reset (outHist == 1) starts a fresh population and
+    // subsequent frames update an online mean / second moment. This resource is
+    // intentionally separate from RGBA16F history to preserve variance precision.
+    if (is_valid(gMoments))
+    {
+        const float lum = dot(outRGB, float3(0.2126f, 0.7152f, 0.0722f));
+        const float previousCount = max(outHist - 1.f, 0.f);
+        if (previousCount <= 0.f)
+        {
+            gMoments[pixel] = float2(lum, lum * lum);
+        }
+        else
+        {
+            const float2 previous = gMoments[pixel];
+            const float invCount = 1.f / max(outHist, 1.f);
+            gMoments[pixel] = float2(
+                (previous.x * previousCount + lum) * invCount,
+                (previous.y * previousCount + lum * lum) * invCount
+            );
+        }
+    }
     if (is_valid(gTemporalAlpha))
         gTemporalAlpha[pixel] = alpha;
     if (is_valid(gTemporalConfidence))

@@ -147,7 +147,11 @@ float3 lumenProbeSampleDirection(
     const uint j = (dirIndex + rot) % n;
     sampleIndex = j;
     // Low-discrepancy 2D point, jittered within one cell to decorrelate probes.
-    float2 u = frac(lumenProbeHammersley(j, n) + lumenProbeHash2(probeIndex) * (1.0 / float(n)));
+    // Cranley-Patterson style per-frame rotation: unlike a pure permutation of
+    // the fixed Hammersley slots, the jitter changes with frameIndex so the
+    // accumulated history observes a growing direction set.
+    float2 u = frac(lumenProbeHammersley(j, n) +
+                    lumenProbeHash2(probeIndex ^ (frameIndex * 0x9e3779b9u)) * (1.0 / float(n)));
 
     // Tangent frame from the normal (branchless construction).
     const float3 N = any(isnan(normalW)) ? float3(0.f, 1.f, 0.f) : normalize(normalW);

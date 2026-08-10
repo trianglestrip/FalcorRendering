@@ -3,7 +3,9 @@
 > 工作分支：`codex/lumen-gi`  
 > 源码基线：NVIDIA Falcor `master@eb540f67`  
 > 配套路线：`docs/LumenGI_Technical_Roadmap.md`  
-> 状态：待执行  
+> **当前权威闭环计划：`docs/LumenGI_Production_Chain_Closure_Plan.md`**
+> 历史阶段拆解与既有证据：本文；当本文与权威闭环计划冲突时，以权威闭环计划为准
+> 状态：组件实现已有历史进展，S5.5 Production Chain Closure 待执行
 > 执行原则：阶段内最大化并行，阶段间严格门禁；持续执行到全部 Definition of Done 满足
 
 ## 1. 最终目标与完成定义
@@ -26,6 +28,8 @@
 - [ ] `Release` 与 `Debug` 均可从干净配置构建；
 - [ ] `LumenGI` RenderGraph 可在 Mogwai 中加载、热重载、切换场景和调整分辨率；
 - [ ] HWRT、Screen+HWRT、Screen+SDF 三条路径均可运行；
+- [ ] 生产数据流真实闭环：Surface Cache radiance → Hit Lighting Router → Probe → Temporal → Spatial/Upscale → Resolve → 最终 `diffuseGI`，且 Scene Trace Router 的 Mesh SDF/GDF/HWRT/Far Field 回退可测；
+- [ ] 生产链所需中间资源由 pass 内部保证分配，打开或关闭 RenderGraph debug/export 输出不改变最终 `diffuseGI`；
 - [ ] 动态相机、动态光源、刚体实例、材质变化会正确更新或失效历史；
 - [ ] 解析光、环境光和发光三角形均贡献间接光；
 - [ ] Surface Cache、Screen Probe、GDF、Radiance Cache 都有独立调试视图；
@@ -300,6 +304,66 @@ flowchart TD
 - [ ] half-res 重建在冻结阈值内接近 full-res reference；——S5-A2 half/quarter 重建（`LumenReconstruction` upscale）为 S8 quality-preset 项；本轮 MVP full-res，契约与 CB 路径已冻结。见 `Spatial/LumenReconstruction.h`。
 - [x] 无 NaN/Inf、负方差、history length 溢出；——static/cut/ghost 全相位全通道 finite + 非负；temporalFiltered.a 峰值 255 ≤ cap 255；spatialFiltered 非负、置信度∈[0,1]。证据 `artifacts/lumengi/S5/gate/*.json`。
 - [x] 固定轨迹的帧间闪烁指标达到目标；——static-tail spatial 帧间 diff 0.05206 ≤ temporal 0.05215×1.1（空间滤波不增闪烁）；temporal 收敛尾 0.053 << raw probe 0.555（~10× 降噪）；cut settle 恢复。证据 `artifacts/lumengi/S5/gate/spatial-gate.json`。
+
+## 10.5. S5.5：Production Chain Closure（当前最高优先级）
+
+> 权威细节、修改范围、测试矩阵与停止条件见 `docs/LumenGI_Production_Chain_Closure_Plan.md`。本阶段不删除 S2–S6 的历史组件证据，但所有受生产数据流改动影响的 GPU/image Gate 必须重跑。Component Gate 通过不等于 Production Integration Gate 关闭。
+
+### 目标生产数据流
+
+```text
+Surface Cache capture + lighting
+→ HZB / Screen Trace
+→ Scene Trace Router（Mesh SDF / GDF / HWRT / Far Field）
+→ Hit Lighting Router（Surface Cache radiance + 明确 fallback）
+→ Probe Integrate / Interpolate
+→ Temporal
+→ Spatial / Upscale
+→ Diffuse GI Resolve
+→ final diffuseGI
+```
+
+任何 shader、CPU 数据结构、debug output 或 feature checkbox 的存在，都不能单独证明主链闭环。只有组件输出被下游生产路径真实消费并最终影响 `diffuseGI`，Production Integration Gate 才能关闭。
+
+### P0–P4 阶段概要
+
+| 阶段 | 目标 | 必须交付的生产语义 | 进入下一阶段的 Gate |
+|---|---|---|---|
+| P0 复现与可信基线 | 冻结 Arcade `E_INVALIDARG`、800x450 崩溃和当前画质失败 | 保存首个 validation error、资源/define manifest；分别输出 raw/probe/temporal/spatial/resolved/final 与 PT direct/indirect/final | 已知失败稳定复现或证明确已消失；线性 HDR、固定曝光、三视角协议可重复 |
+| P1 Trace Router 与执行顺序 | 修复 MeshSDF 黑帧、GDF 后置覆盖和伪 Hybrid | GDF/追踪后端在 Probe 前产生统一 hit record；Hybrid 为 Screen → SDF/GDF → HWRT fallback；记录 backend counters | mode/toggle 矩阵无黑帧；GDF hit 在 Probe 前可见；薄/动态/不支持几何明确回退 HWRT |
+| P2 Surface Cache Hit Lighting | 让 cache radiance 成为命中照明的生产输入 | world hit → card/page/atlas UV；generation/validity 校验；cache miss/stale/evicted 明确回退 | cache 开关对最终 `resolvedDiffuseGI` 产生方向正确的非零差异；关闭 cache 不黑屏；能量与 generation Gate 通过 |
+| P3 Screen Probe 质量 | 修复跨帧方向只重排和固定 2x2 块状插值 | 使用可复现的跨帧新增方向采样；置信度驱动 probe 更新与 3x3/5x5 gather；输出 moments/variance/fallback composition | 96 帧相对 8 帧继续逼近 PT indirect；tile 边界梯度比 ≤ 1.25；几何/材质边界无明显漏光 |
+| P4 Temporal/Spatial/Resolve | 消除可选输出依赖并闭合最终输出 | 中间资源内部化；真实 moments/variance 与 history validation；`resolvedDiffuseGI = selectedIrradiance * diffuseReflectance / PI`，对外 `diffuseGI = resolvedDiffuseGI` | export on/off 数值一致；filtered output 影响最终图；albedo 只乘一次；动态恢复、静态稳定和最终材质颜色 Gate 通过 |
+
+### C0–C9 小批次执行顺序
+
+后续 LLM 每次只处理第一个未完成批次；当前批次 Gate 未关闭前不得跨批次堆叠实现。
+
+| 批次 | 唯一实现范围 | 批次 Gate |
+|---|---|---|
+| C0 | 新增 P0 复现 manifest 与可信截图/参考协议 | 两个已知失败可复现；输出语义和 PT indirect 基准正确 |
+| C1 | 修复 Arcade cache-lighting `E_INVALIDARG` | env + analytic + emissive 同开，D3D12/RT Validation 零 error |
+| C2 | 修复 800x450 与非 8 倍数分辨率资源/dispatch | 640x360、800x450、1280x720 均通过 |
+| C3 | 修复 `MeshSDF + useGDF=false` 黑帧与回退 | trace mode × feature toggle 矩阵通过，合法配置不清零 |
+| C4 | 前移 GDF 并建立统一 Trace Router/hit record | GDF hit 在 Probe Integrate 前可见，Temporal/Spatial 后无后端覆盖 |
+| C5 | 实现真实 Hybrid 与 backend counters | 同帧存在 SDF/GDF 命中及 HWRT fallback 证据 |
+| C6 | 接入 Surface Cache radiance lookup、generation 和 fallback | cache 开关影响最终 GI；stale/evicted 页不可读；miss 不黑屏 |
+| C7 | 修复跨帧 probe direction sampling 与插值输入 | 8 → 32 → 96 帧误差继续下降，固定 seed 可复现 |
+| C8 | 内部化生产中间资源，移除 `markOutput()` 算法依赖 | debug/export on/off 的最终 `diffuseGI` 数值一致 |
+| C9 | Final Resolve 接入最终 `diffuseGI` | spatial/temporal/fallback 层级可测；滤波结果影响最终图且 albedo 只乘一次 |
+
+### S5.5 Production Integration Gate
+
+- [ ] C0–C9 按顺序全部完成，每个批次都有最小复现、受影响回归、artifact 与明确 verdict。
+- [ ] Surface Cache radiance 在真实场景命中中被 Hit Lighting Router 消费；关闭、miss、stale、evicted 时存在无黑帧回退。
+- [ ] Screen miss 经统一 Scene Trace Router 选择 Mesh SDF/GDF/HWRT；`Hybrid` 有多后端命中与 fallback counter 证据。
+- [ ] GDF/追踪结果在 Probe Integrate 前可用，任何后端不得在 Temporal/Spatial 后直接覆盖最终输出。
+- [ ] `probeInterpolated → temporalFiltered → spatialFiltered/upscaled → resolvedDiffuseGI → diffuseGI` 的生产依赖不依赖可选 debug/export 输出。
+- [ ] `spatialFiltered` 的受控变化会影响最终 `diffuseGI`；diffuse albedo 只调制一次，最终图具有正确材质颜色。
+- [ ] Cornell、Arcade、emissive_glow、black_room、white_furnace 的固定线性 HDR 矩阵通过；间接光只与 `PT bounce1 - bounce0` 比较。
+- [ ] 640x360、800x450、1280x720 无 crash、black frame、NaN/Inf、负能量、尺寸不匹配或 D3D12/RT Validation error。
+- [ ] 静态尾帧平均变化 ≤ 1%；camera cut 当帧拒绝历史；移动光/遮挡变化后 ≤ 4 帧恢复；tile-boundary gradient ratio ≤ 1.25。
+- [ ] S5.5 关闭后，受数据流改动影响的 S2–S6 GPU/image Gate 已重跑；未通过项保持未完成并保留可复现证据。
 
 ## 11. S6：Mesh SDF、Global Distance Field 与软件追踪
 
@@ -684,27 +748,34 @@ artifacts/lumengi/<phase>/<timestamp>/
 |---|---|---|---|---|
 | S0 基础骨架 | [x] | 无 | 插件、契约、脚本、测试骨架 | `artifacts/lumengi/S0/`（phase0-report.md、manifest.json、unit-debug.xml、hotreload.log、gbuffer-compare.json） |
 | S1 HWRT 基线 | [x] | S0 | 一反弹 diffuse GI（MIS/RR/clamp/NaN 防护、emissive NEE、调试分量） | `artifacts/lumengi/S1/`（reference-compare/metrics2.json、analytic.log、dynamic.log） |
-| S2 Cards/Surface Cache | [x] | S1 | Card、atlas、驻留与 capture | `artifacts/lumengi/S2/`（gate/coverage、overlay PNG、churn 证据、debuglayer） |
-| S3 Cache Lighting | [x] | S2 | 直接光 cache lighting + 多反弹反馈 | `artifacts/lumengi/S3/`（gate/feedback_gate.json、stability 15/15、lightstep） |
-| S4 Screen Trace/Probe | [x] | S3 | HZB + screen trace + probe grid + integrate/interpolate | `artifacts/lumengi/S4/`（completeness PASS、probe gates、interp 9 gates） |
-| S5 时域/空域 | [x] | S4 | temporal + spatial filter + history | `artifacts/lumengi/S5/`（temporal 14/14、spatial 14/14、ghost 4/4） |
-| S6 Mesh SDF/GDF | [ ] | S2；集成依赖 S5 | builder、atlas、clipmap、hybrid trace（组件齐备+compose/trace 打通，Gate 证据部分） | `artifacts/lumengi/S6/`（compose 运行不崩；软件追踪 vs HWRT 数值对比、S6-C 系列待正式） |
-| S7 Radiance Cache/Far Field | [ ] | S5+S6 | 辐射度缓存与远场（组件落盘未集成 GPU） | `LumenRadianceCache.h` + 23 CPU 测试；GPU 集成待续 |
-| S8 优化/质量档 | [ ] | S7 | compaction、preset、GPU marker（preset 组件落盘） | `LumenQualityPreset.h` + 7 CPU 测试；GPU 接线待续 |
-| S9 发布回归 | [ ] | S8 | 全量测试、性能报告、长稳定（核心回归已跑，完整矩阵待续） | `artifacts/lumengi/S9/`（analytic/dynamic/stability/s2verify/smoke + 110/110 unit） |
-| S3 Surface Cache Lighting | [ ] | S2 | 直接/环境/自发光与 feedback | 待生成 |
-| S4 Screen Probe Gather | [ ] | S3 | screen trace、probe、fallback | 待生成 |
-| S5 时域/空域稳定 | [ ] | S4 | reprojection、滤波、upsample | 待生成 |
-| S6 Mesh SDF/GDF | [ ] | S2；集成依赖 S5 | builder、atlas、clipmap、hybrid trace | 待生成 |
-| S7 Radiance Cache/Far Field | [ ] | S5+S6 | 辐射度缓存与远场 | 待生成 |
-| S8 优化/质量档 | [ ] | S7 | compaction、preset、GPU marker | 待生成 |
-| S9 发布回归 | [ ] | S8 | 全量测试、性能报告、长稳定性 | 待生成 |
+| S2 Cards/Surface Cache | Component [x] / Integration [ ] | S1 | Card、atlas、驻留与 capture 组件已通过；其 radiance 消费仍受 S5.5 主链 Gate 约束 | 保留 `artifacts/lumengi/S2/`（gate/coverage、overlay PNG、churn 证据、debuglayer）；Production Gate 由 S5.5/P2/C6 重验 |
+| S3 Cache Lighting | Component [x] / Integration [ ] | S2 | 独立 cache lighting + 多反弹反馈组件已通过；Screen Probe 尚未消费 cache radiance | 保留 `artifacts/lumengi/S3/`（gate/feedback_gate.json、stability 15/15、lightstep）；生产接线由 S5.5/P2/C6 重验 |
+| S4 Screen Trace/Probe | Component [x] / Integration [ ] | S3 | HZB、screen trace、probe trace/integrate/interpolate 组件已通过；命中 radiance 仍复用 S1 屏幕结果 | 保留 `artifacts/lumengi/S4/`（completeness PASS、probe gates、interp 9 gates）；Production Gate 由 S5.5/P1–P3 重验 |
+| S5 时域/空域 | Component [x] / Integration [ ] | S4 | temporal/spatial/history 组件已通过；host 已接入内部资源和 Final Resolve，但 C8/C9 mark-off endpoint 证据仍未闭环 | 保留 `artifacts/lumengi/S5/`（temporal 14/14、spatial 14/14、ghost 4/4）；Production Gate 由 S5.5/P4/C8–C9 重验 |
+| **S5.5 Production Chain Closure** | [ ] | S3–S6 组件证据 | P0–P4 / C0–C9：Trace Router、Hit Lighting、Probe、重建、Final Resolve 生产闭环 | `artifacts/lumengi/chain-closure/`；仅在本节 Production Integration Gate 全部通过后完成 |
+| S6 Mesh SDF/GDF | Component 部分通过 / Integration [ ] | S2；生产集成依赖 S5.5 | builder/cache/atlas/compose/sphere trace 已打通；执行顺序错误，Hybrid 与 fallback 未完成 | 保留 `artifacts/lumengi/S6/`（compose 运行不崩）；S6-C 数值证据及 S5.5/P1/C3–C5 待完成 |
+| S7 Radiance Cache/Far Field | CPU Component [x] / GPU Integration [ ] | S5.5 | CPU 数据结构和 23 项单测存在；`mUseRadianceCache` 尚未驱动 GPU 生产主链 | `LumenRadianceCache.h` + 23 CPU 测试；GPU query/refresh/fallback 与最终 GI Gate 待完成 |
+| S8 优化/质量档 | Preset Component [x] / Runtime Integration [ ] | S7 | preset 数据表和 7 项单测存在；运行时仅 cache-lighting samples/texel 部分受控 | `LumenQualityPreset.h` + 7 CPU 测试；完整分辨率/probe/trace/cache/filter 预算接线待完成 |
+
+### Runtime evidence delta (2026-08-11)
+
+The current verdicts and artifacts are maintained in
+`docs/LumenGI_Production_Chain_Closure_Plan.md` and `todo.md`:
+
+- C6 runtime lookup/invalidation/low-budget gate: PASS.
+- C7 history count: PASS for finite monotonic accumulation; direction-union identity: SKIP.
+- C8/C9 mark-on equivalence: PASS; mark-off direct production endpoints: BLOCKED; `finalColor`: SKIP.
+- C4/C5: BLOCKED by fresh R32Float `runGDFCompose` `E_INVALIDARG`; E1/E2 shaders compile but host descriptor bisect remains pending.
+- C10-C12 remain deferred until C1, C4/C5, C7 and C8/C9 close.
+| S9 发布回归 | [ ] | S8 | 核心回归证据已有，完整图像/动态/性能/validation/soak 发布矩阵未关闭 | 保留 `artifacts/lumengi/S9/`（analytic/dynamic/stability/s2verify/smoke + 110/110 unit）；完整矩阵待续 |
 
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：
 
 - [ ] S0–S9 全部标记完成。
+- [ ] S5.5 Production Chain Closure 全部关闭：Surface Cache/Trace Router/Hit Lighting/Probe/Temporal/Spatial/Resolve 形成真实生产数据流并最终写入 `diffuseGI`。
+- [ ] 生产链不依赖 `markOutput()` 或任意 debug/export 输出才运行；相同输入下 export on/off 的最终 `diffuseGI` 数值一致。
 - [ ] Low/Medium/High/Reference 四档在支持的硬件上均可运行。
 - [ ] HardwareRT、MeshSDF 和 Hybrid 路径均有测试证据，且可按功能开关回退。
 - [ ] Cornell Box 和 Arcade 的静态、动态、分辨率和更新场景回归全部通过。

@@ -232,5 +232,6 @@ Texture2D<float>   gPrevConfidence;             // optional; previous confidence
 RWTexture2D<float4> gTemporalOutput;            // required; smoothed GI (.a = new history length).
 RWTexture2D<float>  gTemporalAlpha;             // optional; effective EMA alpha.
 RWTexture2D<float>  gTemporalConfidence;        // optional; updated confidence.
+RWTexture2D<float2> gMoments;                   // optional; running luminance mean / mean square.
 
 #endif // __LUMEN_TEMPORAL_FILTER_DATA_SLANG__

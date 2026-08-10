@@ -82,7 +82,7 @@ namespace Falcor
  *     Texture::create2D(mipDimension(w, mip), mipDimension(h, mip),
  *                       ResourceFormat::R32Float, 1, 1, nullptr,
  *                       ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess)
- * Bind gHZBTarget = pLevel[mip]->getUAV(0, 1), gHZBSource = pLevel[mip-1]->getSRV(0, 1),
+ * Bind gHZBTarget = pLevel[mip]->getUAV(0), gHZBSource = pLevel[mip-1]->getSRV(0, 1),
  * gLinearZSource = the GBufferRT linearZ texture.
  *
  * Thread safety: stateless; all methods are const/static and safe to call
