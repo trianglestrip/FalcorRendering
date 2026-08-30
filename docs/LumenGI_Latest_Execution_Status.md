@@ -975,6 +975,13 @@ because independent process runs differ in request counts. Keep the macro
 diagnostic-only until a same-process or otherwise deterministic per-card A/B
 proves equality and measures atomic-group/timestamp benefit.
 
+The request-wave validator now accepts an opt-in `--scope request` diagnostic
+that excludes post-sink capture/ready/first-hit/state fields while retaining
+exact request aggregates and request-frame/card/reason/count fields. Its
+v42/v43 result is still `FAIL` (request raw `988186` vs `991429`; first
+request-count difference at card 7), while the default `--scope exact` remains
+unchanged and strict.
+
 The former C4 compose `E_INVALIDARG` note is superseded by the current bounded
 artifact `artifacts/lumengi/C4/gdf-probe-router-current-20260815/`, which reports
 `PASS`, `useGDF=true`, and `Screen -> GDF -> HWRT`. The remaining C4/C5 work is
@@ -995,3 +1002,26 @@ enabled domain to show activity; legacy v36/v37 artifacts without the newer
 target flags remain compatible. The host copy/pending path is also guarded by
 `hasNormal`, preventing stale UAV readback when the integrate producer is not
 present.
+
+### 2026-08-30 C5 current-runtime guard
+
+- A current Release C5 paired run is recorded at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v1/`. The same
+  Mogwai process and GBuffer produced matching cache-lighting/card-grid
+  telemetry; `resolvedDiffuseGI` and `diffuseGI` stayed within the frozen
+  `1e-4` paired tolerance, while `probeInterpolated` exceeded it on frames
+  6-8 (mean deltas `4.2573e-4`, `3.4903e-4`, `3.0486e-4`). The report is
+  therefore `FAIL/OPEN`, not a grid-equivalence closure.
+- The paired gate now requires positive `probeCount`,
+  `directionsPerProbe`, and `cacheLookupAttempts` telemetry somewhere in the
+  capture. Missing or all-zero activity is `BLOCKED`, preventing an empty
+  screen-probe path from being reported as an equivalence `PASS`. Thresholds
+  and production defaults are unchanged. Paired output diagnostics now also
+  record `p95Abs` and `changedNonzeroFraction`; these fields do not alter the
+  strict mean/mean-delta gate.
+- A rerun with the enhanced runner is at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v2/`. Activity was
+  real (`probeCount` max `920`, `directionsPerProbe` `16`, lookup attempts
+  `4715`), but `probeInterpolated` remained out of tolerance on frames 2-8
+  (mean deltas `1.7956e-2` down to `3.3605e-3`). This confirms the guard is
+  exercising the intended path while C5 quality/equivalence stays `FAIL/OPEN`.

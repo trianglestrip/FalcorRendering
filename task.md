@@ -1094,6 +1094,12 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   deterministic per-card A/B plus atomic-group/timestamp evidence proves exact
   scheduler-visible equivalence and measurable benefit.
 
+- `run_c9_request_wave_equivalence.py` now has an opt-in `--scope request`
+  diagnostic that compares exact request aggregates and request-sink fields
+  without treating later capture/ready/first-hit/state jitter as request
+  semantics. The existing v42/v43 result remains `FAIL` (raw `988186` vs
+  `991429`), and the default exact scope is unchanged.
+
 - The historical C4 compose `E_INVALIDARG` blocker is superseded by
   `artifacts/lumengi/C4/gdf-probe-router-current-20260815/gdf-probe-router.json`
   (`PASS`, `useGDF=true`, `Screen -> GDF -> HWRT`). Remaining C4/C5 work is
@@ -1111,6 +1117,24 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   the enabled domain, and compatibility with older artifacts. Feedback/request
   readback is also guarded by `hasNormal` to prevent stale UAV copies when the
   integrate producer is absent.
+
+- The current Release C5 paired runtime at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v1/` confirms
+  matching cache-lighting/card-grid provenance and in-tolerance
+  `resolvedDiffuseGI`/`diffuseGI`, but `probeInterpolated` exceeds the frozen
+  `1e-4` tolerance on frames 6-8; keep C5 `FAIL/OPEN`. The paired runner now
+  requires positive `probeCount`, `directionsPerProbe`, and
+  `cacheLookupAttempts` activity, classifying missing/all-zero exercise as
+  `BLOCKED` rather than allowing an empty-path PASS. It also records `p95Abs`
+  and `changedNonzeroFraction` for sparse atlas diagnostics without changing
+  the strict gate.
+
+- Enhanced C5 runtime v2 at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v2/` recorded
+  actual activity (`probeCount` max `920`, `directionsPerProbe=16`, lookup
+  attempts `4715`) but `probeInterpolated` still exceeded `1e-4` on frames 2-8
+  (mean deltas `1.7956e-2` to `3.3605e-3`). Keep C5 quality/equivalence
+  `FAIL/OPEN`; the new guard is working.
 
 ## 21. 最终完成条件
 

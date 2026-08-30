@@ -1623,7 +1623,10 @@ The follow-up per-card event-ledger A/B (`.../v42-request-wave-on-events/` vs
 `tests/lumengi/run_c9_request_wave_equivalence.py` because independent process
 runs do not produce identical request counts. Do not enable this macro in
 production until a deterministic per-card A/B and atomic-group/timestamp
-measurement prove both semantic equality and a real benefit.
+measurement prove both semantic equality and a real benefit. The validator now
+offers `--scope request` to isolate request-sink fields from later scheduler
+lifecycle fields; v42/v43 still fails that narrower scope (raw `988186` vs
+`991429`), so no equivalence claim is promoted.
 
 The old C4 compose `E_INVALIDARG` blocker is superseded: the current bounded
 `artifacts/lumengi/C4/gdf-probe-router-current-20260815/gdf-probe-router.json`
@@ -1643,3 +1646,22 @@ process-exit or soak result.
 legacy artifacts, requiring positive activity from the enabled domain. The
 feedback/request copy blocks are additionally guarded by `hasNormal` so a graph
 without the integrate producer cannot replay stale UAV contents.
+
+The current Release C5 paired runtime is captured in
+`artifacts/lumengi/C5/paired-equivalence-current-20260830-v1/`. Cache-lighting
+and card-grid provenance match across the two in-process passes, and the
+resolved/final diffuse outputs remain within the existing `1e-4` tolerance;
+`probeInterpolated` exceeds it on frames 6-8, so this remains `FAIL/OPEN`.
+The paired runner now treats missing or all-zero `probeCount`,
+`directionsPerProbe`, or `cacheLookupAttempts` as `BLOCKED`, avoiding a false
+PASS when the card-grid path was never exercised. No production threshold or
+default was changed. It also records `p95Abs` and
+`changedNonzeroFraction` diagnostics for sparse atlas differences without
+changing the strict mean/mean-delta gate.
+
+The enhanced rerun at
+`artifacts/lumengi/C5/paired-equivalence-current-20260830-v2/` observed real
+probe activity (`probeCount` max `920`, `directionsPerProbe=16`, lookup
+attempts `4715`) but still failed `probeInterpolated` on frames 2-8 (mean
+deltas `1.7956e-2` to `3.3605e-3`). This keeps C5 quality/equivalence
+`FAIL/OPEN` while confirming the path is not an empty no-op.

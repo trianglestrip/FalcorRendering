@@ -67,29 +67,45 @@ def _events(runtime: dict[str, Any], path: Path) -> list[dict[str, Any]]:
     return events
 
 
-def _canonical_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # Sequence is included: it proves the same accepted-card order reached the
-    # scheduler.  Keep the complete event fields so a reason/count mismatch
-    # cannot hide behind equal aggregate totals.
-    fields = (
-        "sequence",
-        "sceneGeneration",
-        "cardID",
-        "pageID",
-        "generation",
-        "requestFrame",
-        "captureFrame",
-        "readyFrame",
-        "firstHitFrame",
-        "reasonBits",
-        "requestCount",
-        "lookupHits",
-        "state",
-    )
+def _canonical_events(events: list[dict[str, Any]], scope: str = "exact") -> list[dict[str, Any]]:
+    # Sequence is included in both scopes: it proves the same accepted-card
+    # order reached the scheduler.  ``request`` intentionally excludes fields
+    # populated after the request sink (capture/ready/first-hit/state and
+    # lookup-hit counts), allowing a semantic A/B to report lifecycle jitter
+    # separately without weakening the default exact gate.
+    if scope == "request":
+        fields = (
+            "sequence",
+            "sceneGeneration",
+            "cardID",
+            "pageID",
+            "generation",
+            "requestFrame",
+            "reasonBits",
+            "requestCount",
+        )
+    else:
+        fields = (
+            "sequence",
+            "sceneGeneration",
+            "cardID",
+            "pageID",
+            "generation",
+            "requestFrame",
+            "captureFrame",
+            "readyFrame",
+            "firstHitFrame",
+            "reasonBits",
+            "requestCount",
+            "lookupHits",
+            "state",
+        )
     return [{field: event.get(field) for field in fields} for event in events]
 
 
-def evaluate(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
+def evaluate(baseline_path: Path, candidate_path: Path, scope: str = "exact") -> dict[str, Any]:
+    if scope not in ("exact", "request"):
+        raise EvidenceBlocked(f"unsupported comparison scope: {scope}")
     baseline_path = baseline_path.resolve()
     candidate_path = candidate_path.resolve()
     baseline = _read(baseline_path)
@@ -121,8 +137,8 @@ def evaluate(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
         for name in REQUEST_STATS
         if baseline_stats.get(name) != candidate_stats.get(name)
     }
-    baseline_events = _canonical_events(_events(baseline, baseline_path))
-    candidate_events = _canonical_events(_events(candidate, candidate_path))
+    baseline_events = _canonical_events(_events(baseline, baseline_path), scope)
+    candidate_events = _canonical_events(_events(candidate, candidate_path), scope)
     if stat_differences or baseline_events != candidate_events:
         event_detail: dict[str, Any] = {
             "baselineEventCount": len(baseline_events),
@@ -133,7 +149,7 @@ def evaluate(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
                 event_detail["firstEventDifference"] = {"index": index, "baseline": left, "candidate": right}
                 break
         raise EvidenceFailed(
-            "request aggregates or per-card scheduler ledger differ: "
+            "%s aggregates or per-card ledger differ: " % scope
             + json.dumps({"stats": stat_differences, "events": event_detail}, sort_keys=True)
         )
 
@@ -144,7 +160,12 @@ def evaluate(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
         "candidate": str(candidate_path),
         "requestStats": {name: baseline_stats.get(name) for name in REQUEST_STATS},
         "eventCount": len(baseline_events),
-        "comparison": "exact_request_aggregates_and_scheduler_event_ledger",
+        "comparison": (
+            "exact_request_aggregates_and_scheduler_event_ledger"
+            if scope == "exact"
+            else "exact_request_aggregates_and_request_sink_event_ledger"
+        ),
+        "scope": scope,
     }
 
 
@@ -204,6 +225,19 @@ def self_test() -> None:
             pass
         else:
             raise AssertionError("config mismatch must block")
+
+        lifecycle_only = _fixture(True)
+        lifecycle_only["surfaceCacheEvents"][0]["readyFrame"] = 99
+        lifecycle_only["surfaceCacheEvents"][0]["lookupHits"] = 42
+        candidate_path.write_text(json.dumps(lifecycle_only), encoding="utf-8")
+        request_result = evaluate(baseline_path, candidate_path, scope="request")
+        assert request_result["status"] == "PASS"
+        try:
+            evaluate(baseline_path, candidate_path, scope="exact")
+        except EvidenceFailed:
+            pass
+        else:
+            raise AssertionError("lifecycle mismatch must fail exact scope")
     print("C9_REQUEST_WAVE_EQUIVALENCE_SELF_TEST PASS")
 
 
@@ -212,6 +246,12 @@ def main() -> int:
     parser.add_argument("--baseline")
     parser.add_argument("--candidate")
     parser.add_argument("--output")
+    parser.add_argument(
+        "--scope",
+        choices=("exact", "request"),
+        default="exact",
+        help="compare the full scheduler ledger (default) or request-sink fields only",
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -220,7 +260,7 @@ def main() -> int:
     if not args.baseline or not args.candidate:
         parser.error("--baseline and --candidate are required")
     try:
-        result = evaluate(Path(args.baseline), Path(args.candidate))
+        result = evaluate(Path(args.baseline), Path(args.candidate), scope=args.scope)
         status = "PASS"
         code = 0
     except EvidenceFailed as exc:

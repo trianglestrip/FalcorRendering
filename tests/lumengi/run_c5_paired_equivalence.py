@@ -109,6 +109,15 @@ STATS_FIELDS = (
     "cardGridIndexedCards",
     "cardGridMissingCards",
 )
+
+# A paired comparison is only meaningful when the screen-probe/card-grid path
+# actually executed.  Without this guard an empty graph can report identical
+# zero counters and accidentally turn an unexercised candidate into PASS.
+ACTIVITY_FIELDS = (
+    "probeCount",
+    "directionsPerProbe",
+    "cacheLookupAttempts",
+)
 STAT_ALIASES = {
     "cardGridCandidateCount": ("cardGridCandidateCount", "candidateCount"),
     "cardGridOverflowCells": ("cardGridOverflowCells", "overflowCells"),
@@ -169,8 +178,10 @@ def _difference(full: Any, grid: Any) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "sameShape": list(left.shape) == list(right.shape),
         "meanAbs": None,
+        "p95Abs": None,
         "maxAbs": None,
         "meanDelta": None,
+        "changedNonzeroFraction": None,
         "finite": False,
         "withinTolerance": False,
     }
@@ -180,13 +191,23 @@ def _difference(full: Any, grid: Any) -> Dict[str, Any]:
         return result
     delta = np.abs(left - right)
     mean_abs = float(np.mean(delta))
+    p95_abs = float(np.percentile(delta, 95.0))
     max_abs = float(np.max(delta))
     mean_delta = abs(float(np.mean(left)) - float(np.mean(right)))
+    nonzero = (np.abs(left) > 0.0) | (np.abs(right) > 0.0)
+    changed_nonzero = (delta > 0.0) & nonzero
+    nonzero_count = int(np.count_nonzero(nonzero))
     result.update(
         {
             "meanAbs": mean_abs,
+            "p95Abs": p95_abs,
             "maxAbs": max_abs,
             "meanDelta": mean_delta,
+            "changedNonzeroFraction": (
+                float(np.count_nonzero(changed_nonzero)) / float(nonzero_count)
+                if nonzero_count
+                else 0.0
+            ),
             "finite": True,
             # Both the pixel-wise mean and the scalar output mean are kept
             # under the same strict gate.  The max is diagnostic only: a
@@ -346,8 +367,10 @@ def _frame_pair(graph: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 "finite": False,
                 "withinTolerance": False,
                 "meanAbs": None,
+                "p95Abs": None,
                 "maxAbs": None,
                 "meanDelta": None,
+                "changedNonzeroFraction": None,
             }
     return (
         {"fullscan": full, "grid": grid, "differences": differences},
@@ -372,6 +395,8 @@ def _save_frame_arrays(frame_id: int, arrays: Mapping[str, Mapping[str, np.ndarr
 
 def _evaluate(frames: Sequence[Mapping[str, Any]], render_error: str | None) -> Dict[str, Any]:
     checks = []
+    activity_values: Dict[str, List[float]] = {field: [] for field in ACTIVITY_FIELDS}
+    activity_missing: Dict[str, bool] = {field: False for field in ACTIVITY_FIELDS}
     if render_error:
         checks.append({"name": "render", "status": "BLOCKED", "reason": render_error})
     if not frames:
@@ -393,6 +418,19 @@ def _evaluate(frames: Sequence[Mapping[str, Any]], render_error: str | None) -> 
                 }
             )
         pair = frame.get("pair", {})
+        # Aggregate activity telemetry across the capture.  Warm-up frames may
+        # legitimately report zero attempts, so the gate requires at least one
+        # positive sample for every field rather than rejecting frame 1.
+        for side in ("fullscan", "grid"):
+            side_probe_stats = pair.get(side, {}).get("screenProbeStats", {})
+            for field in ACTIVITY_FIELDS:
+                value = side_probe_stats.get(field) if isinstance(side_probe_stats, Mapping) else None
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    activity_missing[field] = True
+                elif not math.isfinite(float(value)) or float(value) < 0.0:
+                    activity_missing[field] = True
+                else:
+                    activity_values[field].append(float(value))
         full_stats = pair.get("fullscan", {}).get("surfaceCacheStats", {})
         grid_stats = pair.get("grid", {}).get("surfaceCacheStats", {})
         for field in STATS_FIELDS:
@@ -406,6 +444,34 @@ def _evaluate(frames: Sequence[Mapping[str, Any]], render_error: str | None) -> 
                     "status": "PASS" if equal else "BLOCKED",
                     "fullscan": left,
                     "grid": right,
+                }
+            )
+    for field in ACTIVITY_FIELDS:
+        values = activity_values[field]
+        if activity_missing[field] or not values:
+            checks.append(
+                {
+                    "name": "runtime activity %s" % field,
+                    "status": "BLOCKED",
+                    "reason": "missing or invalid screen-probe telemetry",
+                    "observed": values,
+                }
+            )
+        elif max(values) <= 0.0:
+            checks.append(
+                {
+                    "name": "runtime activity %s" % field,
+                    "status": "BLOCKED",
+                    "reason": "screen-probe/card-grid path was not exercised",
+                    "observed": values,
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": "runtime activity %s" % field,
+                    "status": "PASS",
+                    "observedMax": max(values),
                 }
             )
     statuses = [check["status"] for check in checks]
@@ -433,7 +499,12 @@ def _self_test() -> int:
     assert equal_diff["withinTolerance"]
     assert close_diff["withinTolerance"]
     assert not over_diff["withinTolerance"]
+    assert close_diff["p95Abs"] <= OUTPUT_TOLERANCE
+    assert over_diff["changedNonzeroFraction"] == 1.0
     assert _health(equal)["finite"]
+    empty_gate = _evaluate([], None)
+    assert empty_gate["status"] == "BLOCKED"
+    assert any(check["name"].startswith("runtime activity ") for check in empty_gate["checks"])
     print("C5_PAIRED_EQUIVALENCE_SELF_TEST_PASS")
     return 0
 
