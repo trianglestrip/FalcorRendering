@@ -1582,3 +1582,21 @@ activity (`cacheLookupHits=232`, feedback hits `130291`, request raw
 `3100534`), so it is a timing perturbation rather than evidence of a missing
 state transition. Keep the switch diagnostic-only; `copyResource()` already
 emits the UAV-to-copy transition in the normal path.
+
+The v36-v38 feedback split is the next diagnostic boundary. v36 set
+`LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_ATOMICS=1` while retaining readback;
+lookup remained active (`58470` attempts / `2905` hits), host feedback/request
+counters were zero, and strict C9 passed. v37 set
+`LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_READBACK=1` while retaining shader
+atomics; lookup remained `58470/2905`, but strict C9 failed
+(`mean=3.7652e-5`, `p99=6.1035e-4`, `max=3.4180e-3`). v38 restored both split
+switches to false and reproduced the default failure (`mean=4.2632e-5`,
+`p99=6.1035e-4`, `max=3.6621e-3`) with nonzero feedback/request activity.
+The split switches are test-only and the old aggregate
+`LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK` remains a compatibility alias.
+
+The offline `tests/lumengi/run_c9_feedback_split_validator.py` checks mode
+flags, lookup activity, zero host feedback/request counters, and telemetry
+freshness. Self-test plus v36/v37 artifact checks pass. These diagnostics
+localize host readback/scheduler timing but do not justify a production change;
+the default C9 gate remains `FAIL/OPEN` and thresholds stay frozen.

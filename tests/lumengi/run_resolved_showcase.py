@@ -30,6 +30,18 @@ DISABLE_SURFACE_CACHE_LOOKUP = os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_LO
 # Test-only lookup side-effect isolation. The host keeps cache radiance replacement enabled but
 # disables feedback/request atomics and their next-frame scheduler readbacks.
 DISABLE_SURFACE_CACHE_FEEDBACK = os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK", "0").strip().lower() not in ("0", "false", "off")
+# Test-only split controls. The legacy aggregate switch remains a compatibility alias that
+# disables both dimensions; these flags allow isolating GPU atomics from host readback/copy.
+DISABLE_SURFACE_CACHE_FEEDBACK_ATOMICS = (
+    DISABLE_SURFACE_CACHE_FEEDBACK
+    or os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_ATOMICS", "0").strip().lower()
+    not in ("0", "false", "off")
+)
+DISABLE_SURFACE_CACHE_FEEDBACK_READBACK = (
+    DISABLE_SURFACE_CACHE_FEEDBACK
+    or os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_READBACK", "0").strip().lower()
+    not in ("0", "false", "off")
+)
 # Test-only synchronization probe for cache feedback/request readback copies.
 FORCE_CACHE_READBACK_UAV_BARRIER = os.environ.get("LUMEN_C9_FORCE_CACHE_READBACK_UAV_BARRIER", "0").strip().lower() not in ("0", "false", "off")
 # Diagnostic-only LumenGI filter switches. Defaults preserve the production
@@ -1010,6 +1022,8 @@ for label, scene_path in _scenes():
                 "cacheLighting": USE_CACHE_LIGHTING,
                 "disableSurfaceCacheLookup": DISABLE_SURFACE_CACHE_LOOKUP,
                 "disableSurfaceCacheFeedback": DISABLE_SURFACE_CACHE_FEEDBACK,
+                "disableSurfaceCacheFeedbackAtomics": DISABLE_SURFACE_CACHE_FEEDBACK_ATOMICS,
+                "disableSurfaceCacheFeedbackReadback": DISABLE_SURFACE_CACHE_FEEDBACK_READBACK,
                 "forceCacheReadbackUavBarrier": FORCE_CACHE_READBACK_UAV_BARRIER,
                 "lumenTemporalFilter": USE_LUMEN_TEMPORAL_FILTER,
                 "lumenSpatialFilter": USE_LUMEN_SPATIAL_FILTER,

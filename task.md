@@ -1058,6 +1058,22 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   so the barrier is rejected as a production fix. `copyResource()` already
   performs the UAV-to-copy transition; keep the switch diagnostic-only.
 
+- v36-v38 split the remaining C9 interaction into GPU atomics and host
+  readback/copy controls. v36 (atomics off, readback on) kept lookup active at
+  `58470/2905`, produced zero host feedback/request counters, and passed strict
+  C9. v37 (atomics on, readback off) kept lookup at `58470/2905` but failed
+  strict C9 (`mean=3.7652e-5`, `p99=6.1035e-4`, `max=3.4180e-3`). v38 restored
+  both controls to defaults and reproduced the default failure (`mean=4.2632e-5`,
+  `p99=6.1035e-4`, `max=3.6621e-3`) with nonzero feedback/request activity.
+  Keep `LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_ATOMICS` and
+  `LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_READBACK` diagnostic-only; the
+  aggregate legacy switch remains an alias and all thresholds stay frozen.
+
+- `tests/lumengi/run_c9_feedback_split_validator.py` validates mode flags,
+  lookup activity, zero host feedback/request counters, and telemetry lag.
+  Self-test and v36/v37 artifact checks pass. The split evidence localizes
+  readback/scheduler timing but does not close the production C9 gate.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：

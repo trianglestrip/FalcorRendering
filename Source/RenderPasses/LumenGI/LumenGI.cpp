@@ -1954,6 +1954,19 @@ void LumenGIPass::readbackCounters(RenderContext* pRenderContext)
 std::map<std::string, double> LumenGIPass::getSurfaceCacheStats() const
 {
     std::map<std::string, double> stats;
+    // Test-only C9 isolation switches are exported with the host telemetry so
+    // replay artifacts prove which half of the feedback path was disabled.
+    // The legacy aggregate switch remains an alias for both dimensions.
+    const auto envFlag = [](const char* name)
+    {
+        const char* value = std::getenv(name);
+        return value && (std::string(value) == "1" || std::string(value) == "true");
+    };
+    const bool disableSurfaceCacheFeedback = envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK");
+    const bool disableSurfaceCacheFeedbackAtomics =
+        disableSurfaceCacheFeedback || envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_ATOMICS");
+    const bool disableSurfaceCacheFeedbackReadback =
+        disableSurfaceCacheFeedback || envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_READBACK");
     // Deterministic page-publication fingerprints used by paired C5 diagnostics.
     // These are host-table hashes only; they never participate in shader decisions.
     auto hashWords = [](const auto& words, uint64_t seed)
@@ -2074,6 +2087,9 @@ std::map<std::string, double> LumenGIPass::getSurfaceCacheStats() const
     stats["surfaceCacheSceneGeneration"] = (double)mSurfaceCacheSceneGeneration;
     stats["surfaceCacheResetCount"] = (double)mSurfaceCacheResetCount;
     stats["cacheFeedbackStatsFrame"] = (double)mScreenProbes.cacheFeedbackSubmittedFrame;
+    stats["disableSurfaceCacheFeedback"] = disableSurfaceCacheFeedback ? 1.0 : 0.0;
+    stats["disableSurfaceCacheFeedbackAtomics"] = disableSurfaceCacheFeedbackAtomics ? 1.0 : 0.0;
+    stats["disableSurfaceCacheFeedbackReadback"] = disableSurfaceCacheFeedbackReadback ? 1.0 : 0.0;
     stats["generationRejects"] = (double)mSurfaceCacheGenerationRejects;
     // C6 page-lifecycle telemetry. These are host-authoritative counters; no image-derived
     // inference is used by the runtime gate. pageGeneration is the highest resident allocator
@@ -3965,24 +3981,27 @@ void LumenGIPass::ensureScreenProbeResources(RenderContext* pRenderContext)
 
 void LumenGIPass::readbackScreenProbeCounters(RenderContext* pRenderContext)
 {
-    // Test-only C9 isolation: when feedback/request side effects are disabled,
-    // drop any stale pending readback flags before deciding whether to map them.
-    // Counter readback remains active so cache lookup attempts/hits stay observable.
-    const bool disableSurfaceCacheFeedback = []()
+    // Test-only C9 isolation: when feedback/request readback is disabled, drop
+    // stale pending flags before deciding whether to map them. Counter readback
+    // remains active so cache lookup attempts/hits stay observable.
+    const auto envFlag = [](const char* name)
     {
-        const char* value = std::getenv("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK");
+        const char* value = std::getenv(name);
         return value && (std::string(value) == "1" || std::string(value) == "true");
-    }();
-    if (disableSurfaceCacheFeedback)
+    };
+    const bool disableSurfaceCacheFeedback = envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK");
+    const bool disableSurfaceCacheFeedbackReadback =
+        disableSurfaceCacheFeedback || envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_READBACK");
+    if (disableSurfaceCacheFeedbackReadback)
     {
         mScreenProbes.cacheFeedbackReadbackPending = false;
         mScreenProbes.cacheFeedbackSubmittedFrame = 0;
         mScreenProbes.cacheRequestReadbackPending = false;
     }
     const bool haveCounters = mScreenProbes.counterReadbackPending && mScreenProbes.pCountersReadback;
-    const bool haveFeedback = !disableSurfaceCacheFeedback && mScreenProbes.cacheFeedbackReadbackPending &&
+    const bool haveFeedback = !disableSurfaceCacheFeedbackReadback && mScreenProbes.cacheFeedbackReadbackPending &&
         mScreenProbes.pCacheFeedbackReadback;
-    const bool haveRequests = !disableSurfaceCacheFeedback && mScreenProbes.cacheRequestReadbackPending &&
+    const bool haveRequests = !disableSurfaceCacheFeedbackReadback && mScreenProbes.cacheRequestReadbackPending &&
         mScreenProbes.pCacheRequestsReadback;
     if (!haveCounters && !haveFeedback && !haveRequests)
         return;
@@ -4287,19 +4306,27 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         const char* value = std::getenv("LUMEN_C9_DISABLE_SURFACE_CACHE_LOOKUP");
         return value && (std::string(value) == "1" || std::string(value) == "true");
     }();
-    // Test-only C9 isolation: retain cache lookup/radiance replacement while suppressing
-    // the feedback/request UAV side effects and their next-frame host scheduler readbacks.
-    // This is deliberately opt-in; the production path keeps both atomics enabled.
-    const bool disableSurfaceCacheFeedback = []()
+    // Test-only C9 isolation: retain cache lookup/radiance replacement while independently
+    // suppressing feedback/request atomics or their next-frame host scheduler readbacks. The
+    // legacy aggregate switch disables both dimensions for backwards-compatible replays.
+    const auto envFlag = [](const char* name)
     {
-        const char* value = std::getenv("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK");
+        const char* value = std::getenv(name);
         return value && (std::string(value) == "1" || std::string(value) == "true");
-    }();
+    };
+    const bool disableSurfaceCacheFeedback = envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK");
+    const bool disableSurfaceCacheFeedbackAtomics =
+        disableSurfaceCacheFeedback || envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_ATOMICS");
+    const bool disableSurfaceCacheFeedbackReadback =
+        disableSurfaceCacheFeedback || envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_READBACK");
     const bool hasSurfaceCacheLookup = !disableSurfaceCacheLookup && mUseSurfaceCache && mUseCacheLighting && mCapture.pCards &&
         mCapture.pPageTable && mCapture.pPageGeneration && mCapture.pMetadataAtlas &&
         mCapture.pRadianceAtlas && mCacheLighting.pVisibilityAtlas && mCacheLighting.pPageMetadata &&
         mCacheLighting.pCardGrid && !mCardGridData.empty() && mLastCacheLightingPageCount > 0u;
-    const bool hasSurfaceCacheFeedback = hasSurfaceCacheLookup && !disableSurfaceCacheFeedback;
+    const bool hasSurfaceCacheFeedbackResources = hasSurfaceCacheLookup && !disableSurfaceCacheFeedback &&
+        mScreenProbes.pCacheFeedback && mScreenProbes.pCacheRequests;
+    const bool hasSurfaceCacheFeedbackAtomics = hasSurfaceCacheFeedbackResources && !disableSurfaceCacheFeedbackAtomics;
+    const bool hasSurfaceCacheFeedbackReadback = hasSurfaceCacheFeedbackResources && !disableSurfaceCacheFeedbackReadback;
     // Test-only synchronization probe. D3D12 normally orders the UAV->COPY_SOURCE
     // transition emitted by copyResource; this opt-in barrier tests whether an
     // explicit UAV edge is required for the feedback/request readback pair.
@@ -4363,11 +4390,11 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         );
         programChanged |= mScreenProbes.pIntegrate->getProgram()->addDefine(
             "is_valid_gProbeCacheFeedback",
-            (hasSurfaceCacheFeedback && mScreenProbes.pCacheFeedback) ? "1" : "0"
+            hasSurfaceCacheFeedbackAtomics ? "1" : "0"
         );
         programChanged |= mScreenProbes.pIntegrate->getProgram()->addDefine(
             "is_valid_gProbeCacheRequests",
-            (hasSurfaceCacheFeedback && mScreenProbes.pCacheRequests) ? "1" : "0"
+            hasSurfaceCacheFeedbackAtomics ? "1" : "0"
         );
     }
     if (programChanged)
@@ -4707,17 +4734,17 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
                     var["gProbeRadianceAtlas"] = mCapture.pRadianceAtlas;
                     var["gProbeMetadataAtlas"] = mCapture.pMetadataAtlas;
                     var["gProbeVisibilityAtlas"] = mCacheLighting.pVisibilityAtlas;
-                    if (hasSurfaceCacheFeedback && mScreenProbes.pCacheFeedback)
+                    if (hasSurfaceCacheFeedbackAtomics && mScreenProbes.pCacheFeedback)
                         var["gProbeCacheFeedback"] = mScreenProbes.pCacheFeedback;
-                    if (hasSurfaceCacheFeedback && mScreenProbes.pCacheRequests)
+                    if (hasSurfaceCacheFeedbackAtomics && mScreenProbes.pCacheRequests)
                         var["gProbeCacheRequests"] = mScreenProbes.pCacheRequests;
                 }
             }
         };
 
-        if (hasSurfaceCacheFeedback && mScreenProbes.pCacheFeedback)
+        if (hasSurfaceCacheFeedbackResources && mScreenProbes.pCacheFeedback)
             pRenderContext->clearUAV(mScreenProbes.pCacheFeedback->getUAV().get(), uint4(0));
-        if (hasSurfaceCacheFeedback && mScreenProbes.pCacheRequests)
+        if (hasSurfaceCacheFeedbackResources && mScreenProbes.pCacheRequests)
             pRenderContext->clearUAV(mScreenProbes.pCacheRequests->getUAV().get(), uint4(0));
         bindProbeCompute(mScreenProbes.pIntegrate);
         mScreenProbes.pIntegrate->execute(pRenderContext, updateThreads, 1, 1);
@@ -4763,20 +4790,20 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         mScreenProbeCountersSubmittedFrame = mSurfaceCacheFrameIndex;
         mScreenProbes.counterReadbackPending = true;
     }
-    if (hasSurfaceCacheFeedback && mScreenProbes.pCacheFeedback && mScreenProbes.pCacheFeedbackReadback)
+    if (hasSurfaceCacheFeedbackReadback && mScreenProbes.pCacheFeedback && mScreenProbes.pCacheFeedbackReadback)
     {
         // Consume on the next frame before Surface Cache scheduling. The submitted epoch is
         // carried alongside the GPU generation and checked in readbackScreenProbeCounters().
-        if (forceCacheReadbackUavBarrier && hasNormal)
+        if (forceCacheReadbackUavBarrier && hasNormal && hasSurfaceCacheFeedbackAtomics)
             pRenderContext->uavBarrier(mScreenProbes.pCacheFeedback.get());
         pRenderContext->copyResource(mScreenProbes.pCacheFeedbackReadback.get(), mScreenProbes.pCacheFeedback.get());
         mScreenProbes.cacheFeedbackReadbackPending = true;
         mScreenProbes.cacheFeedbackSceneGeneration = mSurfaceCacheSceneGeneration;
         mScreenProbes.cacheFeedbackSubmittedFrame = mSurfaceCacheFrameIndex;
     }
-    if (hasSurfaceCacheFeedback && mScreenProbes.pCacheRequests && mScreenProbes.pCacheRequestsReadback)
+    if (hasSurfaceCacheFeedbackReadback && mScreenProbes.pCacheRequests && mScreenProbes.pCacheRequestsReadback)
     {
-        if (forceCacheReadbackUavBarrier && hasNormal)
+        if (forceCacheReadbackUavBarrier && hasNormal && hasSurfaceCacheFeedbackAtomics)
             pRenderContext->uavBarrier(mScreenProbes.pCacheRequests.get());
         pRenderContext->copyResource(mScreenProbes.pCacheRequestsReadback.get(), mScreenProbes.pCacheRequests.get());
         mScreenProbes.cacheRequestReadbackPending = true;

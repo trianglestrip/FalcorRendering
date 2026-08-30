@@ -925,3 +925,23 @@ The v35 opt-in explicit UAV-barrier A/B remained strict `FAIL/OPEN` at
 cache activity, so it is rejected as a production fix. The barrier switch is
 diagnostic-only; the normal `copyResource()` path already performs the UAV to
 copy-state transition.
+
+The v36-v38 feedback split isolates the remaining interaction without changing
+production defaults or thresholds. v36 disabled only GPU feedback/request
+atomics while retaining zeroed readback copies; lookup stayed active
+(`58470/2905`) and the strict C9 replay gate passed. v37 retained GPU atomics
+but disabled host readback/copy; lookup stayed `58470/2905`, while strict C9
+failed (`mean=3.7652e-5`, `p99=6.1035e-4`, `max=3.4180e-3`). v38 left both
+split switches disabled and reproduced the default failure (`mean=4.2632e-5`,
+`p99=6.1035e-4`, `max=3.6621e-3`) with nonzero feedback/request activity.
+This confirms that host readback/scheduler timing is part of the variance, but
+does not identify a safe production fix. The new switches are test-only:
+`LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_ATOMICS` and
+`LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_READBACK`; the legacy aggregate
+switch remains a compatibility alias.
+
+`tests/lumengi/run_c9_feedback_split_validator.py` now checks the recorded
+mode, lookup activity, zero host feedback/request counters, and observed
+telemetry lag (lookup lag 0..2 frames, scheduler/cache lag 0..1). Its
+self-test and both v36/v37 artifact checks pass. C9 production remains
+`FAIL/OPEN`; no threshold was relaxed.
