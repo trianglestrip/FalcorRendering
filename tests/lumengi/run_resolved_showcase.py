@@ -503,7 +503,9 @@ def _strict_replay_unload_scene():
     if not callable(unload):
         raise RuntimeError("live m.unloadScene binding is unavailable")
     unload()
-    _strict_replay_teardown_fence("strict replay after scene unload")
+    fence = _strict_replay_teardown_fence("strict replay after scene unload")
+    if fence.get("status") != "PASS":
+        raise RuntimeError("strict replay scene-unload fence failed: " + str(fence.get("reason", "unknown error")))
 
 
 def _capture(label, scene_path, view_name):
