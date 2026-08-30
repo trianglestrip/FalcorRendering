@@ -1453,10 +1453,15 @@ NoResampling experiment was worse and was not kept as a production setting.
 The replay thresholds remain frozen.
 
 The S2 launcher now samples authoritative host available memory in addition to
-GPU-wide VRAM. It performs a preflight and applies a default 1 GiB safety
+GPU-wide VRAM. It performs a preflight and applies a default 0.5 GiB safety
 threshold (`--min-host-free-gib`); crossing it terminates only the exact child,
 records `resource_guard` and host samples, and leaves the phase `BLOCKED` for
 the offline gate. This is a safety/diagnostic guard only and does not weaken
 the two-hour duration, churn, VRAM, or C9 thresholds. Rerun the checkpointed
 soak only when the host has enough memory; do not reinterpret the existing v8
 stop as a soak PASS.
+
+The first v10 launch hit the former 1 GiB guard at 0.959 GiB during cold
+startup, before dynamic evidence was complete. The default is therefore
+calibrated to 0.5 GiB (still above the earlier ~0.43 GiB safety stop) so cold
+warm-up can complete while the host guard remains active.

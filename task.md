@@ -966,11 +966,14 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
 
 - The release-soak launcher now performs authoritative host-memory preflight
   and per-phase sampling (`GlobalMemoryStatusEx` on Windows), with a default
-  1 GiB minimum-free safety threshold exposed as `--min-host-free-gib`.
+  0.5 GiB minimum-free safety threshold exposed as `--min-host-free-gib`.
 - A crossing terminates only the exact Mogwai child, records the observed
   memory and `resource_guard` reason in `launcher-manifest.json`, and keeps the
   phase `BLOCKED`; no release threshold or cadence is changed. Self-test and
   compile pass; no GPU run was started for this change.
+- v10 hit the former 1 GiB guard at 0.959 GiB during cold startup before a
+  dynamic artifact existed; default was calibrated to 0.5 GiB, above the
+  earlier ~0.43 GiB safety stop and still configurable per run.
 
 ## 21. 最终完成条件
 

@@ -402,6 +402,7 @@ tools\.packman\cmake\bin\cmake.exe --build build\windows-vs2022 `
   the v3/v4 artifacts for follow-up determinism work.
 
 - [ ] S2 launcher now has an authoritative host-memory preflight and
-  per-phase safety guard (`--min-host-free-gib`, default 1 GiB). It records
+  per-phase safety guard (`--min-host-free-gib`, default 0.5 GiB). It records
   host samples and exact-child termination in the manifest, but does not alter
-  any release gate; rerun the blocked soak only with adequate host memory.
+  any release gate; v10 calibrated the threshold after a cold-start stop at
+  0.959 GiB, and the blocked soak still requires a complete rerun.

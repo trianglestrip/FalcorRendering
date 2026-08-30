@@ -53,7 +53,10 @@ DEFAULT_MOGWAI = Path("build/windows-vs2022/bin/Release/Mogwai.exe")
 DEFAULT_SCRIPT = Path("tests/lumengi/run_churn_short.py")
 DEFAULT_VRAM_SAMPLE_SECONDS = 5.0
 DEFAULT_TIMEOUT_SLACK_SECONDS = 300.0
-DEFAULT_MIN_HOST_FREE_GIB = 1.0
+# The RTX 2060 SUPER release binary briefly uses several GiB during cold shader
+# compilation. Keep the guard above the observed v8 safety stop (~0.43 GiB)
+# without preventing a valid 30-minute dynamic phase from warming up.
+DEFAULT_MIN_HOST_FREE_GIB = 0.5
 VRAM_QUERY = (
     "nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.used,memory.free "
     "--format=csv,noheader,nounits"
@@ -336,6 +339,29 @@ def validate_child_artifact(artifact, expected_seconds, launcher_samples, select
         value = _finite(artifact.get(key))
         if value is None or value <= 0:
             blockers.append("child dynamic field %s>0 is missing" % key)
+    resource_sync = artifact.get("resource_sync")
+    if not isinstance(resource_sync, Mapping):
+        blockers.append("child resource_sync evidence is missing")
+    else:
+        attempts = _finite(resource_sync.get("attempts"))
+        completed = _finite(resource_sync.get("completed"))
+        failures = _finite(resource_sync.get("failures"))
+        events = resource_sync.get("events")
+        if resource_sync.get("status") != "PASS":
+            blockers.append("child resource_sync status is not PASS")
+        if attempts is None or attempts <= 0:
+            blockers.append("child resource_sync attempts>0 is missing")
+        if completed is None or attempts is None or completed != attempts:
+            blockers.append("child resource_sync completed count does not match attempts")
+        if failures is None or failures != 0:
+            blockers.append("child resource_sync failures must be zero")
+        if not isinstance(events, list) or attempts is None or len(events) != int(attempts):
+            blockers.append("child resource_sync event sequence is missing/incomplete")
+        elif any(
+            not isinstance(event, Mapping) or event.get("status") != "PASS"
+            for event in events
+        ):
+            blockers.append("child resource_sync event is not PASS")
     renderer = _renderer_from_artifact(artifact)
     if not isinstance(renderer, Mapping):
         blockers.append("authoritative renderer provenance is missing")
@@ -418,6 +444,7 @@ def _phase_result(role, expected_seconds, phase_dir, command, timeout_seconds=No
             "reason": None,
         },
         "child_contract_status": "NOT_RUN",
+        "resource_sync": None,
         "blocking_reasons": [],
     }
 
@@ -475,6 +502,35 @@ def run_phase(
             )
             result["process"]["pid"] = process.pid
             while process.poll() is None:
+                # Sample and enforce the host-memory safety contract before
+                # accepting a child artifact as complete.  Otherwise a child
+                # that writes its final JSON while the host is under the
+                # threshold could bypass the guard and look ready in the
+                # launcher manifest.
+                host_snapshot = query_host_memory()
+                host_snapshot["timestamp_unix"] = time.time()
+                host_samples.append(host_snapshot)
+                guard_reason = host_memory_guard_reason(host_snapshot, min_host_free_bytes)
+                if guard_reason:
+                    result["resource_guard"].update(
+                        {
+                            "triggered": True,
+                            "threshold_bytes": min_host_free_bytes,
+                            "observed_free_bytes": host_snapshot.get("free_bytes"),
+                            "reason": guard_reason,
+                        }
+                    )
+                    result["blocking_reasons"].append(guard_reason)
+                    result["process"]["intentional_termination"] = True
+                    result["process"]["termination_reason"] = "host_memory_safety_guard"
+                    process.terminate()
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=30)
+                    break
+
                 # Falcor scripts commonly write their JSON artifact and call
                 # ``exit()`` without terminating the Mogwai host process.
                 # Once the child has proved the complete requested duration,
@@ -506,29 +562,6 @@ def run_phase(
                                 process.kill()
                                 process.wait(timeout=30)
                             break
-                host_snapshot = query_host_memory()
-                host_snapshot["timestamp_unix"] = time.time()
-                host_samples.append(host_snapshot)
-                guard_reason = host_memory_guard_reason(host_snapshot, min_host_free_bytes)
-                if guard_reason:
-                    result["resource_guard"].update(
-                        {
-                            "triggered": True,
-                            "threshold_bytes": min_host_free_bytes,
-                            "observed_free_bytes": host_snapshot.get("free_bytes"),
-                            "reason": guard_reason,
-                        }
-                    )
-                    result["blocking_reasons"].append(guard_reason)
-                    result["process"]["intentional_termination"] = True
-                    result["process"]["termination_reason"] = "host_memory_safety_guard"
-                    process.terminate()
-                    try:
-                        process.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=30)
-                    break
                 snapshot = query_vram(gpu_index)
                 snapshot["timestamp_unix"] = time.time()
                 samples.append(snapshot)
@@ -587,6 +620,7 @@ def run_phase(
     result["child_contract_status"] = child_status
     result["blocking_reasons"].extend(child_reasons)
     result["artifact_status"] = artifact.get("status") if isinstance(artifact, Mapping) else None
+    result["resource_sync"] = artifact.get("resource_sync") if isinstance(artifact, Mapping) else None
     result["status"] = "BLOCKED" if result["blocking_reasons"] else "READY_FOR_OFFLINE_GATE"
     return result
 

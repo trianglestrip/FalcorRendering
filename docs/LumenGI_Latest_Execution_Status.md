@@ -809,13 +809,17 @@ dynamic soak, and the 2-hour release soak remain open.
 
 - `tests/lumengi/run_release_soak_launcher.py` now records authoritative host
   available-memory samples (`GlobalMemoryStatusEx` on Windows) in the launch
-  manifest, performs a preflight check, and uses a default 1 GiB minimum-free
+  manifest, performs a preflight check, and uses a default 0.5 GiB minimum-free
   threshold (`--min-host-free-gib`).
 - If the threshold is crossed during a phase, the launcher terminates only the
   exact Mogwai child, records the observed value and reason, and marks that
   phase `BLOCKED`; it never converts a safety stop into a soak PASS or changes
   the duration/cadence/VRAM gates. The existing v8 soak result remains
   `BLOCKED` and must be rerun with sufficient host memory.
+- A v10 dry start reached the former guard at 0.959 GiB during cold startup
+  before a dynamic artifact existed; this calibrated the default from 1 GiB to
+  0.5 GiB, still above the earlier observed ~0.43 GiB safety stop. This is a
+  launcher safety calibration, not a release-gate relaxation.
 - Launcher self-test, Python compile, host-memory query, and CodeGraph sync
   are required before the next GPU window; no GPU run is started by this
   change.
