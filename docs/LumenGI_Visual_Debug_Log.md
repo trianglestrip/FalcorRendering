@@ -1208,3 +1208,16 @@ candidate. The default v23 regression left both filters enabled and sentinels
 off, and measured `4.3798e-5`. Keep the production path and frozen C9 limits;
 the companion offline tool is
 [`run_c9_producer_snapshot_diff.py`](../tests/lumengi/run_c9_producer_snapshot_diff.py).
+
+## 2026-08-30 C9 cache-path isolation
+
+The v24-v26 producer-trace matrix is diagnostic-only because its three
+`BlitPass` sentinels change graph topology. It nevertheless provides a clean
+source split: only Surface Cache + Cache Lighting enabled together produced a
+non-zero LumenGI delta; disabling either switch made that producer delta
+exactly zero. The v29 strict no-cache control passed the unchanged C9 limits
+(`mean=2.8565e-6`, `p99=7.1168e-5`, `max=2.1065e-3`). The v27 explicit
+pre-FrameCapture wait was recorded PASS but remained strict FAIL at
+`mean=3.0024e-5`, while v28 without the wait measured `6.1814e-5`. Keep both
+cache features enabled in production and treat this as the next barrier/
+resource-ordering investigation boundary.

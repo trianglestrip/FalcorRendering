@@ -1540,3 +1540,17 @@ its `CopySource` transition, submit/signal fence, and host wait; the later
 `CopySource`. The run measured mean `4.3308e-5` and therefore did not improve
 C9. A telemetry-off v18 control measured `3.3280e-5`, so the trace is retained
 as diagnostic evidence only and no behavior or threshold change is justified.
+
+The v24-v26 producer-trace matrix isolates the cache interaction. With both
+Surface Cache and Cache Lighting disabled (v24), with Surface Cache disabled
+alone (v25), or with Cache Lighting disabled alone (v26), the LumenGI producer
+delta is exactly zero in the test-only sentinel topology and the corresponding
+offline C9 comparisons pass. The v20 both-on run remains the only matrix cell
+with a large LumenGI delta, so the interaction is localized to the combined
+cache path; neither cache switch is being disabled in production. A strict
+no-cache v29 control independently passed (`mean=2.8565e-6`,
+`p99=7.1168e-5`, `max=2.1065e-3`), confirming the direct/non-cache baseline.
+The opt-in v27 pre-FrameCapture `m.device.wait()` fence was recorded PASS on
+both phases but still failed the frozen mean bound (`3.0024e-5`); the v28
+no-wait control was higher (`6.1814e-5`). This is scheduling evidence only,
+not a production fix or a threshold change.

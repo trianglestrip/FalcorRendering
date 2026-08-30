@@ -891,3 +891,14 @@ dynamic soak, and the 2-hour release soak remain open.
   sentinel copy passes change graph topology. The default v23 regression kept
   both filters enabled and no sentinel, and remains strict `FAIL/OPEN` at
   mean `4.3798e-5`; production defaults are unchanged.
+
+The v24-v26 producer-trace matrix shows that the residual is specific to the
+combined Surface Cache + Cache Lighting path: disabling both (v24), Surface
+Cache only (v25), or Cache Lighting only (v26) made the LumenGI producer delta
+exactly zero in the sentinel topology, and each offline C9 comparison passed.
+The production defaults remain enabled. A strict no-cache v29 control passed
+with `mean=2.8565e-6`, `p99=7.1168e-5`, and `max=2.1065e-3`, providing a clean
+direct/non-cache baseline. The v27 opt-in wait before FrameCapture was fenced
+successfully but still failed C9 at `mean=3.0024e-5`; v28 no-wait was
+`6.1814e-5`. These are scheduling diagnostics only; frozen thresholds and
+production behavior are unchanged.

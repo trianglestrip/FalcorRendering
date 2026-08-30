@@ -1026,6 +1026,15 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   `FAIL/OPEN` at mean `4.3798e-5`, with production filters and thresholds
   unchanged. Use `run_c9_producer_snapshot_diff.py` for the offline comparison.
 
+- The v24-v26 cache matrix shows the residual is specific to Surface Cache and
+  Cache Lighting being enabled together: disabling either switch made the
+  LumenGI producer delta exactly zero in the sentinel topology. A strict v29
+  no-cache control passed (`mean=2.8565e-6`, `p99=7.1168e-5`,
+  `max=2.1065e-3`). The v27 opt-in wait before FrameCapture improved one run
+  to `3.0024e-5` but still failed the frozen mean bound; v28 no-wait measured
+  `6.1814e-5`. Keep both cache switches enabled and treat these artifacts as
+  diagnostic scheduling evidence only.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：

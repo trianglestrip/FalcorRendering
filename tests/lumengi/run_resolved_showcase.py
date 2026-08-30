@@ -73,6 +73,14 @@ REPLAY_ORDER = _REPLAY_ORDER if _REPLAY_ORDER in ("mark-on-first", "mark-off-fir
 # This avoids comparing two independently seeded RTXDI/NRD processes.  Set to
 # 0 only when a caller deliberately wants the older independent-reference mode.
 SAME_PROCESS_EQUIVALENCE = os.environ.get("LUMEN_C9_SAME_PROCESS_EQUIVALENCE", "1").strip().lower() not in ("0", "false", "off")
+# Optional strict-replay scheduling diagnostic.  When enabled, drain the GPU
+# after the final renderFrame() and before FrameCapture adds its readback work.
+# This is deliberately off by default and is only meaningful for deterministic
+# C9 replay; it must not change the ordinary showcase schedule.
+WAIT_BEFORE_FRAME_CAPTURE = (
+    os.environ.get("LUMEN_C9_WAIT_BEFORE_FRAME_CAPTURE", "0").strip().lower()
+    not in ("0", "false", "off")
+)
 KEEP_SCENE_CAMERA = os.environ.get("LUMEN_RESOLVED_KEEP_SCENE_CAMERA", "0").strip().lower() not in ("0", "false", "off")
 MARK_LUMEN_OUTPUTS = os.environ.get("LUMEN_RESOLVED_MARK_LUMEN_OUTPUTS", "1").strip().lower() not in ("0", "false", "off")
 E1_DIAGNOSTIC_OUTPUTS = os.environ.get("LUMEN_RESOLVED_E1_DIAGNOSTIC_OUTPUTS", "0").strip().lower() not in ("0", "false", "off")
@@ -640,6 +648,20 @@ def _capture(label, scene_path, view_name):
         profiler_path.mkdir(parents=True, exist_ok=True)
         with (profiler_path / (label + "-" + view_name + ".json")).open("w", encoding="utf-8") as handle:
             json.dump(profiler_capture, handle, indent=2, default=str)
+    pre_capture_fence = {
+        "status": "NOT_RUN",
+        "binding": "m.device.wait",
+        "scope": "strict replay before FrameCapture",
+    }
+    if WAIT_BEFORE_FRAME_CAPTURE and DETERMINISTIC_REPLAY_OUT:
+        pre_capture_fence = _strict_replay_teardown_fence("strict replay before FrameCapture")
+        if pre_capture_fence.get("status") != "PASS":
+            raise RuntimeError(
+                "strict replay pre-capture fence failed: "
+                + str(pre_capture_fence.get("reason", "unknown error"))
+            )
+    elif WAIT_BEFORE_FRAME_CAPTURE:
+        print("RESOLVED_SHOWCASE pre-capture wait ignored outside deterministic replay")
     m.frameCapture.capture()
     if MARK_LUMEN_OUTPUTS:
         resolved = m.activeGraph.get_output("LumenGI.resolvedDiffuseGI").to_numpy()[..., :3]
@@ -824,6 +846,7 @@ def _capture(label, scene_path, view_name):
                     "graphRecreated": True,
                     "clockFrames": [1, SETTLE_FRAMES],
                     "captureExecutions": 1,
+                    "preCaptureFence": pre_capture_fence,
                 }
                 if DETERMINISTIC_REPLAY_CONTEXT
                 else None
@@ -966,6 +989,7 @@ for label, scene_path in _scenes():
                 "cacheLighting": USE_CACHE_LIGHTING,
                 "lumenTemporalFilter": USE_LUMEN_TEMPORAL_FILTER,
                 "lumenSpatialFilter": USE_LUMEN_SPATIAL_FILTER,
+                "waitBeforeFrameCapture": WAIT_BEFORE_FRAME_CAPTURE,
                 "probeDirections": PROBE_DIRECTIONS_PER_PROBE,
                 "spatial": [SPATIAL_RADIUS_MIN, SPATIAL_RADIUS_MAX, SPATIAL_VARIANCE_LOW, SPATIAL_VARIANCE_HIGH],
                 "lightingOverrides": [ENV_INTENSITY, POINT_LIGHT_SCALE, DIRECTIONAL_LIGHT_SCALE, EMISSIVE_FACTOR_SCALE],
