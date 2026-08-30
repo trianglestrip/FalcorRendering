@@ -56,6 +56,8 @@ FINALCOLOR_REFERENCE_JSON = os.environ.get("LUMEN_C9_REFERENCE_RUNTIME_JSON", ""
 DETERMINISTIC_REPLAY_OUT = os.environ.get("LUMEN_C9_DETERMINISTIC_REPLAY_OUT", "").strip()
 DETERMINISTIC_REPLAY_ID = os.environ.get("LUMEN_C9_DETERMINISTIC_REPLAY_ID", "").strip()
 DETERMINISTIC_REPLAY_CONTEXT = {}
+_REPLAY_ORDER = os.environ.get("LUMEN_C9_REPLAY_ORDER", "mark-on-first").strip().lower()
+REPLAY_ORDER = _REPLAY_ORDER if _REPLAY_ORDER in ("mark-on-first", "mark-off-first") else "mark-on-first"
 # Marking a RenderGraph output changes endpoint exposure, not the producer
 # arithmetic.  The default C9 runtime path therefore performs an explicit
 # same-process mark-on -> unmark transition after the composite is rendered.
@@ -391,6 +393,7 @@ def _same_process_mark_equivalence(graph, composite):
             "reason": "same-process mark transition disabled by LUMEN_C9_SAME_PROCESS_EQUIVALENCE=0",
             "renderedFrames": 0,
         }
+
     names = list(_lumen_output_mark_list())
     rendered_frames = 0
     try:
@@ -454,6 +457,37 @@ def _same_process_mark_equivalence(graph, composite):
             "renderedFrames": rendered_frames,
             "producerExecutions": 0,
             "graphRecompiled": False,
+        }
+
+
+def _strict_replay_teardown_fence(scope="strict replay capture before graph teardown"):
+    """Drain the live device before a strict replay graph is destroyed.
+
+    The replay intentionally recreates the scene and graph between mark-on and
+    mark-off phases. Waiting at that boundary prevents deferred scene/FBO
+    releases from overlapping the next phase, while leaving ordinary showcase
+    captures untouched. The status is recorded as diagnostics; the offline
+    gate still owns the frozen pixel verdict.
+    """
+    if not DETERMINISTIC_REPLAY_OUT:
+        return {"status": "NOT_RUN", "binding": "m.device.wait"}
+    try:
+        device = getattr(globals().get("m"), "device", None)
+        wait = getattr(device, "wait", None) if device is not None else None
+        if not callable(wait):
+            raise RuntimeError("live m.device.wait binding is unavailable")
+        wait()
+        return {
+            "status": "PASS",
+            "binding": "m.device.wait",
+            "scope": scope,
+        }
+    except Exception as exc:
+        return {
+            "status": "BLOCKED",
+            "binding": "m.device.wait",
+            "scope": scope,
+            "reason": str(exc),
         }
 
 
@@ -740,6 +774,9 @@ def _capture(label, scene_path, view_name):
                 "metrics": export_metrics,
             },
         }
+        teardown_fence = _strict_replay_teardown_fence()
+        if isinstance(runtime.get("deterministicReplay"), dict):
+            runtime["deterministicReplay"]["teardownFence"] = teardown_fence
         runtime_path.write_text(json.dumps(runtime, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(
         "RESOLVED_SHOWCASE",
@@ -763,6 +800,24 @@ def _capture(label, scene_path, view_name):
         bool(float(resolved.min()) >= 0.0),
     )
     m.removeGraph(graph)
+    # Drop the final Python graph reference before fencing the deferred
+    # releases. This is a diagnostic guard for strict replay only; ordinary
+    # showcase captures keep their historical teardown path.
+    graph = None
+    if DETERMINISTIC_REPLAY_OUT:
+        post_teardown_fence = _strict_replay_teardown_fence("strict replay after graph teardown")
+        runtime_path = Path(FINALCOLOR_RUNTIME_OUT) if FINALCOLOR_RUNTIME_OUT else None
+        if runtime_path and runtime_path.exists():
+            try:
+                runtime_after_teardown = json.loads(runtime_path.read_text(encoding="utf-8"))
+                deterministic = runtime_after_teardown.get("deterministicReplay")
+                if isinstance(deterministic, dict):
+                    deterministic["postTeardownFence"] = post_teardown_fence
+                    runtime_path.write_text(
+                        json.dumps(runtime_after_teardown, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                    )
+            except Exception as exc:
+                print("RESOLVED_SHOWCASE teardown fence metadata blocked", str(exc))
 
 
 m.ui = False
@@ -798,38 +853,40 @@ for label, scene_path in _scenes():
                 "spatial": [SPATIAL_RADIUS_MIN, SPATIAL_RADIUS_MAX, SPATIAL_VARIANCE_LOW, SPATIAL_VARIANCE_HIGH],
                 "lightingOverrides": [ENV_INTENSITY, POINT_LIGHT_SCALE, DIRECTIONAL_LIGHT_SCALE, EMISSIVE_FACTOR_SCALE],
                 "deterministicMarkChannels": list(_lumen_output_mark_list()) if DETERMINISTIC_REPLAY_OUT else None,
+                "replayOrder": REPLAY_ORDER,
             }
             config_fingerprint = hashlib.sha256(
                 json.dumps(config_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
             on_json = pair_root / "mark-on.json"
             off_json = pair_root / "mark-off.json"
-            MARK_LUMEN_OUTPUTS = True
-            SAME_PROCESS_EQUIVALENCE = False
-            FINALCOLOR_REFERENCE_JSON = ""
-            FINALCOLOR_RUNTIME_OUT = str(on_json)
-            DETERMINISTIC_REPLAY_CONTEXT = {
-                "pairId": pair_id,
-                "phase": "mark-on",
-                "configFingerprint": config_fingerprint,
-                "config": config_payload,
-            }
-            _capture(label, scene_path, view_name)
-            MARK_LUMEN_OUTPUTS = False
-            FINALCOLOR_REFERENCE_JSON = str(on_json)
-            FINALCOLOR_RUNTIME_OUT = str(off_json)
-            DETERMINISTIC_REPLAY_CONTEXT = {
-                "pairId": pair_id,
-                "phase": "mark-off",
-                "configFingerprint": config_fingerprint,
-                "config": config_payload,
-            }
-            _capture(label, scene_path, view_name)
+            phase_paths = {"mark-on": on_json, "mark-off": off_json}
+            replay_phases = (
+                ("mark-on", "mark-off")
+                if REPLAY_ORDER == "mark-on-first"
+                else ("mark-off", "mark-on")
+            )
+            first_phase_path = None
+            for phase in replay_phases:
+                MARK_LUMEN_OUTPUTS = phase == "mark-on"
+                SAME_PROCESS_EQUIVALENCE = False
+                FINALCOLOR_REFERENCE_JSON = str(first_phase_path) if first_phase_path else ""
+                FINALCOLOR_RUNTIME_OUT = str(phase_paths[phase])
+                DETERMINISTIC_REPLAY_CONTEXT = {
+                    "pairId": pair_id,
+                    "phase": phase,
+                    "configFingerprint": config_fingerprint,
+                    "config": config_payload,
+                }
+                _capture(label, scene_path, view_name)
+                if first_phase_path is None:
+                    first_phase_path = phase_paths[phase]
             manifest = {
                 "schema": "LumenGI.C9.DeterministicReplayManifest.v1",
                 "pairId": pair_id,
                 "processId": os.getpid(),
                 "configFingerprint": config_fingerprint,
+                "replayOrder": REPLAY_ORDER,
                 "markOn": str(on_json),
                 "markOff": str(off_json),
                 "gateCommand": "python -B tests/lumengi/run_c9_export_repro.py --manifest " + str(pair_root / "replay-manifest.json"),

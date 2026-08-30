@@ -1465,3 +1465,13 @@ The first v10 launch hit the former 1 GiB guard at 0.959 GiB during cold
 startup, before dynamic evidence was complete. The default is therefore
 calibrated to 0.5 GiB (still above the earlier ~0.43 GiB safety stop) so cold
 warm-up can complete while the host guard remains active.
+
+Follow-up hardening (2026-08-30): `run_churn_short.py` now unloads the current
+scene before constructing its replacement and fences pre/unload/post boundaries;
+the artifact records the complete `resource_sync` event sequence. The 90 s
+three-reload probe passed all nine waits but still showed host working-set
+growth, so S2 remains BLOCKED pending a complete long run. The launcher waits
+for the `CHURN seconds` readiness marker (or 180 s) before enforcing the normal
+0.5 GiB guard and keeps a 0.25 GiB startup hard floor. C9 strict replay adds a
+post-`removeGraph()` fence and reverse-order diagnostics; v6 off-first remains
+strict FAIL on mean error only (`3.3392e-5`).

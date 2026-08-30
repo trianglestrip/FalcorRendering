@@ -57,6 +57,15 @@ DEFAULT_TIMEOUT_SLACK_SECONDS = 300.0
 # compilation. Keep the guard above the observed v8 safety stop (~0.43 GiB)
 # without preventing a valid 30-minute dynamic phase from warming up.
 DEFAULT_MIN_HOST_FREE_GIB = 0.5
+# Shader/program compilation can transiently consume several GiB before the
+# churn script reaches its first frame. The phase guard therefore waits for
+# the child's explicit ``CHURN seconds`` readiness marker (or this bounded
+# grace period) before applying the normal threshold. A lower hard floor is
+# still enforced during startup so a pathological compile cannot exhaust the
+# host. This changes only guard timing, never a release gate threshold.
+STARTUP_GRACE_SECONDS = 180.0
+STARTUP_HARD_FLOOR_GIB = 0.25
+STARTUP_MARKER = "CHURN seconds"
 VRAM_QUERY = (
     "nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.used,memory.free "
     "--format=csv,noheader,nounits"
@@ -443,6 +452,13 @@ def _phase_result(role, expected_seconds, phase_dir, command, timeout_seconds=No
             "observed_free_bytes": None,
             "reason": None,
         },
+        "startup_guard": {
+            "ready": False,
+            "marker": STARTUP_MARKER,
+            "ready_reason": None,
+            "grace_seconds": STARTUP_GRACE_SECONDS,
+            "hard_floor_bytes": int(STARTUP_HARD_FLOOR_GIB * 1024**3),
+        },
         "child_contract_status": "NOT_RUN",
         "resource_sync": None,
         "blocking_reasons": [],
@@ -488,6 +504,8 @@ def run_phase(
     host_samples = []
     started = time.time()
     monotonic_started = time.monotonic()
+    startup_ready = False
+    startup_hard_floor_bytes = int(STARTUP_HARD_FLOOR_GIB * 1024**3)
     result["process"]["started_at_unix"] = started
     try:
         # Mogwai owns ``--logfile``.  Keep launcher stdout separate so two
@@ -510,12 +528,36 @@ def run_phase(
                 host_snapshot = query_host_memory()
                 host_snapshot["timestamp_unix"] = time.time()
                 host_samples.append(host_snapshot)
-                guard_reason = host_memory_guard_reason(host_snapshot, min_host_free_bytes)
+                elapsed = time.monotonic() - monotonic_started
+                if not startup_ready:
+                    marker_seen = False
+                    try:
+                        # The child writes this marker after graph/scene setup
+                        # and before entering the frame loop. Reading the
+                        # bounded launcher stdout file is cheap at the 5 s
+                        # sampling cadence and avoids guessing at compile time.
+                        marker_seen = STARTUP_MARKER in stdout_path.read_text(
+                            encoding="utf-8", errors="ignore"
+                        )
+                    except OSError:
+                        marker_seen = False
+                    if marker_seen:
+                        startup_ready = True
+                        result["startup_guard"].update(
+                            {"ready": True, "ready_reason": "child_readiness_marker", "ready_at_unix": time.time()}
+                        )
+                    elif elapsed >= STARTUP_GRACE_SECONDS:
+                        startup_ready = True
+                        result["startup_guard"].update(
+                            {"ready": True, "ready_reason": "startup_grace_expired", "ready_at_unix": time.time()}
+                        )
+                guard_threshold = min_host_free_bytes if startup_ready else startup_hard_floor_bytes
+                guard_reason = host_memory_guard_reason(host_snapshot, guard_threshold)
                 if guard_reason:
                     result["resource_guard"].update(
                         {
                             "triggered": True,
-                            "threshold_bytes": min_host_free_bytes,
+                            "threshold_bytes": guard_threshold,
                             "observed_free_bytes": host_snapshot.get("free_bytes"),
                             "reason": guard_reason,
                         }
@@ -565,7 +607,6 @@ def run_phase(
                 snapshot = query_vram(gpu_index)
                 snapshot["timestamp_unix"] = time.time()
                 samples.append(snapshot)
-                elapsed = time.monotonic() - monotonic_started
                 if elapsed >= timeout_seconds:
                     result["process"]["timed_out"] = True
                     process.terminate()
@@ -688,6 +729,8 @@ def _self_test():
     assert command[1:5] == ["--device-type", "d3d12", "--headless", "--precise"]
     phase = _phase_result("dynamic", 1800.0, Path("out/dynamic"), command, 2100.0)
     assert phase["role"] == "dynamic"
+    assert phase["startup_guard"]["marker"] == STARTUP_MARKER
+    assert phase["startup_guard"]["hard_floor_bytes"] < int(DEFAULT_MIN_HOST_FREE_GIB * 1024**3)
     manifest = build_manifest(
         {
             "dynamic_minutes": 30.0,

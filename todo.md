@@ -406,3 +406,14 @@ tools\.packman\cmake\bin\cmake.exe --build build\windows-vs2022 `
   host samples and exact-child termination in the manifest, but does not alter
   any release gate; v10 calibrated the threshold after a cold-start stop at
   0.959 GiB, and the blocked soak still requires a complete rerun.
+
+### Follow-up hardening (2026-08-30)
+
+- [ ] Re-run S2 with explicit `unloadScene()` before each replacement and
+  `resource_sync` fence telemetry. The 90 s/3-reload probe passed all waits but
+  showed host working-set growth; no soak PASS is claimed.
+- [ ] Launcher startup guard now waits for the `CHURN seconds` marker (or 180 s)
+  and retains a 0.25 GiB hard floor; normal 0.5 GiB and duration/VRAM gates are
+  unchanged.
+- [ ] C9 strict replay now fences after graph teardown and supports reverse
+  order. v6 off-first remains FAIL only on frozen mean error (`3.3392e-5`).

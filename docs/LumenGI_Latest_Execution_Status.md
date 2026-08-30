@@ -823,3 +823,18 @@ dynamic soak, and the 2-hour release soak remain open.
 - Launcher self-test, Python compile, host-memory query, and CodeGraph sync
   are required before the next GPU window; no GPU run is started by this
   change.
+
+### 2026-08-30 S2/C9 follow-up hardening
+
+- The churn driver now performs an explicit `unloadScene()` followed by a
+  fenced `loadScene()` for each reload, and records every `m.device.wait()`
+  event under `resource_sync`. A 90 s/3-reload probe completed with all nine
+  fences passing, but host working-set growth remains observable; S2 is not
+  certified by this probe.
+- The soak launcher defers the normal 0.5 GiB guard until the child's
+  `CHURN seconds` readiness marker (or 180 s), while enforcing a 0.25 GiB
+  startup hard floor. This prevents cold shader compilation from being
+  mistaken for steady-state churn without weakening the release threshold.
+- C9 strict replay now fences both before and after graph teardown and supports
+  reverse mark order. The v6 off-first replay still fails only the frozen mean
+  error bound (`3.3392e-5` vs `2e-5`); p99/max/relative-max remain in bounds.

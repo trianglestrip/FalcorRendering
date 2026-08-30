@@ -975,6 +975,18 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   dynamic artifact existed; default was calibrated to 0.5 GiB, above the
   earlier ~0.43 GiB safety stop and still configurable per run.
 
+### Follow-up hardening (2026-08-30)
+
+- S2 churn reloads now execute `unloadScene()` before `loadScene()` and fence
+  pre/unload/post boundaries; `resource_sync` must contain a PASS event for
+  every mutation. A 90 s/3-reload probe passed all nine waits, but host working
+  set still grew, so the long gate remains BLOCKED.
+- The launcher waits for the `CHURN seconds` readiness marker (or 180 s) before
+  the normal 0.5 GiB guard and enforces a 0.25 GiB startup hard floor. This is
+  startup protection only; duration, VRAM, and release thresholds are unchanged.
+- C9 strict replay fences after graph teardown and supports reverse order; v6
+  off-first remains FAIL on frozen mean error (`3.3392e-5` vs `2e-5`).
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：

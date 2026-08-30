@@ -842,6 +842,47 @@ def probe_material_toggle():
         return False, None
 
 
+def wait_for_resource_reclamation(resource_sync, event, frame):
+    """Synchronize the live device after a resource-replacement operation.
+
+    ``Renderer::setScene()`` fences scene replacement on the C++ side.  A
+    framebuffer resize, however, replaces the target FBO from the Python
+    binding and can leave the old FBO in the deferred-release queue until a
+    later frame fence.  Use the existing live ``m.device.wait()`` binding after
+    resize and both before and after scene replacement, and record every
+    attempt.  A missing/failed binding is
+    evidence of an incomplete churn contract; it must never become a fake
+    successful run.
+    """
+    record = {
+        "event": str(event),
+        "frame": int(frame),
+        "timestamp_unix": time.time(),
+        "status": "BLOCKED",
+        "reason": None,
+    }
+    resource_sync["attempts"] += 1
+    try:
+        script_host = globals().get("m")
+        device = getattr(script_host, "device", None) if script_host is not None else None
+        wait = getattr(device, "wait", None) if device is not None else None
+        if not callable(wait):
+            raise RuntimeError("live m.device.wait binding is unavailable")
+        wait()
+        record["status"] = "PASS"
+        resource_sync["completed"] += 1
+    except Exception as exc:
+        reason = "device wait after %s failed: %s" % (event, str(exc))
+        record["reason"] = reason
+        resource_sync["failures"] += 1
+        resource_sync["status"] = "BLOCKED"
+        print("CHURN BLOCKED resource reclamation", reason)
+    else:
+        resource_sync["status"] = "PASS"
+    resource_sync["events"].append(record)
+    return record["status"] == "PASS"
+
+
 def main():
     graph = create_lumen_graph()
     m.addGraph(graph)
@@ -872,6 +913,15 @@ def main():
     stats_sources = set()
     last_norm = None
     vram_samples = []
+    resource_sync = {
+        "schema_version": "device-resource-sync-v1",
+        "binding": "m.device.wait",
+        "status": "NOT_RUN",
+        "attempts": 0,
+        "completed": 0,
+        "failures": 0,
+        "events": [],
+    }
 
     # Keep the start sample in the same sequence as in-run samples.  The
     # release contract deliberately does not infer a trend from only start/end
@@ -901,8 +951,21 @@ def main():
 
         # Static churn: periodic scene reload (full re-capture) and resize.
         if frame % RELOAD_INTERVAL_FRAMES == 0:
+            # SceneBuilder constructs the replacement scene before
+            # Renderer::setScene() is entered, so its C++ pre-fence cannot
+            # prevent old and new scene allocations from overlapping.  Drop
+            # the old scene explicitly before constructing the replacement,
+            # then fence each boundary.  This keeps the churn driver from
+            # measuring a deliberate old+new peak as a renderer leak.
+            if not wait_for_resource_reclamation(resource_sync, "scene_reload_pre", frame):
+                raise RuntimeError("scene reload pre-fence failed; aborting unsafe churn")
+            m.unloadScene()
+            if not wait_for_resource_reclamation(resource_sync, "scene_unload", frame):
+                raise RuntimeError("scene unload fence failed; aborting unsafe churn")
             m.loadScene(SCENE_CORNELL)
             reloads += 1
+            if not wait_for_resource_reclamation(resource_sync, "scene_reload_post", frame):
+                raise RuntimeError("scene reload post-fence failed; aborting unsafe churn")
             # Re-fetch the material after reload; the old handle may be stale.
             if material_available:
                 try:
@@ -913,6 +976,8 @@ def main():
             is_small = not is_small
             m.resizeFrameBuffer(*(SMALL_RESOLUTION if is_small else RESOLUTION))
             resizes += 1
+            if not wait_for_resource_reclamation(resource_sync, "framebuffer_resize", frame):
+                raise RuntimeError("framebuffer resize fence failed; aborting unsafe churn")
 
         m.renderFrame()
 
@@ -1040,6 +1105,18 @@ def main():
     print("CHURN totals", totals)
 
     telemetry_missing = []
+    if (
+        resource_sync["attempts"] <= 0
+        or resource_sync["status"] != "PASS"
+        or resource_sync["completed"] != resource_sync["attempts"]
+        or resource_sync["failures"] != 0
+        or len(resource_sync["events"]) != resource_sync["attempts"]
+        or any(
+            not isinstance(event, Mapping) or event.get("status") != "PASS"
+            for event in resource_sync["events"]
+        )
+    ):
+        telemetry_missing.append("successful m.device.wait after every scene reload/resize")
     if not stats_complete:
         telemetry_missing.append("LumenGI.surfaceCacheStats canonical fields")
     if not provenance["renderer"].get("authoritative"):
@@ -1098,6 +1175,7 @@ def main():
             "reloads": reloads,
             "resizes": resizes,
             "dirty_injections": dirty_injections,
+            "resource_sync": resource_sync,
             "series": series,
             "telemetry_provenance": provenance,
             # Flat aliases make the required provenance visible to simple
