@@ -34,6 +34,7 @@ The resulting ``launcher-manifest.json`` is input/provenance evidence for
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import math
 import os
@@ -52,6 +53,7 @@ DEFAULT_MOGWAI = Path("build/windows-vs2022/bin/Release/Mogwai.exe")
 DEFAULT_SCRIPT = Path("tests/lumengi/run_churn_short.py")
 DEFAULT_VRAM_SAMPLE_SECONDS = 5.0
 DEFAULT_TIMEOUT_SLACK_SECONDS = 300.0
+DEFAULT_MIN_HOST_FREE_GIB = 1.0
 VRAM_QUERY = (
     "nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.used,memory.free "
     "--format=csv,noheader,nounits"
@@ -79,6 +81,96 @@ def _memory_bytes(value):
         return None
     # nvidia-smi emits MiB when nounits is used.
     return int(number * 1024.0 * 1024.0)
+
+
+def query_host_memory():
+    """Return an authoritative host-memory sample where the platform exposes one."""
+    result = {
+        "source": None,
+        "available": False,
+        "authoritative": False,
+        "status": "BLOCKED",
+        "total_bytes": None,
+        "free_bytes": None,
+        "reason": None,
+    }
+    try:
+        if os.name == "nt":
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                raise RuntimeError("GlobalMemoryStatusEx failed")
+            total = int(status.ullTotalPhys)
+            free = int(status.ullAvailPhys)
+            source = "GlobalMemoryStatusEx"
+        else:
+            fields = {}
+            with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    key, separator, value = line.partition(":")
+                    if not separator:
+                        continue
+                    parts = value.strip().split()
+                    if parts:
+                        number = _finite(parts[0])
+                        unit = parts[1].lower() if len(parts) >= 2 else "bytes"
+                        multiplier = {
+                            "kb": 1024,
+                            "mb": 1024**2,
+                            "gb": 1024**3,
+                            "bytes": 1,
+                        }.get(unit)
+                        fields[key] = (
+                            int(number * multiplier)
+                            if number is not None and multiplier is not None
+                            else None
+                        )
+            total = fields.get("MemTotal")
+            free = fields.get("MemAvailable") or fields.get("MemFree")
+            source = "/proc/meminfo"
+        if total is None or free is None or total <= 0 or free < 0 or free > total:
+            raise RuntimeError("host memory fields are incomplete or invalid")
+        result.update(
+            {
+                "source": source,
+                "available": True,
+                "authoritative": True,
+                "status": "PASS",
+                "total_bytes": total,
+                "free_bytes": free,
+            }
+        )
+    except Exception as exc:
+        result["reason"] = "authoritative host memory unavailable: %s" % exc
+    return result
+
+
+def host_memory_guard_reason(snapshot, min_free_bytes):
+    """Return a safety-stop reason, or None when the sample is healthy."""
+    if not isinstance(snapshot, Mapping) or snapshot.get("authoritative") is not True:
+        return "authoritative host memory unavailable"
+    free = _finite(snapshot.get("free_bytes"))
+    if free is None:
+        return "authoritative host free memory is missing"
+    if free < min_free_bytes:
+        return "host free memory %.3f GiB is below safety threshold %.3f GiB" % (
+            free / float(1024**3),
+            min_free_bytes / float(1024**3),
+        )
+    return None
 
 
 def _write_json(path, payload):
@@ -173,7 +265,13 @@ def build_command(mogwai, script, log_path):
     ]
 
 
-def validate_config(dynamic_minutes, soak_hours, gpu_index, sample_seconds):
+def validate_config(
+    dynamic_minutes,
+    soak_hours,
+    gpu_index,
+    sample_seconds,
+    min_host_free_gib=DEFAULT_MIN_HOST_FREE_GIB,
+):
     errors = []
     dynamic = _finite(dynamic_minutes)
     soak = _finite(soak_hours)
@@ -185,6 +283,8 @@ def validate_config(dynamic_minutes, soak_hours, gpu_index, sample_seconds):
         errors.append("one explicit gpu-index is required")
     if _positive(sample_seconds) is None:
         errors.append("VRAM sample interval must be positive")
+    if _positive(min_host_free_gib) is None:
+        errors.append("minimum host free memory must be positive")
     return errors
 
 
@@ -310,6 +410,13 @@ def _phase_result(role, expected_seconds, phase_dir, command, timeout_seconds=No
         },
         "log": {"exists": False, "bytes": 0},
         "launcher_vram_samples": [],
+        "launcher_host_memory_samples": [],
+        "resource_guard": {
+            "triggered": False,
+            "threshold_bytes": None,
+            "observed_free_bytes": None,
+            "reason": None,
+        },
         "child_contract_status": "NOT_RUN",
         "blocking_reasons": [],
     }
@@ -325,6 +432,7 @@ def run_phase(
     selected_gpu,
     sample_seconds,
     timeout_seconds,
+    min_host_free_bytes,
 ):
     phase_dir = root / role
     phase_dir.mkdir(parents=False, exist_ok=False)
@@ -350,6 +458,7 @@ def run_phase(
         }
     )
     samples = []
+    host_samples = []
     started = time.time()
     monotonic_started = time.monotonic()
     result["process"]["started_at_unix"] = started
@@ -397,6 +506,29 @@ def run_phase(
                                 process.kill()
                                 process.wait(timeout=30)
                             break
+                host_snapshot = query_host_memory()
+                host_snapshot["timestamp_unix"] = time.time()
+                host_samples.append(host_snapshot)
+                guard_reason = host_memory_guard_reason(host_snapshot, min_host_free_bytes)
+                if guard_reason:
+                    result["resource_guard"].update(
+                        {
+                            "triggered": True,
+                            "threshold_bytes": min_host_free_bytes,
+                            "observed_free_bytes": host_snapshot.get("free_bytes"),
+                            "reason": guard_reason,
+                        }
+                    )
+                    result["blocking_reasons"].append(guard_reason)
+                    result["process"]["intentional_termination"] = True
+                    result["process"]["termination_reason"] = "host_memory_safety_guard"
+                    process.terminate()
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=30)
+                    break
                 snapshot = query_vram(gpu_index)
                 snapshot["timestamp_unix"] = time.time()
                 samples.append(snapshot)
@@ -423,7 +555,11 @@ def run_phase(
     final_snapshot = query_vram(gpu_index)
     final_snapshot["timestamp_unix"] = time.time()
     samples.append(final_snapshot)
+    final_host_snapshot = query_host_memory()
+    final_host_snapshot["timestamp_unix"] = time.time()
+    host_samples.append(final_host_snapshot)
     result["launcher_vram_samples"] = samples
+    result["launcher_host_memory_samples"] = host_samples
     result["selected_gpu"] = {
         "gpu_index": selected_gpu.get("gpu_index"),
         "gpu_name": selected_gpu.get("gpu_name"),
@@ -469,11 +605,18 @@ def build_manifest(config, root, phases, status):
             "frame_rate_hz": FRAME_RATE,
             "gpu_index": str(config["gpu_index"]),
             "vram_sample_seconds": config["vram_sample_seconds"],
+            "min_host_free_gib": config.get("min_host_free_gib", DEFAULT_MIN_HOST_FREE_GIB),
+            "min_host_free_bytes": config.get(
+                "min_host_free_bytes",
+                int(config.get("min_host_free_gib", DEFAULT_MIN_HOST_FREE_GIB) * 1024**3),
+            ),
         },
         "contract": {
             "single_gpu": True,
             "require_authoritative_renderer_provenance": True,
             "require_authoritative_gpu_wide_vram": True,
+            "require_authoritative_host_memory": True,
+            "min_host_free_gib": config.get("min_host_free_gib", DEFAULT_MIN_HOST_FREE_GIB),
             "require_dynamic_minutes_at_least": MIN_DYNAMIC_MINUTES,
             "require_soak_hours_at_least": MIN_SOAK_HOURS,
             "proxy_is_not_soak": True,
@@ -498,6 +641,14 @@ def _self_test():
     assert validate_config(29.9, 2.0, "0", 5.0)
     assert validate_config(30.0, 1.99, "0", 5.0)
     assert validate_config(30.0, 2.0, None, 5.0)
+    assert validate_config(30.0, 2.0, "0", 5.0, 0.0)
+    assert host_memory_guard_reason(
+        {"authoritative": True, "free_bytes": 2 * 1024**3}, 1 * 1024**3
+    ) is None
+    assert "below safety threshold" in host_memory_guard_reason(
+        {"authoritative": True, "free_bytes": 512 * 1024**2}, 1 * 1024**3
+    )
+    assert "unavailable" in host_memory_guard_reason({}, 1 * 1024**3)
     command = build_command("Mogwai.exe", "run_churn_short.py", "out/mogwai.log")
     assert "--script" in command and "--logfile" in command
     assert command[1:5] == ["--device-type", "d3d12", "--headless", "--precise"]
@@ -511,6 +662,8 @@ def _self_test():
             "soak_seconds": 7200.0,
             "gpu_index": "0",
             "vram_sample_seconds": 5.0,
+            "min_host_free_gib": DEFAULT_MIN_HOST_FREE_GIB,
+            "min_host_free_bytes": int(DEFAULT_MIN_HOST_FREE_GIB * 1024**3),
         },
         Path("out"),
         {"dynamic": phase, "soak": dict(phase, role="soak", expected_seconds=7200.0)},
@@ -538,6 +691,12 @@ def main(argv=None):
     parser.add_argument("--script", default=str(DEFAULT_SCRIPT))
     parser.add_argument("--vram-sample-seconds", type=float, default=DEFAULT_VRAM_SAMPLE_SECONDS)
     parser.add_argument(
+        "--min-host-free-gib",
+        type=float,
+        default=DEFAULT_MIN_HOST_FREE_GIB,
+        help="safety-stop threshold for authoritative host available memory",
+    )
+    parser.add_argument(
         "--timeout-slack-seconds",
         type=float,
         default=DEFAULT_TIMEOUT_SLACK_SECONDS,
@@ -547,7 +706,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.self_test:
         return _self_test()
-    errors = validate_config(args.dynamic_minutes, args.soak_hours, args.gpu_index, args.vram_sample_seconds)
+    errors = validate_config(
+        args.dynamic_minutes,
+        args.soak_hours,
+        args.gpu_index,
+        args.vram_sample_seconds,
+        args.min_host_free_gib,
+    )
     if _finite(args.timeout_slack_seconds) is None or args.timeout_slack_seconds < 0:
         errors.append("timeout slack must be non-negative")
     if errors:
@@ -560,7 +725,15 @@ def main(argv=None):
         parser.error("runner script does not exist: %s" % script)
     root = _unique_output_root(args.output_root)
     initial_vram = query_vram(args.gpu_index)
+    initial_host_memory = query_host_memory()
+    min_host_free_bytes = int(args.min_host_free_gib * 1024**3)
+    preflight_reasons = []
     if initial_vram.get("authoritative") is not True:
+        preflight_reasons.append(initial_vram.get("reason") or "authoritative VRAM unavailable")
+    host_guard_reason = host_memory_guard_reason(initial_host_memory, min_host_free_bytes)
+    if host_guard_reason:
+        preflight_reasons.append(host_guard_reason)
+    if preflight_reasons:
         manifest = build_manifest(
             {
                 "dynamic_minutes": args.dynamic_minutes,
@@ -569,12 +742,16 @@ def main(argv=None):
                 "soak_seconds": args.soak_hours * 3600.0,
                 "gpu_index": args.gpu_index,
                 "vram_sample_seconds": args.vram_sample_seconds,
+                "min_host_free_gib": args.min_host_free_gib,
+                "min_host_free_bytes": min_host_free_bytes,
             },
             root,
             {},
             "BLOCKED",
         )
-        manifest["blocking_reasons"] = [initial_vram.get("reason") or "authoritative VRAM unavailable"]
+        manifest["launcher_initial_vram"] = initial_vram
+        manifest["launcher_initial_host_memory"] = initial_host_memory
+        manifest["blocking_reasons"] = preflight_reasons
         _write_json(root / "launcher-manifest.json", manifest)
         print("S2_RELEASE_SOAK_LAUNCHER BLOCKED", root)
         return 2
@@ -585,6 +762,8 @@ def main(argv=None):
         "soak_seconds": args.soak_hours * 3600.0,
         "gpu_index": args.gpu_index,
         "vram_sample_seconds": args.vram_sample_seconds,
+        "min_host_free_gib": args.min_host_free_gib,
+        "min_host_free_bytes": min_host_free_bytes,
     }
 
     def persist_manifest(phases, status, run_state):
@@ -600,6 +779,7 @@ def main(argv=None):
         manifest = build_manifest(config, root, phases, status)
         manifest["run_state"] = run_state
         manifest["launcher_initial_vram"] = initial_vram
+        manifest["launcher_initial_host_memory"] = initial_host_memory
         manifest["selected_gpu"] = {
             "gpu_index": initial_vram.get("gpu_index"),
             "gpu_name": initial_vram.get("gpu_name"),
@@ -621,6 +801,7 @@ def main(argv=None):
             initial_vram,
             args.vram_sample_seconds,
             timeout,
+            min_host_free_bytes,
         )
         # Persist the completed phase before starting the next one.  A
         # cancelled/failed soak therefore leaves the dynamic artifact and its
@@ -635,6 +816,7 @@ def main(argv=None):
     ) else "BLOCKED"
     manifest = build_manifest(config, root, phases, status)
     manifest["launcher_initial_vram"] = initial_vram
+    manifest["launcher_initial_host_memory"] = initial_host_memory
     manifest["selected_gpu"] = {
         "gpu_index": initial_vram.get("gpu_index"),
         "gpu_name": initial_vram.get("gpu_name"),

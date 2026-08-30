@@ -962,6 +962,16 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   still fail mean error (`2.6779e-5` / `3.1251e-5` versus `2e-5`). A temporary
   NoResampling diagnostic was worse and was discarded; C9 remains OPEN/FAIL.
 
+### S2 host-memory safety guard (2026-08-30)
+
+- The release-soak launcher now performs authoritative host-memory preflight
+  and per-phase sampling (`GlobalMemoryStatusEx` on Windows), with a default
+  1 GiB minimum-free safety threshold exposed as `--min-host-free-gib`.
+- A crossing terminates only the exact Mogwai child, records the observed
+  memory and `resource_guard` reason in `launcher-manifest.json`, and keeps the
+  phase `BLOCKED`; no release threshold or cadence is changed. Self-test and
+  compile pass; no GPU run was started for this change.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：

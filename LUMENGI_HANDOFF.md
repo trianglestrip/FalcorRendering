@@ -1451,3 +1451,12 @@ unchanged. Fresh v3/v4 artifacts remain `FAIL` only on mean error (v3
 `2.6779e-5`, v4 `3.1251e-5`; p99/max are within bounds). A temporary
 NoResampling experiment was worse and was not kept as a production setting.
 The replay thresholds remain frozen.
+
+The S2 launcher now samples authoritative host available memory in addition to
+GPU-wide VRAM. It performs a preflight and applies a default 1 GiB safety
+threshold (`--min-host-free-gib`); crossing it terminates only the exact child,
+records `resource_guard` and host samples, and leaves the phase `BLOCKED` for
+the offline gate. This is a safety/diagnostic guard only and does not weaken
+the two-hour duration, churn, VRAM, or C9 thresholds. Rerun the checkpointed
+soak only when the host has enough memory; do not reinterpret the existing v8
+stop as a soak PASS.

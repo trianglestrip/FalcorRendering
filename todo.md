@@ -400,3 +400,8 @@ tools\.packman\cmake\bin\cmake.exe --build build\windows-vs2022 `
 - [ ] C9 replay mark-set isolation reduced p99/max but v3/v4 mean error remains
   above the frozen `2e-5` limit; keep strict equivalence OPEN/FAIL and retain
   the v3/v4 artifacts for follow-up determinism work.
+
+- [ ] S2 launcher now has an authoritative host-memory preflight and
+  per-phase safety guard (`--min-host-free-gib`, default 1 GiB). It records
+  host samples and exact-child termination in the manifest, but does not alter
+  any release gate; rerun the blocked soak only with adequate host memory.

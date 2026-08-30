@@ -804,3 +804,18 @@ dynamic soak, and the 2-hour release soak remain open.
   diagnostic (v5) was worse (mean `5.6078e-5`) and is not retained as a
   production setting. C9 strict equivalence remains open; no tolerance was
   relaxed.
+
+### 2026-08-30 S2 host-memory safety guard
+
+- `tests/lumengi/run_release_soak_launcher.py` now records authoritative host
+  available-memory samples (`GlobalMemoryStatusEx` on Windows) in the launch
+  manifest, performs a preflight check, and uses a default 1 GiB minimum-free
+  threshold (`--min-host-free-gib`).
+- If the threshold is crossed during a phase, the launcher terminates only the
+  exact Mogwai child, records the observed value and reason, and marks that
+  phase `BLOCKED`; it never converts a safety stop into a soak PASS or changes
+  the duration/cadence/VRAM gates. The existing v8 soak result remains
+  `BLOCKED` and must be rerun with sufficient host memory.
+- Launcher self-test, Python compile, host-memory query, and CodeGraph sync
+  are required before the next GPU window; no GPU run is started by this
+  change.
