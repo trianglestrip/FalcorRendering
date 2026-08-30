@@ -396,3 +396,7 @@ tools\.packman\cmake\bin\cmake.exe --build build\windows-vs2022 `
   `artifacts/lumengi/release/soak-launch-20260830-postfix-v8/release-soak-gate.json`
   is `BLOCKED` with no soak child JSON. Rerun on a host with adequate memory;
   do not lower cadence or duration.
+
+- [ ] C9 replay mark-set isolation reduced p99/max but v3/v4 mean error remains
+  above the frozen `2e-5` limit; keep strict equivalence OPEN/FAIL and retain
+  the v3/v4 artifacts for follow-up determinism work.

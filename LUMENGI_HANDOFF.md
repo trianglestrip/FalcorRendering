@@ -1444,3 +1444,10 @@ stopped for host safety. The launcher finalized with `dynamic=PASS`,
 `soak=BLOCKED` and no soak child artifact; the offline report is
 `.../release-soak-gate.json`. Preserve this as a safety stop, not a soak
 verdict, and rerun with sufficient host memory before considering S2 closure.
+
+Strict C9 replay was also isolated to retain only the production-required
+`LumenGI.resolvedDiffuseGI` mark during mark-on; normal showcase captures are
+unchanged. Fresh v3/v4 artifacts remain `FAIL` only on mean error (v3
+`2.6779e-5`, v4 `3.1251e-5`; p99/max are within bounds). A temporary
+NoResampling experiment was worse and was not kept as a production setting.
+The replay thresholds remain frozen.

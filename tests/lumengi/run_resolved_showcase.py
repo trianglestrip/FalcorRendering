@@ -95,6 +95,30 @@ LUMEN_RUNTIME_OUTPUTS = (
 )
 
 
+def _lumen_output_mark_list():
+    """Return the diagnostic outputs retained by the current capture mode.
+
+    The ordinary showcase keeps the complete LumenGI diagnostic surface for
+    screenshot and telemetry consumers.  Strict C9 replay only needs the
+    production composite's resolved diffuse resource; retaining every
+    intermediate diagnostic in mark-on changes RenderGraph lifetime/aliasing
+    versus mark-off and can introduce unrelated low-bit differences in the
+    final composite.  This narrows only the replay harness and leaves the
+    production graph/output policy unchanged.
+    """
+    if DETERMINISTIC_REPLAY_OUT:
+        return ("resolvedDiffuseGI",)
+    outputs = LUMEN_RUNTIME_OUTPUTS
+    if E1_DIAGNOSTIC_OUTPUTS:
+        outputs += (
+            "roughSpecularIndirect",
+            "roughSpecularValidity",
+            "transmissionIndirect",
+            "transmissionValidity",
+        )
+    return outputs
+
+
 def _scenes():
     value = os.environ.get("LUMEN_RESOLVED_SHOWCASE_SCENES", "")
     if not value:
@@ -301,14 +325,7 @@ def _graph():
         "emissive",
     ):
         graph.addEdge("GBufferRT." + channel, "LumenGI." + channel)
-    lumen_outputs = LUMEN_RUNTIME_OUTPUTS
-    if E1_DIAGNOSTIC_OUTPUTS:
-        lumen_outputs += (
-            "roughSpecularIndirect",
-            "roughSpecularValidity",
-            "transmissionIndirect",
-            "transmissionValidity",
-        )
+    lumen_outputs = _lumen_output_mark_list()
     # Keep Mogwai's first graph output on the production composite. The
     # renderer uses output[0] as its mainOutput; putting a diagnostic LumenGI
     # texture first makes a later same-process unmark transition leave the
@@ -374,9 +391,7 @@ def _same_process_mark_equivalence(graph, composite):
             "reason": "same-process mark transition disabled by LUMEN_C9_SAME_PROCESS_EQUIVALENCE=0",
             "renderedFrames": 0,
         }
-    names = list(LUMEN_RUNTIME_OUTPUTS)
-    if E1_DIAGNOSTIC_OUTPUTS:
-        names.extend(("roughSpecularIndirect", "roughSpecularValidity", "transmissionIndirect", "transmissionValidity"))
+    names = list(_lumen_output_mark_list())
     rendered_frames = 0
     try:
         if not MARK_LUMEN_OUTPUTS:
@@ -782,6 +797,7 @@ for label, scene_path in _scenes():
                 "probeDirections": PROBE_DIRECTIONS_PER_PROBE,
                 "spatial": [SPATIAL_RADIUS_MIN, SPATIAL_RADIUS_MAX, SPATIAL_VARIANCE_LOW, SPATIAL_VARIANCE_HIGH],
                 "lightingOverrides": [ENV_INTENSITY, POINT_LIGHT_SCALE, DIRECTIONAL_LIGHT_SCALE, EMISSIVE_FACTOR_SCALE],
+                "deterministicMarkChannels": list(_lumen_output_mark_list()) if DETERMINISTIC_REPLAY_OUT else None,
             }
             config_fingerprint = hashlib.sha256(
                 json.dumps(config_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

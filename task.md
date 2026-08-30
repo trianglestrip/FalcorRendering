@@ -955,6 +955,13 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   `churn.json` exists. This is a host-safety stop; do not reinterpret it as a
   2-hour result or reduce the duration/cadence gates.
 
+### C9 replay isolation (2026-08-30)
+
+- Strict replay mark-on now retains only `LumenGI.resolvedDiffuseGI`; ordinary
+  showcase output marking is unchanged. v3/v4 GPU replays improved p99/max but
+  still fail mean error (`2.6779e-5` / `3.1251e-5` versus `2e-5`). A temporary
+  NoResampling diagnostic was worse and was discarded; C9 remains OPEN/FAIL.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：

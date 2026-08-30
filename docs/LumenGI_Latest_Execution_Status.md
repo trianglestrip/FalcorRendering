@@ -790,3 +790,17 @@ dynamic soak, and the 2-hour release soak remain open.
   (mean `5.0122e-5`, p99 `6.1035e-4`, max `2.5635e-3`); thresholds remain
   unchanged. Shutdown remains unauthorized while C9 equivalence and the
   complete 2-hour soak are open/blocked.
+
+### 2026-08-30 C9 replay isolation
+
+- Strict replay now retains only the production-required `LumenGI.resolvedDiffuseGI`
+  mark during the mark-on phase; ordinary showcase captures still retain the
+  full diagnostic output set. This isolates RenderGraph lifetime/aliasing from
+  unrelated intermediate exports without changing production defaults or
+  thresholds.
+- Fresh v3/v4 replays reduced p99/max into bounds but remain `FAIL` on mean
+  error: v3 mean `2.6779e-5`, p99 `4.2725e-4`, max `2.6855e-3`; v4 mean
+  `3.1251e-5`, p99 `4.8828e-4`, max `2.4414e-3`. A temporary NoResampling
+  diagnostic (v5) was worse (mean `5.6078e-5`) and is not retained as a
+  production setting. C9 strict equivalence remains open; no tolerance was
+  relaxed.
