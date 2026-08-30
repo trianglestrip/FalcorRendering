@@ -764,3 +764,10 @@ dynamic soak, and the 2-hour release soak remain open.
 - `Mogwai::Renderer::setScene()` now fences before and after replacing an existing scene (`Source/Mogwai/Mogwai.cpp`). The first wait drains work referencing the old scene; the second advances the fence after graph/pass release so deferred GPU resources are reclaimed before the next reload. The normal frame path is unchanged.
 - Release `Mogwai` rebuilt successfully (`cmake --build build/windows-vs2022 --config Release --target Mogwai --parallel 1`), CodeGraph was synchronized, and all dependency-free LumenGI/S2/C9/C10 self-tests passed. The strict S2 two-hour gate remains `BLOCKED` until a fresh post-fix run produces complete 2-hour evidence; C9 strict export equivalence remains open.
 - The S2 launcher now persists a strict `RUNNING`/`BLOCKED` manifest after initial setup and after each phase. If the launcher is interrupted after a child writes its artifact, the completed phase's process/VRAM evidence remains discoverable; the offline gate still rejects non-`READY_FOR_OFFLINE_GATE` manifests.
+- A fresh C9 replay after the scene-fence change remains strict `FAIL` at
+  `artifacts/lumengi/C9/deterministic-replay-20260830-v2/c9-export-repro.json`
+  (mean `5.0122e-5`, p99 `6.1035e-4`, max `2.5635e-3`). The max error is within
+  its bound, but mean/p99 exceed the frozen tolerances; the lifetime guard does
+  not claim C9 numerical equivalence.
+- The first post-fix S2 launcher attempt was interrupted during renderer startup
+  before it could checkpoint a manifest (`artifacts/lumengi/release/soak-launch-20260830-postfix-v5/` contains only compile logs). It is not a gate result; rerun with the checkpointing launcher when the GPU window is available.

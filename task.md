@@ -940,6 +940,10 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
 - The launcher now checkpoints `launcher-manifest.json` as `RUNNING`/`BLOCKED`
   after setup and each phase, preserving partial process/VRAM evidence across
   an interrupted orchestration without weakening the offline gate.
+- C9 replay after the scene-fence change remains `FAIL` (`mean=5.0122e-5`,
+  `p99=6.1035e-4`, `max=2.5635e-3`); mean/p99 exceed frozen limits. The first
+  post-fix S2 launch was interrupted during renderer startup before a manifest
+  was written, so it supplies no soak verdict.
 
 ## 21. 最终完成条件
 

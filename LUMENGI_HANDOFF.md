@@ -1425,3 +1425,12 @@ after each phase. This preserves completed dynamic evidence if the launcher is
 interrupted before the soak phase or final aggregation; the offline gate still
 requires `READY_FOR_OFFLINE_GATE` and all authoritative duration/provenance
 checks.
+
+A fresh C9 replay after the scene-fence change remains strict `FAIL` at
+`artifacts/lumengi/C9/deterministic-replay-20260830-v2/c9-export-repro.json`
+(mean `5.0122e-5`, p99 `6.1035e-4`, max `2.5635e-3`). Mean/p99 still exceed
+the frozen limits; the lifetime guard is not a numerical-equivalence fix. The
+first post-fix S2 launcher attempt was interrupted during renderer startup and
+left only compile logs under
+`artifacts/lumengi/release/soak-launch-20260830-postfix-v5/`; it is not a gate
+result. Future runs should use the launcher's new phase checkpoints.
