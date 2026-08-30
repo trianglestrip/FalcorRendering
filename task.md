@@ -986,6 +986,10 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   startup protection only; duration, VRAM, and release thresholds are unchanged.
 - C9 strict replay fences after graph teardown and supports reverse order; v6
   off-first remains FAIL on frozen mean error (`3.3392e-5` vs `2e-5`).
+- S2 v13 dynamic reached 1800 s/108000 frames with one reload/resize and
+  `resource_sync` 4/4 PASS; its soak stopped at 0.473 GiB after four reloads,
+  so S2 remains BLOCKED. The launcher now selects 30-minute dynamic and
+  60-minute soak reload/resize defaults, with explicit overrides preserved.
 
 ## 21. 最终完成条件
 

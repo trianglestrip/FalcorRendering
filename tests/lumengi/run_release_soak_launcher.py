@@ -495,11 +495,23 @@ def run_phase(
             # material/reload/resize churn while avoiding an unbounded retained
             # allocation pattern from changing a material every rendered frame.
             "LUMEN_CHURN_MATERIAL_INTERVAL_FRAMES": os.environ.get("LUMEN_CHURN_MATERIAL_INTERVAL_FRAMES", "60"),
-            "LUMEN_CHURN_RELOAD_INTERVAL_FRAMES": os.environ.get("LUMEN_CHURN_RELOAD_INTERVAL_FRAMES", "3600"),
-            "LUMEN_CHURN_RESIZE_INTERVAL_FRAMES": os.environ.get("LUMEN_CHURN_RESIZE_INTERVAL_FRAMES", "5400"),
+            # Keep one positive reload/resize in the 30-minute dynamic phase,
+            # while the two-hour soak uses a 60-minute cadence.  A caller may
+            # still override either value explicitly for a bounded diagnostic.
+            "LUMEN_CHURN_RELOAD_INTERVAL_FRAMES": os.environ.get(
+                "LUMEN_CHURN_RELOAD_INTERVAL_FRAMES", "108000" if role == "dynamic" else "216000"
+            ),
+            "LUMEN_CHURN_RESIZE_INTERVAL_FRAMES": os.environ.get(
+                "LUMEN_CHURN_RESIZE_INTERVAL_FRAMES", "108000" if role == "dynamic" else "216000"
+            ),
             "LUMEN_CHURN_PHASE_ID": role,
         }
     )
+    result["workload"] = {
+        "reload_interval_frames": int(env["LUMEN_CHURN_RELOAD_INTERVAL_FRAMES"]),
+        "resize_interval_frames": int(env["LUMEN_CHURN_RESIZE_INTERVAL_FRAMES"]),
+        "material_interval_frames": int(env["LUMEN_CHURN_MATERIAL_INTERVAL_FRAMES"]),
+    }
     samples = []
     host_samples = []
     started = time.time()

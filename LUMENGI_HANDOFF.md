@@ -1475,3 +1475,11 @@ for the `CHURN seconds` readiness marker (or 180 s) before enforcing the normal
 0.5 GiB guard and keeps a 0.25 GiB startup hard floor. C9 strict replay adds a
 post-`removeGraph()` fence and reverse-order diagnostics; v6 off-first remains
 strict FAIL on mean error only (`3.3392e-5`).
+
+The v13 launcher run completed its dynamic phase at 1800 s/108000 frames with
+one reload and one resize (`resource_sync` 4/4 PASS). The soak phase was safely
+stopped at 0.473 GiB after four reloads, producing no child soak artifact and
+remaining `BLOCKED`. The launcher now defaults to phase-specific 30-minute
+dynamic and 60-minute soak reload/resize cadences (explicit environment values
+still override these for bounded diagnostics); no duration, VRAM, or memory
+threshold was relaxed.

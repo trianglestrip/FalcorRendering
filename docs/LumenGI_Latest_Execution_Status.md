@@ -838,3 +838,10 @@ dynamic soak, and the 2-hour release soak remain open.
 - C9 strict replay now fences both before and after graph teardown and supports
   reverse mark order. The v6 off-first replay still fails only the frozen mean
   error bound (`3.3392e-5` vs `2e-5`); p99/max/relative-max remain in bounds.
+- S2 v13 dynamic completed 1800 s/108000 frames with one reload and one resize
+  (`resource_sync` 4/4 PASS). Its soak phase safely stopped at 0.473 GiB after
+  four reloads, so the result remains `BLOCKED`; this confirms the guard is
+  catching residual host growth rather than fabricating a soak PASS.
+- The next launcher run uses phase-specific defaults (dynamic 30 min, soak 60
+  min reload/resize cadence) while retaining positive mutation counts and all
+  duration/VRAM/memory thresholds.

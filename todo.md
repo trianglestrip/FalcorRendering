@@ -417,3 +417,7 @@ tools\.packman\cmake\bin\cmake.exe --build build\windows-vs2022 `
   unchanged.
 - [ ] C9 strict replay now fences after graph teardown and supports reverse
   order. v6 off-first remains FAIL only on frozen mean error (`3.3392e-5`).
+- [ ] S2 v13 dynamic completed 1800 s/108000 frames with one reload/resize and
+  `resource_sync` 4/4 PASS; soak safely stopped at 0.473 GiB after four
+  reloads (`BLOCKED`). Re-run with phase-specific 30-minute dynamic/60-minute
+  soak cadence and preserve the 0.5 GiB guard.
