@@ -957,6 +957,38 @@ localizes the observed variance to request atomics or their scheduler path,
 not page feedback. Suppressing request atomics also suppresses demand capture,
 so it is diagnostic-only and cannot be promoted to production behavior.
 
+### 2026-08-30 request-wave aggregation experiment
+
+The request sink now has an opt-in `LUMEN_C9_ENABLE_PROBE_CACHE_REQUEST_WAVE_AGGREGATION`
+diagnostic macro. It uses a full `uint4` `WaveMatch` mask and a leader-only
+`InterlockedAdd/InterlockedOr`, preserving the per-card raw-count and reason-bit
+contract; the default remains disabled. Runtime shader compilation succeeded on
+the RTX 2060 SUPER in `artifacts/lumengi/C9/deterministic-replay-20260830-v41-request-wave-aggregation/`.
+
+The strict C9 pair in v41 still fails (`mean=5.4954e-5`, `p99=7.3242e-4`,
+`max=2.6658e-3`), so it is not evidence of an equivalence fix. A follow-up
+macro-on/off run with the per-card `surfaceCacheEvents` ledger is recorded in
+`artifacts/lumengi/C9/deterministic-replay-20260830-v42-request-wave-on-events/`
+and `.../v43-request-wave-off-events/`; the exact request-ledger validator is
+`tests/lumengi/run_c9_request_wave_equivalence.py` and currently returns `FAIL`
+because independent process runs differ in request counts. Keep the macro
+diagnostic-only until a same-process or otherwise deterministic per-card A/B
+proves equality and measures atomic-group/timestamp benefit.
+
+The former C4 compose `E_INVALIDARG` note is superseded by the current bounded
+artifact `artifacts/lumengi/C4/gdf-probe-router-current-20260815/`, which reports
+`PASS`, `useGDF=true`, and `Screen -> GDF -> HWRT`. The remaining C4/C5 work is
+fresh runtime provenance and cache-lighting coverage/timeout, not another root
+signature change.
+
+A fresh current-Release C4 router run is now recorded at
+`artifacts/lumengi/C4/gdf-probe-router-current-20260830-v1/`. Its JSON is
+`PASS` with `gdfHits=607`, `gdfMisses=12260`, `fallbackHits=2255`, no render
+error, and no `E_INVALIDARG`/Fatal/device-removed marker in the log. The exact
+Mogwai process was terminated only after the report was written because
+`unloadScene()` stopped making progress; this is runtime evidence for the route
+and compose dispatch, not an end-to-end clean-exit claim.
+
 The split validator now supports `feedback-atomics-off` and
 `request-atomics-off`, requiring the disabled domain to be zero and the
 enabled domain to show activity; legacy v36/v37 artifacts without the newer

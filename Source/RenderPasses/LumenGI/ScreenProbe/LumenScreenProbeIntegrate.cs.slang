@@ -135,6 +135,15 @@ import RenderPasses.LumenGI.Capture.LumenCardCaptureData;
 #define LUMEN_GI_PROBE_CACHE_LOOKUP 0
 #endif
 
+// Optional C9 diagnostic optimization.  When enabled, request miss atomics are
+// coalesced only within the currently active wave and only for identical card
+// IDs.  The leader adds the complete lane count and ORs the reason bits, so the
+// per-card raw-event contract is unchanged.  Keep this disabled by default until
+// a runtime A/B proves exact per-card equivalence on the target wave width.
+#ifndef LUMEN_GI_PROBE_CACHE_REQUEST_WAVE_AGGREGATION
+#define LUMEN_GI_PROBE_CACHE_REQUEST_WAVE_AGGREGATION 0
+#endif
+
 #if LUMEN_GI_PROBE_CACHE_LOOKUP
 StructuredBuffer<LumenCard> gProbeCards;
 StructuredBuffer<uint> gProbeCardPageTable;
@@ -145,6 +154,32 @@ StructuredBuffer<uint> gProbeCardGrid;
 Texture2D<float4> gProbeRadianceAtlas;
 Texture2D<float4> gProbeMetadataAtlas;
 Texture2D<float> gProbeVisibilityAtlas;
+
+#if LUMEN_GI_PROBE_CACHE_REQUEST_WAVE_AGGREGATION && is_valid_gProbeCacheRequests
+uint lumenProbeRequestWaveFirstLane(const uint4 mask)
+{
+    if (mask.x != 0u)
+        return firstbitlow(mask.x);
+    if (mask.y != 0u)
+        return 32u + firstbitlow(mask.y);
+    if (mask.z != 0u)
+        return 64u + firstbitlow(mask.z);
+    if (mask.w != 0u)
+        return 96u + firstbitlow(mask.w);
+    return 0xffffffffu;
+}
+
+bool lumenProbeRequestWaveContains(const uint4 mask, const uint lane)
+{
+    if (lane < 32u)
+        return (mask.x & (1u << lane)) != 0u;
+    if (lane < 64u)
+        return (mask.y & (1u << (lane - 32u))) != 0u;
+    if (lane < 96u)
+        return (mask.z & (1u << (lane - 64u))) != 0u;
+    return (mask.w & (1u << (lane - 96u))) != 0u;
+}
+#endif
 
 cbuffer LumenProbeCacheCB
 {
@@ -606,8 +641,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         const bool cacheFound = tryLookupSurfaceCache(
             hitPosition, dirW, cacheRadiance, cacheConfidence, cachePageID, cachePageGeneration, requestCardID, requestReason
         );
-        if (cacheFound &&
-            cacheConfidence > 0.f && lumenScreenProbeRadianceIsFinite(cacheRadiance))
+        const bool cacheSampleAccepted = cacheFound &&
+            cacheConfidence > 0.f && lumenScreenProbeRadianceIsFinite(cacheRadiance);
+        if (cacheSampleAccepted)
         {
             li = lumenScreenProbeSanitizeRadiance(cacheRadiance);
             InterlockedAdd(gProbeCounters[0].cacheLookupHits, 1u);
@@ -623,11 +659,37 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 #endif
         }
 #if is_valid_gProbeCacheRequests
-        else if (requestCardID != kLumenCardInvalidID && requestReason != 0u)
+        const bool requestActive = !cacheSampleAccepted &&
+            requestCardID != kLumenCardInvalidID && requestReason != 0u;
+#if LUMEN_GI_PROBE_CACHE_REQUEST_WAVE_AGGREGATION
+        // All active lanes reach WaveMatch with a sentinel key for non-requests.
+        // This keeps the wave operation out of divergent control flow while the
+        // leader still writes only the matching card's count/reason pair.
+        const uint requestKey = requestActive ? requestCardID : kLumenCardInvalidID;
+        const uint4 requestMask = WaveMatch(requestKey);
+        const uint requestLeader = lumenProbeRequestWaveFirstLane(requestMask);
+        if (requestActive && WaveGetLaneIndex() == requestLeader)
+        {
+            uint requestCount = 0u;
+            uint requestReasonOr = 0u;
+            const uint waveCount = WaveGetLaneCount();
+            for (uint lane = 0u; lane < waveCount; ++lane)
+            {
+                if (!lumenProbeRequestWaveContains(requestMask, lane))
+                    continue;
+                ++requestCount;
+                requestReasonOr |= WaveReadLaneAt(requestReason, lane);
+            }
+            InterlockedAdd(gProbeCacheRequests[requestCardID].x, requestCount);
+            InterlockedOr(gProbeCacheRequests[requestCardID].y, requestReasonOr);
+        }
+#else
+        if (requestActive)
         {
             InterlockedAdd(gProbeCacheRequests[requestCardID].x, 1u);
             InterlockedOr(gProbeCacheRequests[requestCardID].y, requestReason);
         }
+#endif
 #endif
 #endif
         // Sanitization preserves finite black as a valid contribution while

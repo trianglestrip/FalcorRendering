@@ -1083,6 +1083,30 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   localizes the variance to request atomics or scheduler interaction. Request
   suppression prevents demand capture, so it remains diagnostic-only.
 
+- The next bounded optimization is an opt-in
+  `LUMEN_C9_ENABLE_PROBE_CACHE_REQUEST_WAVE_AGGREGATION` shader macro. It
+  preserves per-card raw counts and reason-bit OR by matching card IDs with a
+  full `uint4` wave mask and emitting one leader atomic per card group. Runtime
+  compilation succeeds on the RTX 2060 SUPER, but the v41 strict pair remains
+  `FAIL` (`mean=5.4954e-5`, `p99=7.3242e-4`, `max=2.6658e-3`). The v42/v43
+  macro-on/off event-ledger comparison also returns `FAIL` across independent
+  processes because request counts differ. Keep the macro disabled until a
+  deterministic per-card A/B plus atomic-group/timestamp evidence proves exact
+  scheduler-visible equivalence and measurable benefit.
+
+- The historical C4 compose `E_INVALIDARG` blocker is superseded by
+  `artifacts/lumengi/C4/gdf-probe-router-current-20260815/gdf-probe-router.json`
+  (`PASS`, `useGDF=true`, `Screen -> GDF -> HWRT`). Remaining C4/C5 work is
+  fresh runtime provenance and cache-lighting coverage/timeout; do not reopen
+  the descriptor/root-signature change without new contradictory evidence.
+
+- A current Release C4 router rerun at
+  `artifacts/lumengi/C4/gdf-probe-router-current-20260830-v1/` is `PASS` with
+  `gdfHits=607`, `gdfMisses=12260`, `fallbackHits=2255`, no render error, and
+  no `E_INVALIDARG`/Fatal/device-removed log marker. The Mogwai PID was
+  terminated only after the JSON was written because `unloadScene()` stopped
+  progressing; this does not close clean-exit, soak, or C5 coverage gates.
+
 - The split validator now covers page/request sub-modes, positive activity in
   the enabled domain, and compatibility with older artifacts. Feedback/request
   readback is also guarded by `hasNormal` to prevent stale UAV copies when the

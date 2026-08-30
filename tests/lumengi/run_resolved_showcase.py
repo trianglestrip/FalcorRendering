@@ -54,6 +54,13 @@ DISABLE_SURFACE_CACHE_REQUEST_ATOMICS = (
     or os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_REQUEST_ATOMICS", "0").strip().lower()
     not in ("0", "false", "off")
 )
+# Optional test-only shader experiment. Keep it independent from the disable
+# switches and record it in deterministic replay metadata so A/B artifacts are
+# never mistaken for the production default.
+ENABLE_SURFACE_CACHE_REQUEST_WAVE_AGGREGATION = (
+    os.environ.get("LUMEN_C9_ENABLE_PROBE_CACHE_REQUEST_WAVE_AGGREGATION", "0").strip().lower()
+    not in ("0", "false", "off")
+)
 # Test-only synchronization probe for cache feedback/request readback copies.
 FORCE_CACHE_READBACK_UAV_BARRIER = os.environ.get("LUMEN_C9_FORCE_CACHE_READBACK_UAV_BARRIER", "0").strip().lower() not in ("0", "false", "off")
 # Diagnostic-only LumenGI filter switches. Defaults preserve the production
@@ -708,10 +715,16 @@ def _capture(label, scene_path, view_name):
     # and makes cache-lookup/feedback isolation claims auditable in the artifact.
     screen_probe_stats = {}
     surface_cache_stats = {}
+    surface_cache_events = []
     try:
         lumen_pass = graph.getPass("LumenGI")
         screen_probe_stats = dict(lumen_pass.screenProbeStats)
         surface_cache_stats = dict(lumen_pass.surfaceCacheStats)
+        # Deterministic replay keeps the accepted per-card ledger so an A/B can
+        # compare scheduler-visible request identity/reason/count, not only
+        # aggregate totals. Ordinary showcase captures omit this larger payload.
+        if DETERMINISTIC_REPLAY_OUT:
+            surface_cache_events = [dict(event) for event in lumen_pass.surfaceCacheEvents]
     except Exception as exc:
         print("RESOLVED_SHOWCASE telemetry unavailable", str(exc))
     producer_trace = _capture_producer_trace(graph, label, view_name)
@@ -923,6 +936,7 @@ def _capture(label, scene_path, view_name):
             "producerTrace": producer_trace,
             "screenProbeStats": screen_probe_stats,
             "surfaceCacheStats": surface_cache_stats,
+            "surfaceCacheEvents": surface_cache_events,
             "finalColor": {
                 "endpoint": "ResolvedCompositePreview.out",
                 "marked": True,
@@ -1038,6 +1052,7 @@ for label, scene_path in _scenes():
                 "disableSurfaceCacheFeedbackReadback": DISABLE_SURFACE_CACHE_FEEDBACK_READBACK,
                 "disableSurfaceCacheFeedbackPageAtomics": DISABLE_SURFACE_CACHE_FEEDBACK_PAGE_ATOMICS,
                 "disableSurfaceCacheRequestAtomics": DISABLE_SURFACE_CACHE_REQUEST_ATOMICS,
+                "enableSurfaceCacheRequestWaveAggregation": ENABLE_SURFACE_CACHE_REQUEST_WAVE_AGGREGATION,
                 "forceCacheReadbackUavBarrier": FORCE_CACHE_READBACK_UAV_BARRIER,
                 "lumenTemporalFilter": USE_LUMEN_TEMPORAL_FILTER,
                 "lumenSpatialFilter": USE_LUMEN_SPATIAL_FILTER,

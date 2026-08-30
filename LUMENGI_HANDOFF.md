@@ -1611,6 +1611,34 @@ and zero request counters. The current evidence localizes the variance to
 request atomics or their host scheduler path. Disabling requests removes demand
 capture and is therefore diagnostic-only, not a production fix.
 
+The next request-path experiment adds the opt-in
+`LUMEN_C9_ENABLE_PROBE_CACHE_REQUEST_WAVE_AGGREGATION` macro. It matches only
+identical card IDs within the active wave, uses the complete `uint4` mask, and
+lets the leader add the group size plus OR the matching reason bits. The default
+is disabled. Runtime shader compilation succeeded on the RTX 2060 SUPER, but the
+strict pair remains `FAIL` (`mean=5.4954e-5`, `p99=7.3242e-4`, `max=2.6658e-3`)
+in `artifacts/lumengi/C9/deterministic-replay-20260830-v41-request-wave-aggregation/`.
+The follow-up per-card event-ledger A/B (`.../v42-request-wave-on-events/` vs
+`.../v43-request-wave-off-events/`) is currently `FAIL` under
+`tests/lumengi/run_c9_request_wave_equivalence.py` because independent process
+runs do not produce identical request counts. Do not enable this macro in
+production until a deterministic per-card A/B and atomic-group/timestamp
+measurement prove both semantic equality and a real benefit.
+
+The old C4 compose `E_INVALIDARG` blocker is superseded: the current bounded
+`artifacts/lumengi/C4/gdf-probe-router-current-20260815/gdf-probe-router.json`
+is `PASS` with `Screen -> GDF -> HWRT`. Remaining C4/C5 work is a fresh runtime
+log/provenance check and cache-lighting coverage/timeout, not another descriptor
+or root-signature change.
+
+A fresh current-Release router run is available at
+`artifacts/lumengi/C4/gdf-probe-router-current-20260830-v1/`. It reports
+`PASS`, `gdfHits=607`, `gdfMisses=12260`, `fallbackHits=2255`, no render error,
+and no `E_INVALIDARG`/Fatal/device-removed marker in the log. The exact Mogwai
+PID was force-terminated only after the JSON was written because `unloadScene()`
+stopped progressing; treat this as bounded route/compose evidence, not a clean
+process-exit or soak result.
+
 `run_c9_feedback_split_validator.py` now supports both sub-split modes and
 legacy artifacts, requiring positive activity from the enabled domain. The
 feedback/request copy blocks are additionally guarded by `hasNormal` so a graph

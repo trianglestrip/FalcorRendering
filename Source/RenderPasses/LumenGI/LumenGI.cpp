@@ -1971,6 +1971,11 @@ std::map<std::string, double> LumenGIPass::getSurfaceCacheStats() const
         disableSurfaceCacheFeedbackAtomics || envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_PAGE_ATOMICS");
     const bool disableSurfaceCacheRequestAtomics =
         disableSurfaceCacheFeedbackAtomics || envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_REQUEST_ATOMICS");
+    // Test-only shader experiment.  This changes only the number of UAV atomic
+    // instructions, not the per-card request count or reason-bit contract.  It
+    // remains opt-in until a target-GPU A/B proves exact card-level equivalence.
+    const bool enableSurfaceCacheRequestWaveAggregation =
+        envFlag("LUMEN_C9_ENABLE_PROBE_CACHE_REQUEST_WAVE_AGGREGATION");
     // Deterministic page-publication fingerprints used by paired C5 diagnostics.
     // These are host-table hashes only; they never participate in shader decisions.
     auto hashWords = [](const auto& words, uint64_t seed)
@@ -2096,6 +2101,7 @@ std::map<std::string, double> LumenGIPass::getSurfaceCacheStats() const
     stats["disableSurfaceCacheFeedbackReadback"] = disableSurfaceCacheFeedbackReadback ? 1.0 : 0.0;
     stats["disableSurfaceCacheFeedbackPageAtomics"] = disableSurfaceCacheFeedbackPageAtomics ? 1.0 : 0.0;
     stats["disableSurfaceCacheRequestAtomics"] = disableSurfaceCacheRequestAtomics ? 1.0 : 0.0;
+    stats["enableSurfaceCacheRequestWaveAggregation"] = enableSurfaceCacheRequestWaveAggregation ? 1.0 : 0.0;
     stats["generationRejects"] = (double)mSurfaceCacheGenerationRejects;
     // C6 page-lifecycle telemetry. These are host-authoritative counters; no image-derived
     // inference is used by the runtime gate. pageGeneration is the highest resident allocator
@@ -4329,6 +4335,11 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         disableSurfaceCacheFeedbackAtomics || envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_PAGE_ATOMICS");
     const bool disableSurfaceCacheRequestAtomics =
         disableSurfaceCacheFeedbackAtomics || envFlag("LUMEN_C9_DISABLE_SURFACE_CACHE_REQUEST_ATOMICS");
+    // Test-only shader experiment. This changes only the number of UAV atomic
+    // instructions, not the per-card request count or reason-bit contract. It
+    // remains opt-in until a target-GPU A/B proves exact card-level equivalence.
+    const bool enableSurfaceCacheRequestWaveAggregation =
+        envFlag("LUMEN_C9_ENABLE_PROBE_CACHE_REQUEST_WAVE_AGGREGATION");
     const bool hasSurfaceCacheLookup = !disableSurfaceCacheLookup && mUseSurfaceCache && mUseCacheLighting && mCapture.pCards &&
         mCapture.pPageTable && mCapture.pPageGeneration && mCapture.pMetadataAtlas &&
         mCapture.pRadianceAtlas && mCacheLighting.pVisibilityAtlas && mCacheLighting.pPageMetadata &&
@@ -4408,6 +4419,10 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         programChanged |= mScreenProbes.pIntegrate->getProgram()->addDefine(
             "is_valid_gProbeCacheRequests",
             hasSurfaceCacheRequestAtomics ? "1" : "0"
+        );
+        programChanged |= mScreenProbes.pIntegrate->getProgram()->addDefine(
+            "LUMEN_GI_PROBE_CACHE_REQUEST_WAVE_AGGREGATION",
+            hasSurfaceCacheRequestAtomics && enableSurfaceCacheRequestWaveAggregation ? "1" : "0"
         );
     }
     if (programChanged)
