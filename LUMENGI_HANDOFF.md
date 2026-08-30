@@ -1696,3 +1696,15 @@ test-only and default-off. The S1 cache-off control v7 is correctly BLOCKED
 `diffuseRadianceHitDist` identical and shows only a late frame-8 probe delta,
 so it does not implicate S1 RT and the cache/temporal scheduler interaction
 remains OPEN.
+
+The request-wave follow-up is now a real same-process diagnostic rather than
+two independent invocations. With `LUMEN_C9_REQUEST_WAVE_AB=1`, the runner
+creates fresh scene/graph phases in one Mogwai process, unloads and fences the
+first phase, toggles only the request-wave environment flag, and records the
+actual host variant in `requestWaveHostTelemetry`. The artifact
+`artifacts/lumengi/C9/request-wave-same-process-20260830-v1/` has wave-off/on
+host flags `0/1`, `306/306` events, and zero dropped events, but request raw
+counts differ `988831/988881` (first request count `31461/31451`). Both
+request-scope and exact-scope validators are `FAIL`; keep the shader macro
+default-off. `run_c9_request_wave_equivalence.py --require-same-process` is an
+optional fail-closed guard for process, pair, phase, and host-variant evidence.

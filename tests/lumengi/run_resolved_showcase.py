@@ -104,6 +104,9 @@ PRODUCER_TRACE_OUT = os.environ.get("LUMEN_C9_PRODUCER_TRACE_OUT", "").strip()
 DETERMINISTIC_REPLAY_OUT = os.environ.get("LUMEN_C9_DETERMINISTIC_REPLAY_OUT", "").strip()
 DETERMINISTIC_REPLAY_ID = os.environ.get("LUMEN_C9_DETERMINISTIC_REPLAY_ID", "").strip()
 DETERMINISTIC_REPLAY_CONTEXT = {}
+REQUEST_WAVE_AB = os.environ.get("LUMEN_C9_REQUEST_WAVE_AB", "0").strip().lower() not in ("0", "false", "off")
+_REQUEST_WAVE_AB_ORDER = os.environ.get("LUMEN_C9_REQUEST_WAVE_AB_ORDER", "off-first").strip().lower()
+REQUEST_WAVE_AB_ORDER = _REQUEST_WAVE_AB_ORDER if _REQUEST_WAVE_AB_ORDER in ("off-first", "on-first") else "off-first"
 _REPLAY_ORDER = os.environ.get("LUMEN_C9_REPLAY_ORDER", "mark-on-first").strip().lower()
 REPLAY_ORDER = _REPLAY_ORDER if _REPLAY_ORDER in ("mark-on-first", "mark-off-first") else "mark-on-first"
 # Marking a RenderGraph output changes endpoint exposure, not the producer
@@ -720,6 +723,24 @@ def _capture(label, scene_path, view_name):
         lumen_pass = graph.getPass("LumenGI")
         screen_probe_stats = dict(lumen_pass.screenProbeStats)
         surface_cache_stats = dict(lumen_pass.surfaceCacheStats)
+        if REQUEST_WAVE_AB:
+            expected_wave = bool(
+                DETERMINISTIC_REPLAY_CONTEXT.get("config", {}).get(
+                    "enableSurfaceCacheRequestWaveAggregation", False
+                )
+            )
+            observed_wave_raw = surface_cache_stats.get("enableSurfaceCacheRequestWaveAggregation")
+            observed_wave = None
+            if observed_wave_raw is not None:
+                try:
+                    observed_wave = bool(float(observed_wave_raw))
+                except (TypeError, ValueError):
+                    observed_wave = None
+            DETERMINISTIC_REPLAY_CONTEXT["requestWaveHostTelemetry"] = {
+                "expected": expected_wave,
+                "observed": observed_wave,
+                "status": "PASS" if observed_wave == expected_wave else "BLOCKED",
+            }
         # Deterministic replay keeps the accepted per-card ledger so an A/B can
         # compare scheduler-visible request identity/reason/count, not only
         # aggregate totals. Ordinary showcase captures omit this larger payload.
@@ -1061,46 +1082,105 @@ for label, scene_path in _scenes():
                 "spatial": [SPATIAL_RADIUS_MIN, SPATIAL_RADIUS_MAX, SPATIAL_VARIANCE_LOW, SPATIAL_VARIANCE_HIGH],
                 "lightingOverrides": [ENV_INTENSITY, POINT_LIGHT_SCALE, DIRECTIONAL_LIGHT_SCALE, EMISSIVE_FACTOR_SCALE],
                 "deterministicMarkChannels": list(_lumen_output_mark_list()) if DETERMINISTIC_REPLAY_OUT else None,
-                "replayOrder": REPLAY_ORDER,
+                "replayOrder": REQUEST_WAVE_AB_ORDER if REQUEST_WAVE_AB else REPLAY_ORDER,
             }
             config_fingerprint = hashlib.sha256(
                 json.dumps(config_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
-            on_json = pair_root / "mark-on.json"
-            off_json = pair_root / "mark-off.json"
-            phase_paths = {"mark-on": on_json, "mark-off": off_json}
-            replay_phases = (
-                ("mark-on", "mark-off")
-                if REPLAY_ORDER == "mark-on-first"
-                else ("mark-off", "mark-on")
-            )
-            first_phase_path = None
-            for phase in replay_phases:
-                MARK_LUMEN_OUTPUTS = phase == "mark-on"
-                SAME_PROCESS_EQUIVALENCE = False
-                FINALCOLOR_REFERENCE_JSON = str(first_phase_path) if first_phase_path else ""
-                FINALCOLOR_RUNTIME_OUT = str(phase_paths[phase])
-                DETERMINISTIC_REPLAY_CONTEXT = {
-                    "pairId": pair_id,
-                    "phase": phase,
-                    "configFingerprint": config_fingerprint,
-                    "config": config_payload,
+            if REQUEST_WAVE_AB:
+                # Request-wave A/B uses two fresh scene/graph phases in this
+                # one Mogwai process. Both phases keep the same marked LumenGI
+                # endpoint policy; only the host-read environment flag varies.
+                # Exclude that flag from the base fingerprint so the offline
+                # validator can prove the requested single-variable change.
+                base_config_payload = dict(config_payload)
+                base_config_payload.pop("enableSurfaceCacheRequestWaveAggregation", None)
+                base_config_fingerprint = hashlib.sha256(
+                    json.dumps(base_config_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                wave_phases = (
+                    (("wave-off", False), ("wave-on", True))
+                    if REQUEST_WAVE_AB_ORDER == "off-first"
+                    else (("wave-on", True), ("wave-off", False))
+                )
+                phase_paths = {
+                    phase: pair_root / (phase + ".json")
+                    for phase, _enabled in wave_phases
                 }
-                _capture(label, scene_path, view_name)
-                if first_phase_path is None:
-                    first_phase_path = phase_paths[phase]
-                    if DETERMINISTIC_REPLAY_OUT:
-                        _strict_replay_unload_scene()
+                manifest_schema = "LumenGI.C9.RequestWaveSameProcessManifest.v1"
+            else:
+                on_json = pair_root / "mark-on.json"
+                off_json = pair_root / "mark-off.json"
+                phase_paths = {"mark-on": on_json, "mark-off": off_json}
+                wave_phases = tuple(
+                    (phase, None)
+                    for phase in (
+                        ("mark-on", "mark-off")
+                        if REPLAY_ORDER == "mark-on-first"
+                        else ("mark-off", "mark-on")
+                    )
+                )
+                base_config_fingerprint = config_fingerprint
+                manifest_schema = "LumenGI.C9.DeterministicReplayManifest.v1"
+            first_phase_path = None
+            previous_wave_env = os.environ.get("LUMEN_C9_ENABLE_PROBE_CACHE_REQUEST_WAVE_AGGREGATION")
+            try:
+                for phase, wave_enabled in wave_phases:
+                    if REQUEST_WAVE_AB:
+                        os.environ["LUMEN_C9_ENABLE_PROBE_CACHE_REQUEST_WAVE_AGGREGATION"] = "1" if wave_enabled else "0"
+                        MARK_LUMEN_OUTPUTS = True
+                        phase_config_payload = dict(config_payload)
+                        phase_config_payload["enableSurfaceCacheRequestWaveAggregation"] = bool(wave_enabled)
+                        phase_config_fingerprint = hashlib.sha256(
+                            json.dumps(phase_config_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                        ).hexdigest()
+                    else:
+                        MARK_LUMEN_OUTPUTS = phase == "mark-on"
+                        phase_config_payload = config_payload
+                        phase_config_fingerprint = config_fingerprint
+
+                    SAME_PROCESS_EQUIVALENCE = False
+                    FINALCOLOR_REFERENCE_JSON = str(first_phase_path) if first_phase_path else ""
+                    FINALCOLOR_RUNTIME_OUT = str(phase_paths[phase])
+                    DETERMINISTIC_REPLAY_CONTEXT = {
+                        "pairId": pair_id,
+                        "phase": phase,
+                        "configFingerprint": phase_config_fingerprint,
+                        "baseConfigFingerprint": base_config_fingerprint,
+                        "sameProcess": True,
+                        "graphRecreated": True,
+                        "sceneReloaded": True,
+                        "config": phase_config_payload,
+                    }
+                    _capture(label, scene_path, view_name)
+                    if first_phase_path is None:
+                        first_phase_path = phase_paths[phase]
+                        if DETERMINISTIC_REPLAY_OUT:
+                            _strict_replay_unload_scene()
+            finally:
+                if previous_wave_env is None:
+                    os.environ.pop("LUMEN_C9_ENABLE_PROBE_CACHE_REQUEST_WAVE_AGGREGATION", None)
+                else:
+                    os.environ["LUMEN_C9_ENABLE_PROBE_CACHE_REQUEST_WAVE_AGGREGATION"] = previous_wave_env
             manifest = {
-                "schema": "LumenGI.C9.DeterministicReplayManifest.v1",
+                "schema": manifest_schema,
                 "pairId": pair_id,
                 "processId": os.getpid(),
                 "configFingerprint": config_fingerprint,
-                "replayOrder": REPLAY_ORDER,
-                "markOn": str(on_json),
-                "markOff": str(off_json),
-                "gateCommand": "python -B tests/lumengi/run_c9_export_repro.py --manifest " + str(pair_root / "replay-manifest.json"),
+                "baseConfigFingerprint": base_config_fingerprint,
+                "sameProcess": True,
+                "graphRecreated": True,
+                "sceneReloaded": True,
+                "replayOrder": REQUEST_WAVE_AB_ORDER if REQUEST_WAVE_AB else REPLAY_ORDER,
+                "waveAggregation": REQUEST_WAVE_AB,
+                "phases": {phase: str(path) for phase, path in phase_paths.items()},
             }
+            if not REQUEST_WAVE_AB:
+                manifest.update({
+                    "markOn": str(on_json),
+                    "markOff": str(off_json),
+                    "gateCommand": "python -B tests/lumengi/run_c9_export_repro.py --manifest " + str(pair_root / "replay-manifest.json"),
+                })
             (pair_root / "replay-manifest.json").write_text(
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )

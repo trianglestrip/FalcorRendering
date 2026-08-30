@@ -1062,3 +1062,22 @@ present.
   failing probe comparison (frame 8, meanAbs about `7.68e-4`); this does not
   identify S1 RT as the source and leaves the cache/temporal scheduling
   interaction open.
+
+### 2026-08-30 C9 request-wave same-process replay
+
+- `run_resolved_showcase.py` now has an opt-in
+  `LUMEN_C9_REQUEST_WAVE_AB=1` mode. It runs wave-off and wave-on in one
+  Mogwai process, recreates the scene and RenderGraph between phases, keeps
+  both phases on the same marked LumenGI endpoint policy, fences the unload,
+  and records `pairId`, `baseConfigFingerprint`, process/graph/scene metadata,
+  and the observed host variant flag. The ordinary showcase and strict
+  mark-on/mark-off replay remain unchanged.
+- The first GPU artifact is
+  `artifacts/lumengi/C9/request-wave-same-process-20260830-v1/`. Host telemetry
+  confirms wave-off `0` and wave-on `1`; both phases have process/scene/graph
+  identity, `306` accepted events, and zero dropped events. Request totals are
+  nevertheless different (`surfaceCacheRequestRaw` `988831` vs `988881`; the
+  first request count is `31461` vs `31451`). Both the `--scope request` and
+  `--scope exact` offline validators therefore return `FAIL`. The optional
+  `--require-same-process` validator guard is retained for future runs, but no
+  equivalence or production-performance claim is promoted.

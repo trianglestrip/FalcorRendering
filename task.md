@@ -1158,6 +1158,15 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   while cache-on v8 keeps `diffuseRadianceHitDist` identical and leaves a
   single late probe mismatch; no S1 fix or threshold change is justified.
 
+- C9 request-wave replay now supports an opt-in same-process A/B mode
+  (`LUMEN_C9_REQUEST_WAVE_AB=1`) with fresh scene/graph phases, unload fence,
+  common `baseConfigFingerprint`, process identity, and host-variant telemetry.
+  `artifacts/lumengi/C9/request-wave-same-process-20260830-v1/` confirms
+  wave-off/on `0/1`, `306/306` events, and zero drops, but raw requests differ
+  `988831/988881` (first request `31461/31451`). Both request and exact scopes
+  remain `FAIL`; the optional validator `--require-same-process` is fail-closed
+  and the production aggregation macro stays disabled.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：
