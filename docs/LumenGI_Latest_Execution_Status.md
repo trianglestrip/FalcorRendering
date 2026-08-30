@@ -875,3 +875,10 @@ dynamic soak, and the 2-hour release soak remain open.
   are otherwise identical with distinct identities after scene reload. Strict
   C9 remains `FAIL/OPEN`: mean `2.4343e-5`, p99 `3.6621e-4`, max `2.1065e-3`,
   relative max `2.4668e-5`. Keep this telemetry opt-in and frozen thresholds.
+- The v17 readback/fence extension of the opt-in trace confirms the scheduling
+  asymmetry: mark-on performs four frame-capture readbacks (including
+  `LumenGI.resolvedDiffuseGI`) and mark-off performs three. It records the
+  `CopySource` transition, submit/signal fence, and host wait; subsequent
+  `to_numpy()` reads are no-op barriers. v17 measured mean `4.3308e-5`; the
+  telemetry-off v18 control measured `3.3280e-5`. Keep this as diagnostic
+  evidence only; no production behavior or threshold changed.

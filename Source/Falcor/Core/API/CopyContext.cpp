@@ -41,6 +41,9 @@
 #include "Core/Error.h"
 #include "Utils/Logger.h"
 #include "Utils/Math/Common.h"
+#include <atomic>
+#include <cstdlib>
+#include <cstdint>
 
 #if FALCOR_HAS_CUDA
 #include "Utils/CudaUtils.h"
@@ -48,6 +51,17 @@
 
 namespace Falcor
 {
+namespace
+{
+bool readbackTelemetryEnabled()
+{
+    const char* value = std::getenv("FALCOR_RENDERGRAPH_RESOURCE_TELEMETRY");
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
+std::atomic<uint64_t> gReadbackTelemetrySerial{0};
+} // namespace
+
 CopyContext::CopyContext(Device* pDevice, gfx::ICommandQueue* pQueue) : mpDevice(pDevice)
 {
     FALCOR_ASSERT(mpDevice);
@@ -325,6 +339,8 @@ CopyContext::ReadTextureTask::SharedPtr CopyContext::ReadTextureTask::create(
 {
     SharedPtr pThis = SharedPtr(new ReadTextureTask);
     pThis->mpContext = pCtx;
+    const bool traceReadback = readbackTelemetryEnabled();
+    const uint64_t traceSerial = traceReadback ? ++gReadbackTelemetrySerial : 0;
     // Get footprint
     gfx::ITextureResource* srcTexture = pTexture->getGfxTextureResource();
     gfx::FormatInfo formatInfo;
@@ -343,7 +359,10 @@ CopyContext::ReadTextureTask::SharedPtr CopyContext::ReadTextureTask::create(
     pThis->mpBuffer = pCtx->getDevice()->createBuffer(size, ResourceBindFlags::None, MemoryType::ReadBack, nullptr);
 
     // Copy from texture to buffer
-    pCtx->resourceBarrier(pTexture, Resource::State::CopySource);
+    const auto oldState = pTexture->isStateGlobal()
+        ? pTexture->getGlobalState()
+        : pTexture->getSubresourceState(pTexture->getSubresourceArraySlice(subresourceIndex), mipLevel);
+    const bool barrierRecorded = pCtx->resourceBarrier(pTexture, Resource::State::CopySource);
     auto encoder = pCtx->getLowLevelData()->getResourceCommandEncoder();
     gfx::SubresourceRange srcSubresource = {};
     srcSubresource.baseArrayLayer = pTexture->getSubresourceArraySlice(subresourceIndex);
@@ -370,7 +389,23 @@ CopyContext::ReadTextureTask::SharedPtr CopyContext::ReadTextureTask::create(
     pThis->mpFence = pCtx->getDevice()->createFence();
     pThis->mpFence->breakStrongReferenceToDevice();
     pCtx->submit(false);
-    pCtx->signal(pThis->mpFence.get());
+    const uint64_t fenceValue = pCtx->signal(pThis->mpFence.get());
+    if (traceReadback)
+    {
+        logInfo(
+            "FALCOR_RENDERGRAPH_RESOURCE_TRACE READBACK serial={} resource='{}' size={} oldState='{}' newState='{}' barrierRecorded={} task=0x{:x} texture=0x{:x} gfx=0x{:x} fence={}",
+            traceSerial,
+            pTexture->getName(),
+            size,
+            to_string(oldState),
+            to_string(Resource::State::CopySource),
+            barrierRecorded,
+            reinterpret_cast<uintptr_t>(pThis.get()),
+            reinterpret_cast<uintptr_t>(pTexture),
+            reinterpret_cast<uintptr_t>(pTexture->getGfxResource()),
+            fenceValue
+        );
+    }
     pThis->mRowCount = (uint32_t)rowCount;
     pThis->mDepth = pTexture->getDepth(mipLevel);
     return pThis;
@@ -381,6 +416,15 @@ void CopyContext::ReadTextureTask::getData(void* pData, size_t size) const
     FALCOR_ASSERT(size == size_t(mRowCount) * mActualRowSize * mDepth);
 
     mpFence->wait();
+    if (readbackTelemetryEnabled())
+    {
+        logInfo(
+            "FALCOR_RENDERGRAPH_RESOURCE_TRACE READBACK_WAIT task=0x{:x} bytes={} fence={}",
+            reinterpret_cast<uintptr_t>(this),
+            size,
+            mpFence->getSignaledValue()
+        );
+    }
 
     uint8_t* pDst = reinterpret_cast<uint8_t*>(pData);
     const uint8_t* pSrc = reinterpret_cast<const uint8_t*>(mpBuffer->map());

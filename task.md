@@ -1013,6 +1013,11 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   extended lifetime; bind flags and allocations match, so no physical aliasing
   bug is evidenced. Strict C9 remains `FAIL/OPEN` at mean `2.4343e-5` with the
   frozen thresholds unchanged.
+- v17 readback telemetry confirms mark-on has four frame-capture readbacks
+  versus three for mark-off, including the resolved LumenGI output; every
+  readback logs its barrier and fence. v17 mean was `4.3308e-5` and the
+  telemetry-off v18 control was `3.3280e-5`, so this is evidence only and not a
+  fix. Keep production behavior and C9 thresholds unchanged.
 
 ## 21. 最终完成条件
 

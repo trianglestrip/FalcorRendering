@@ -1519,3 +1519,12 @@ strict `FAIL/OPEN` at mean `2.4343e-5` (p99 `3.6621e-4`, max `2.1065e-3`,
 relative max `2.4668e-5`). Keep the telemetry opt-in and investigate queue/barrier
 ordering only if a future trace shows a real hazard; do not infer physical aliasing
 from the lifetime metadata or relax the frozen C9 thresholds.
+
+The v17 readback extension of the same opt-in trace confirms the scheduling
+asymmetry directly: mark-on performs four frame-capture readbacks (including
+`LumenGI.resolvedDiffuseGI`), while mark-off performs three. Each readback logs
+its `CopySource` transition, submit/signal fence, and host wait; the later
+`to_numpy()` reads are no-op barriers because the resource is already in
+`CopySource`. The run measured mean `4.3308e-5` and therefore did not improve
+C9. A telemetry-off v18 control measured `3.3280e-5`, so the trace is retained
+as diagnostic evidence only and no behavior or threshold change is justified.
