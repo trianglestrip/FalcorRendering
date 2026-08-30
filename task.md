@@ -1136,6 +1136,12 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   (mean deltas `1.7956e-2` to `3.3605e-3`). Keep C5 quality/equivalence
   `FAIL/OPEN`; the new guard is working.
 
+- Cache-Lighting-off control v3 at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v3-cachelighting-off/`
+  is byte-equal but has zero `cacheLookupAttempts`, so the activity guard
+  correctly returns `BLOCKED`. Treat this only as localization evidence for
+  the Cache Lighting/Surface Cache interaction.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：

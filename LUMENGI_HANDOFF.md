@@ -1665,3 +1665,9 @@ probe activity (`probeCount` max `920`, `directionsPerProbe=16`, lookup
 attempts `4715`) but still failed `probeInterpolated` on frames 2-8 (mean
 deltas `1.7956e-2` to `3.3605e-3`). This keeps C5 quality/equivalence
 `FAIL/OPEN` while confirming the path is not an empty no-op.
+
+A Cache-Lighting-off control at
+`artifacts/lumengi/C5/paired-equivalence-current-20260830-v3-cachelighting-off/`
+is byte-equal across the two passes, but has zero cache lookup attempts and is
+therefore correctly `BLOCKED` by the activity guard. It is useful localization
+evidence for the Cache Lighting/Surface Cache interaction only, not a C5 pass.

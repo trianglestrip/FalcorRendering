@@ -1025,3 +1025,9 @@ present.
   `4715`), but `probeInterpolated` remained out of tolerance on frames 2-8
   (mean deltas `1.7956e-2` down to `3.3605e-3`). This confirms the guard is
   exercising the intended path while C5 quality/equivalence stays `FAIL/OPEN`.
+- A Cache-Lighting-off control at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v3-cachelighting-off/`
+  produced byte-equal paired outputs, but all `cacheLookupAttempts` were zero;
+  the activity guard correctly reports `BLOCKED`. This is a control that
+  localizes the observed probe divergence to the Cache Lighting/Surface Cache
+  interaction, not a valid C5 equivalence pass.
