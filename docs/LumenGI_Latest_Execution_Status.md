@@ -845,3 +845,8 @@ dynamic soak, and the 2-hour release soak remain open.
 - The next launcher run uses phase-specific defaults (dynamic 30 min, soak 60
   min reload/resize cadence) while retaining positive mutation counts and all
   duration/VRAM/memory thresholds.
+- S2 v14 closed the long-run gate: dynamic 1800 s/108000 frames and soak
+  7200 s/432000 frames both PASS with authoritative RTX 2060 SUPER/D3D12
+  provenance, 361/1441 VRAM samples, stable Surface Cache residency, and
+  complete reload/resize `resource_sync`. Evidence:
+  `artifacts/lumengi/release/soak-launch-20260830-postfix-v14/release-soak-gate.json`.

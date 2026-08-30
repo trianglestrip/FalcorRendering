@@ -421,3 +421,6 @@ tools\.packman\cmake\bin\cmake.exe --build build\windows-vs2022 `
   `resource_sync` 4/4 PASS; soak safely stopped at 0.473 GiB after four
   reloads (`BLOCKED`). Re-run with phase-specific 30-minute dynamic/60-minute
   soak cadence and preserve the 0.5 GiB guard.
+- [x] S2 v14 dynamic + two-hour soak PASS with stable VRAM/cache residency and
+  complete resource-sync evidence:
+  `artifacts/lumengi/release/soak-launch-20260830-postfix-v14/release-soak-gate.json`.

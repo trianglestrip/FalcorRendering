@@ -990,6 +990,9 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   `resource_sync` 4/4 PASS; its soak stopped at 0.473 GiB after four reloads,
   so S2 remains BLOCKED. The launcher now selects 30-minute dynamic and
   60-minute soak reload/resize defaults, with explicit overrides preserved.
+- S2 v14 is now PASS: dynamic 1800 s/108000 frames plus soak 7200 s/432000
+  frames, stable VRAM/cache residency, and complete resource-sync telemetry.
+  Evidence: `artifacts/lumengi/release/soak-launch-20260830-postfix-v14/release-soak-gate.json`.
 
 ## 21. 最终完成条件
 

@@ -1483,3 +1483,9 @@ remaining `BLOCKED`. The launcher now defaults to phase-specific 30-minute
 dynamic and 60-minute soak reload/resize cadences (explicit environment values
 still override these for bounded diagnostics); no duration, VRAM, or memory
 threshold was relaxed.
+
+The v14 rerun closed S2: dynamic 1800 s/108000 frames and soak 7200 s/432000
+frames both passed the offline gate with 361/1441 authoritative VRAM samples,
+stable `residentBytes`/`allocatedPages`, and complete reload/resize resource
+sync. Canonical evidence is
+`artifacts/lumengi/release/soak-launch-20260830-postfix-v14/release-soak-gate.json`.
