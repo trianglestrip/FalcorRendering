@@ -145,6 +145,33 @@ STAT_ALIASES = {
     "cardGridIndexedCards": ("cardGridIndexedCards", "cardGridCardsIndexed", "indexedCards"),
     "cardGridMissingCards": ("cardGridMissingCards", "missingCards"),
 }
+# Diagnostic-only per-frame fields. They are reported in the paired artifact
+# but deliberately do not participate in the strict output/stat gate below.
+SCREEN_PROBE_DIAGNOSTIC_FIELDS = (
+    "historyAccepted",
+    "historyRejectCurrentInvalid",
+    "historyRejectDepth",
+    "historyRejectGuide",
+    "historyRejectLighting",
+    "historyRejectMotion",
+    "historyRejectPreviousInvalid",
+    "historyReset",
+    "historyResetCount",
+    "historyResetThisFrame",
+    "historyGeneration",
+    "lightingGeneration",
+    "historyReadIndex",
+    "historyWriteIndex",
+)
+SURFACE_CACHE_DIAGNOSTIC_FIELDS = (
+    "cacheLookupAttempts",
+    "cacheLookupHits",
+    "surfaceCacheRequestRaw",
+    "surfaceCacheRequestCards",
+    "surfaceCacheRequestDedup",
+    "surfaceCacheEventCount",
+    "surfaceCacheEventDropped",
+)
 
 
 def _safe(value: Any) -> Any:
@@ -244,6 +271,19 @@ def _stat_value(stats: Mapping[str, Any], field: str) -> Any:
         if alias in stats:
             return stats[alias]
     return None
+
+
+def _stat_differences(
+    left: Mapping[str, Any], right: Mapping[str, Any], fields: Sequence[str]
+) -> Dict[str, Dict[str, Any]]:
+    """Return non-equal numeric/stat values for diagnostic attribution only."""
+    differences: Dict[str, Dict[str, Any]] = {}
+    for field in fields:
+        left_value = _stat_value(left, field)
+        right_value = _stat_value(right, field)
+        if left_value != right_value:
+            differences[field] = {"fullscan": left_value, "grid": right_value}
+    return differences
 
 
 def _pass_properties(use_grid: bool) -> Dict[str, Any]:
@@ -392,7 +432,23 @@ def _frame_pair(graph: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 "changedNonzeroFraction": None,
             }
     return (
-        {"fullscan": full, "grid": grid, "differences": differences},
+        {
+            "fullscan": full,
+            "grid": grid,
+            "differences": differences,
+            "diagnostics": {
+                "screenProbeStatDifferences": _stat_differences(
+                    full.get("screenProbeStats", {}),
+                    grid.get("screenProbeStats", {}),
+                    SCREEN_PROBE_DIAGNOSTIC_FIELDS,
+                ),
+                "surfaceCacheStatDifferences": _stat_differences(
+                    full.get("surfaceCacheStats", {}),
+                    grid.get("surfaceCacheStats", {}),
+                    SURFACE_CACHE_DIAGNOSTIC_FIELDS,
+                ),
+            },
+        },
         {"fullscan": full_arrays, "grid": grid_arrays},
     )
 
@@ -520,6 +576,9 @@ def _self_test() -> int:
     assert not over_diff["withinTolerance"]
     assert close_diff["p95Abs"] <= OUTPUT_TOLERANCE
     assert over_diff["changedNonzeroFraction"] == 1.0
+    stat_diffs = _stat_differences({"historyAccepted": 1, "historyReset": 2}, {"historyAccepted": 3, "historyReset": 2}, SCREEN_PROBE_DIAGNOSTIC_FIELDS)
+    assert stat_diffs["historyAccepted"] == {"fullscan": 1, "grid": 3}
+    assert "historyReset" not in stat_diffs
     assert _health(equal)["finite"]
     empty_gate = _evaluate([], None)
     assert empty_gate["status"] == "BLOCKED"
@@ -598,6 +657,8 @@ def _run() -> int:
             "strictOutputTolerance": OUTPUT_TOLERANCE,
             "comparedChannels": list(COMPARE_CHANNELS),
             "candidateStatFields": list(STATS_FIELDS),
+            "diagnosticScreenProbeStatFields": list(SCREEN_PROBE_DIAGNOSTIC_FIELDS),
+            "diagnosticSurfaceCacheStatFields": list(SURFACE_CACHE_DIAGNOSTIC_FIELDS),
             "wallClockTimeoutSeconds": PAIR_TIMEOUT_SECONDS,
         },
         "status": "BLOCKED",

@@ -1158,6 +1158,14 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   while cache-on v8 keeps `diffuseRadianceHitDist` identical and leaves a
   single late probe mismatch; no S1 fix or threshold change is justified.
 
+- C5 v9 adds diagnostic-only per-frame history/cache stat deltas. The Release
+  artifact `artifacts/lumengi/C5/paired-equivalence-current-20260830-v9-history-stat-telemetry/`
+  remains `FAIL` (15 output checks): history accept/reject/reset fields match,
+  while cache request raw counts diverge late (`10352/10302` at frame 5 and
+  `18379/18153` at frame 8, plus lookup-hit differences). This reinforces the
+  cache/request scheduler boundary as the remaining investigation target; no
+  production threshold or default changed.
+
 - C9 request-wave replay now supports an opt-in same-process A/B mode
   (`LUMEN_C9_REQUEST_WAVE_AB=1`) with fresh scene/graph phases, unload fence,
   common `baseConfigFingerprint`, process identity, and host-variant telemetry.

@@ -1697,6 +1697,16 @@ test-only and default-off. The S1 cache-off control v7 is correctly BLOCKED
 so it does not implicate S1 RT and the cache/temporal scheduler interaction
 remains OPEN.
 
+The C5 paired runner now records non-gating per-frame deltas for history
+accept/reject/reset fields and cache request counters. The Release artifact
+`artifacts/lumengi/C5/paired-equivalence-current-20260830-v9-history-stat-telemetry/`
+is still `FAIL` (15 output checks), while temporal history fields remain equal
+across passes. Cache request activity diverges late (raw `10352/10302` at frame
+5 and `18379/18153` at frame 8, with lookup-hit differences), so the evidence
+continues to point at cache/request scheduling rather than temporal history
+acceptance. The extra summaries are diagnostic only; thresholds/defaults are
+unchanged.
+
 The request-wave follow-up is now a real same-process diagnostic rather than
 two independent invocations. With `LUMEN_C9_REQUEST_WAVE_AB=1`, the runner
 creates fresh scene/graph phases in one Mogwai process, unloads and fences the

@@ -1063,6 +1063,17 @@ present.
   identify S1 RT as the source and leaves the cache/temporal scheduling
   interaction open.
 
+- The paired runner now emits diagnostic-only per-frame stat deltas for
+  temporal history and cache request counters. The Release run at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v9-history-stat-telemetry/`
+  remains `FAIL` (`15` output checks), but history accept/reject/reset fields
+  are equal between the two passes. Cache request activity diverges late in
+  the capture (for example frame 5 raw `10352` vs `10302`, frame 8 raw
+  `18379` vs `18153`, with lookup-hit differences), reinforcing that the
+  remaining mismatch is in cache/request scheduling rather than a temporal
+  history decision. These summaries are diagnostic and do not affect the
+  frozen gate.
+
 ### 2026-08-30 C9 request-wave same-process replay
 
 - `run_resolved_showcase.py` now has an opt-in
