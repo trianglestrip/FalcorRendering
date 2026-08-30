@@ -1434,3 +1434,13 @@ first post-fix S2 launcher attempt was interrupted during renderer startup and
 left only compile logs under
 `artifacts/lumengi/release/soak-launch-20260830-postfix-v5/`; it is not a gate
 result. Future runs should use the launcher's new phase checkpoints.
+
+The checkpointed post-fix retry at
+`artifacts/lumengi/release/soak-launch-20260830-postfix-v8/` completed the
+30-minute dynamic phase (`dynamic=PASS`) and began the required soak. After
+about four minutes, system free memory fell below 0.5 GB while the cold soak
+Mogwai process approached 8 GB working set, so only that exact child PID was
+stopped for host safety. The launcher finalized with `dynamic=PASS`,
+`soak=BLOCKED` and no soak child artifact; the offline report is
+`.../release-soak-gate.json`. Preserve this as a safety stop, not a soak
+verdict, and rerun with sufficient host memory before considering S2 closure.

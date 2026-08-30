@@ -945,6 +945,16 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   post-fix S2 launch was interrupted during renderer startup before a manifest
   was written, so it supplies no soak verdict.
 
+### Checkpointed S2 retry (2026-08-30)
+
+- `artifacts/lumengi/release/soak-launch-20260830-postfix-v8/` preserved a
+  complete dynamic `PASS` artifact and authoritative GPU provenance.
+- The soak child was stopped after roughly four minutes when free system RAM
+  fell below 0.5 GB (cold Mogwai working set near 8 GB). The launcher wrote
+  `release-soak-gate.json` with `dynamic=PASS`, `soak=BLOCKED` because no soak
+  `churn.json` exists. This is a host-safety stop; do not reinterpret it as a
+  2-hour result or reduce the duration/cadence gates.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：

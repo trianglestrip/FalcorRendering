@@ -388,3 +388,11 @@ tools\.packman\cmake\bin\cmake.exe --build build\windows-vs2022 `
   complete post-fix child artifact before changing the gate.
 - [ ] C9 strict export equivalence remains OPEN/FAIL at the frozen mean/max
   bounds; `PASS_BOUNDED` same-frame retention is not a substitute.
+
+### Runtime evidence delta (2026-08-30, checkpointed retry)
+
+- [ ] S2 v8 dynamic phase passed, but the soak phase was safely stopped after
+  approximately four minutes at <0.5 GB free system RAM; launcher artifact
+  `artifacts/lumengi/release/soak-launch-20260830-postfix-v8/release-soak-gate.json`
+  is `BLOCKED` with no soak child JSON. Rerun on a host with adequate memory;
+  do not lower cadence or duration.

@@ -771,3 +771,22 @@ dynamic soak, and the 2-hour release soak remain open.
   not claim C9 numerical equivalence.
 - The first post-fix S2 launcher attempt was interrupted during renderer startup
   before it could checkpoint a manifest (`artifacts/lumengi/release/soak-launch-20260830-postfix-v5/` contains only compile logs). It is not a gate result; rerun with the checkpointing launcher when the GPU window is available.
+
+### 2026-08-30 S2 checkpointed post-fix retry
+
+- The checkpointing launcher completed the 30-minute dynamic phase as `PASS`
+  with authoritative RTX 2060 SUPER / D3D12 provenance and wrote
+  `artifacts/lumengi/release/soak-launch-20260830-postfix-v8/dynamic/churn.json`.
+- The required soak phase started but was stopped after approximately four
+  minutes when system free physical memory fell below 0.5 GB while the cold
+  Mogwai process approached 8 GB working set. Only the exact soak child PID
+  was terminated; launcher logs and manifest were preserved. No `churn.json`
+  was emitted for soak, so the offline result at
+  `artifacts/lumengi/release/soak-launch-20260830-postfix-v8/release-soak-gate.json`
+  is correctly `BLOCKED` (`dynamic=PASS`, `soak=BLOCKED`). This is a safety
+  stop and not a duration or resource-lifetime PASS.
+- C9 strict replay remains `FAIL` at
+  `artifacts/lumengi/C9/deterministic-replay-20260830-v2/c9-export-repro.json`
+  (mean `5.0122e-5`, p99 `6.1035e-4`, max `2.5635e-3`); thresholds remain
+  unchanged. Shutdown remains unauthorized while C9 equivalence and the
+  complete 2-hour soak are open/blocked.
