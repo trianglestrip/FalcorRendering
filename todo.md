@@ -424,3 +424,6 @@ tools\.packman\cmake\bin\cmake.exe --build build\windows-vs2022 `
 - [x] S2 v14 dynamic + two-hour soak PASS with stable VRAM/cache residency and
   complete resource-sync evidence:
   `artifacts/lumengi/release/soak-launch-20260830-postfix-v14/release-soak-gate.json`.
+- [ ] C9 strict equivalence remains OPEN/FAIL after NRD-off and settle-192 A/Bs
+  (means `4.0274e-5`, `7.5287e-5`, `3.3476e-5`). Add lifetime/aliasing/barrier
+  telemetry before any further implementation change; retain frozen thresholds.

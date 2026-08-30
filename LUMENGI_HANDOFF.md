@@ -1489,3 +1489,9 @@ frames both passed the offline gate with 361/1441 authoritative VRAM samples,
 stable `residentBytes`/`allocatedPages`, and complete reload/resize resource
 sync. Canonical evidence is
 `artifacts/lumengi/release/soak-launch-20260830-postfix-v14/release-soak-gate.json`.
+
+C9 follow-up A/Bs remain diagnostic only: direct-NRD-off mean `4.0274e-5`,
+indirect-NRD-off `7.5287e-5`, and default settle-192 `3.3476e-5`; all strict
+replays fail the unchanged `2e-5` mean bound while p99/max/relative-max remain
+within bounds. The evidence points away from NRD or settle length and toward
+mark-output resource lifetime/aliasing/barrier behavior; do not relax the gate.

@@ -993,6 +993,9 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
 - S2 v14 is now PASS: dynamic 1800 s/108000 frames plus soak 7200 s/432000
   frames, stable VRAM/cache residency, and complete resource-sync telemetry.
   Evidence: `artifacts/lumengi/release/soak-launch-20260830-postfix-v14/release-soak-gate.json`.
+- C9 A/B follow-up: direct-NRD-off (`4.0274e-5`), indirect-NRD-off
+  (`7.5287e-5`), and settle-192 (`3.3476e-5`) all remain strict FAIL. Keep
+  thresholds frozen; next work is resource lifetime/aliasing/barrier telemetry.
 
 ## 21. 最终完成条件
 

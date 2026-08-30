@@ -850,3 +850,8 @@ dynamic soak, and the 2-hour release soak remain open.
   provenance, 361/1441 VRAM samples, stable Surface Cache residency, and
   complete reload/resize `resource_sync`. Evidence:
   `artifacts/lumengi/release/soak-launch-20260830-postfix-v14/release-soak-gate.json`.
+- C9 NRD isolation did not close strict equivalence: direct-NRD-off measured
+  mean `4.0274e-5`, indirect-NRD-off `7.5287e-5`; both are worse than default.
+  A default-config settle-192 replay remained `3.3476e-5`, so convergence is
+  not the cause. Keep the frozen C9 thresholds and target resource lifetime,
+  aliasing, and barrier telemetry next.
