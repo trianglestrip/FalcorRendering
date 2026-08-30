@@ -37,3 +37,5 @@ artifacts/
 .codegraph/
 tests/temp/
 .playwright-mcp/
+/LumenGI/MSDFCache/
+/vc140.pdb
