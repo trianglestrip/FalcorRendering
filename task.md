@@ -996,6 +996,12 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
 - C9 A/B follow-up: direct-NRD-off (`4.0274e-5`), indirect-NRD-off
   (`7.5287e-5`), and settle-192 (`3.3476e-5`) all remain strict FAIL. Keep
   thresholds frozen; next work is resource lifetime/aliasing/barrier telemetry.
+- C9 v11 inserted a strict-replay-only `unloadScene()` boundary between
+  mark-on/mark-off phases. This reduced mean error to `2.4324e-5` while p99,
+  max, and relative-max stayed within bounds, but mean remains above the
+  frozen `2e-5` limit. The unload+settle-192 v12 combination regressed to
+  `2.6635e-5`; retain the lifecycle boundary, reject settle inflation, and
+  keep strict equivalence `OPEN/FAIL` pending resource alias/barrier telemetry.
 
 ## 21. 最终完成条件
 

@@ -491,6 +491,21 @@ def _strict_replay_teardown_fence(scope="strict replay capture before graph tear
         }
 
 
+def _strict_replay_unload_scene():
+    """Release the prior Scene before SceneBuilder constructs the next phase.
+
+    Renderer.loadScene() builds the replacement Scene before setScene() can
+    release the current one.  Strict replay uses an explicit unload boundary
+    between phases so the two Scene GPU allocations cannot overlap.  This is
+    intentionally scoped to the diagnostic replay path.
+    """
+    unload = getattr(m, "unloadScene", None)
+    if not callable(unload):
+        raise RuntimeError("live m.unloadScene binding is unavailable")
+    unload()
+    _strict_replay_teardown_fence("strict replay after scene unload")
+
+
 def _capture(label, scene_path, view_name):
     m.loadScene(scene_path)
     _apply_scene_overrides()
@@ -881,6 +896,8 @@ for label, scene_path in _scenes():
                 _capture(label, scene_path, view_name)
                 if first_phase_path is None:
                     first_phase_path = phase_paths[phase]
+                    if DETERMINISTIC_REPLAY_OUT:
+                        _strict_replay_unload_scene()
             manifest = {
                 "schema": "LumenGI.C9.DeterministicReplayManifest.v1",
                 "pairId": pair_id,

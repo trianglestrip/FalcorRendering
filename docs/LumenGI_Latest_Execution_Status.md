@@ -855,3 +855,9 @@ dynamic soak, and the 2-hour release soak remain open.
   A default-config settle-192 replay remained `3.3476e-5`, so convergence is
   not the cause. Keep the frozen C9 thresholds and target resource lifetime,
   aliasing, and barrier telemetry next.
+- C9 v11 added a strict-replay-only `unloadScene()` boundary between the two
+  phases, preventing `SceneBuilder` allocations from overlapping the prior
+  scene. Mean error improved to `2.4324e-5` (p99 `3.6621e-4`, max
+  `2.1065e-3`), but the frozen `2e-5` mean gate still fails. Combining the
+  boundary with settle-192 regressed to `2.6635e-5`; retain the unload boundary
+  and do not increase settle frames as a threshold workaround.
