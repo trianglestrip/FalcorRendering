@@ -1002,6 +1002,17 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   frozen `2e-5` limit. The unload+settle-192 v12 combination regressed to
   `2.6635e-5`; retain the lifecycle boundary, reject settle inflation, and
   keep strict equivalence `OPEN/FAIL` pending resource alias/barrier telemetry.
+- A v13 symmetric-readback experiment regressed to `3.1941e-5` and was
+  discarded; v11 remains the reproducibility baseline.
+- A v14 experiment that skipped FrameCapture during strict replay regressed to
+  `5.3091e-5` and was discarded; retain the existing capture/readback schedule
+  pending compiler/barrier telemetry.
+- v16 resource telemetry (opt-in `FALCOR_RENDERGRAPH_RESOURCE_TELEMETRY=1`)
+  records actual texture sizes and native identities. The only stable topology
+  difference is mark-on's extra `LumenGI.resolvedDiffuseGI` graph output and
+  extended lifetime; bind flags and allocations match, so no physical aliasing
+  bug is evidenced. Strict C9 remains `FAIL/OPEN` at mean `2.4343e-5` with the
+  frozen thresholds unchanged.
 
 ## 21. 最终完成条件
 

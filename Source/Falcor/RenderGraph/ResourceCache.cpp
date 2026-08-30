@@ -30,9 +30,20 @@
 #include "Core/API/Texture.h"
 #include "Core/API/Buffer.h"
 #include "Utils/Logger.h"
+#include <cstdlib>
+#include <cstdint>
 
 namespace Falcor
 {
+namespace
+{
+bool resourceTelemetryEnabled()
+{
+    const char* value = std::getenv("FALCOR_RENDERGRAPH_RESOURCE_TELEMETRY");
+    return value && value[0] == '1' && value[1] == '\0';
+}
+} // namespace
+
 void ResourceCache::reset()
 {
     mNameToIndex.clear();
@@ -193,11 +204,38 @@ inline ref<Resource> createResourceForPass(
 
 void ResourceCache::allocateResources(ref<Device> pDevice, const DefaultProperties& params)
 {
+    const bool traceResources = resourceTelemetryEnabled();
     for (auto& data : mResourceData)
     {
         if ((data.pResource == nullptr) && (data.field.isValid()))
         {
             data.pResource = createResourceForPass(pDevice, params, data.field, data.resolveBindFlags, data.name);
+            if (traceResources)
+            {
+                const auto objectIdentity = reinterpret_cast<uintptr_t>(data.pResource.get());
+                const auto gfxIdentity = reinterpret_cast<uintptr_t>(data.pResource->getGfxResource());
+                uint64_t resourceSize = data.pResource->getSize();
+                if (auto pTexture = data.pResource->asTexture())
+                    resourceSize = pTexture->getTextureSizeInBytes();
+                logInfo(
+                    "FALCOR_RENDERGRAPH_RESOURCE_TRACE RESOURCE name='{}' lifetime=[{},{}] type={} dims={}x{}x{} mips={} array={} format='{}' fieldBindFlags=0x{:x} actualBindFlags=0x{:x} size={} object=0x{:x} gfx=0x{:x}",
+                    data.name,
+                    data.lifetime.first,
+                    data.lifetime.second,
+                    static_cast<uint32_t>(data.field.getType()),
+                    data.field.getWidth() ? data.field.getWidth() : params.dims.x,
+                    data.field.getHeight() ? data.field.getHeight() : params.dims.y,
+                    data.field.getDepth() ? data.field.getDepth() : 1,
+                    data.field.getMipCount(),
+                    data.field.getArraySize(),
+                    to_string(data.field.getFormat()),
+                    static_cast<uint32_t>(data.field.getBindFlags()),
+                    static_cast<uint32_t>(data.pResource->getBindFlags()),
+                    resourceSize,
+                    objectIdentity,
+                    gfxIdentity
+                );
+            }
         }
     }
 }

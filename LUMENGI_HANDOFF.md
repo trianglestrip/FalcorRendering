@@ -1495,3 +1495,27 @@ indirect-NRD-off `7.5287e-5`, and default settle-192 `3.3476e-5`; all strict
 replays fail the unchanged `2e-5` mean bound while p99/max/relative-max remain
 within bounds. The evidence points away from NRD or settle length and toward
 mark-output resource lifetime/aliasing/barrier behavior; do not relax the gate.
+
+The next strict replay adds an explicit `unloadScene()` boundary after the
+first phase, before `SceneBuilder` constructs the second Scene, and fails closed
+if its device fence is unavailable. This lowered the fresh v11 mean error to
+`2.4324e-5` (p99 `3.6621e-4`, max `2.1065e-3`), but it is still strict
+`FAIL/OPEN`; combining the boundary with settle-192 regressed to `2.6635e-5`.
+Keep the lifecycle boundary and frozen thresholds, and use the v11/v12 artifacts
+as the baseline for the next resource-lifetime/barrier telemetry pass.
+A v13 symmetric-readback experiment was also rejected after regressing to mean
+`3.1941e-5`; the strict replay keeps its original intermediate readback behavior.
+A v14 FrameCapture-parity experiment was rejected after regressing to mean
+`5.3091e-5`; keep the established capture/readback schedule until the compiler
+and barrier trace explains its stabilizing effect.
+
+The v16 opt-in RenderGraph resource trace records real texture byte sizes,
+object/GFX identities, bind flags, lifetimes, and graph outputs for both fresh
+replays. It confirms that mark-on adds only `LumenGI.resolvedDiffuseGI` to the
+graph output set (`outputs=4` versus `3`) and extends that resource lifetime to
+the external output fence; bind flags and allocation sizes remain identical,
+and all native identities are distinct after scene reload. The replay remains
+strict `FAIL/OPEN` at mean `2.4343e-5` (p99 `3.6621e-4`, max `2.1065e-3`,
+relative max `2.4668e-5`). Keep the telemetry opt-in and investigate queue/barrier
+ordering only if a future trace shows a real hazard; do not infer physical aliasing
+from the lifetime metadata or relax the frozen C9 thresholds.

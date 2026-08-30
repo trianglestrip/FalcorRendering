@@ -861,3 +861,17 @@ dynamic soak, and the 2-hour release soak remain open.
   `2.1065e-3`), but the frozen `2e-5` mean gate still fails. Combining the
   boundary with settle-192 regressed to `2.6635e-5`; retain the unload boundary
   and do not increase settle frames as a threshold workaround.
+- A v13 symmetric-readback experiment (skipping the intermediate LumenGI
+  readback during strict replay) regressed to mean `3.1941e-5`; that change was
+  discarded. The v11 unload boundary remains the current C9 baseline.
+- A v14 FrameCapture-parity experiment (skipping `m.frameCapture.capture()` in
+  strict replay) regressed further to mean `5.3091e-5`; it was discarded. Keep
+  the existing capture/readback schedule until compiler/barrier telemetry
+  identifies why it affects the result.
+- The v16 opt-in RenderGraph resource trace reports actual texture sizes,
+  native object/GFX identities, bind flags, lifetimes, and graph outputs for
+  both fresh executions. Mark-on adds only `LumenGI.resolvedDiffuseGI` to the
+  output set (`4` vs `3`) and extends its lifetime; allocations and bind flags
+  are otherwise identical with distinct identities after scene reload. Strict
+  C9 remains `FAIL/OPEN`: mean `2.4343e-5`, p99 `3.6621e-4`, max `2.1065e-3`,
+  relative max `2.4668e-5`. Keep this telemetry opt-in and frozen thresholds.

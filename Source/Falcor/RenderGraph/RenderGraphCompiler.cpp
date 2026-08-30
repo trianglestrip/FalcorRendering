@@ -30,12 +30,23 @@
 #include "RenderPasses/ResolvePass.h"
 #include "Core/Error.h"
 #include "Utils/Algorithm/DirectedGraphTraversal.h"
+#include "Utils/Logger.h"
 #include "Utils/StringUtils.h"
+#include <cstdlib>
+#include <cstdint>
 
 namespace Falcor
 {
 namespace
 {
+bool resourceTelemetryEnabled()
+{
+    const char* value = std::getenv("FALCOR_RENDERGRAPH_RESOURCE_TELEMETRY");
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
+uint64_t gResourceTelemetryCompileSerial = 0;
+
 bool canAutoResolve(const RenderPassReflection::Field& src, const RenderPassReflection::Field& dst)
 {
     return src.getSampleCount() > 1 && dst.getSampleCount() == 1;
@@ -53,6 +64,21 @@ std::unique_ptr<RenderGraphExe> RenderGraphCompiler::compile(
 )
 {
     RenderGraphCompiler c = RenderGraphCompiler(graph, dependencies);
+    const bool traceResources = resourceTelemetryEnabled();
+    const uint64_t traceSerial = traceResources ? ++gResourceTelemetryCompileSerial : 0;
+    if (traceResources)
+    {
+        logInfo(
+            "FALCOR_RENDERGRAPH_RESOURCE_TRACE BEGIN serial={} graph='{}' outputs={}",
+            traceSerial,
+            graph.getName(),
+            graph.getOutputCount()
+        );
+        for (size_t i = 0; i < graph.getOutputCount(); ++i)
+        {
+            logInfo("FALCOR_RENDERGRAPH_RESOURCE_TRACE OUTPUT serial={} index={} name='{}'", traceSerial, i, graph.getOutputName(i));
+        }
+    }
 
     // Register the external resources
     auto pResourcesCache = std::make_unique<ResourceCache>();
@@ -75,6 +101,10 @@ std::unique_ptr<RenderGraphExe> RenderGraphCompiler::compile(
     }
     c.restoreCompilationChanges();
     pExe->mpResourceCache = std::move(pResourcesCache);
+    if (traceResources)
+    {
+        logInfo("FALCOR_RENDERGRAPH_RESOURCE_TRACE END serial={} graph='{}'", traceSerial, graph.getName());
+    }
     return pExe;
 }
 
