@@ -1031,3 +1031,7 @@ present.
   the activity guard correctly reports `BLOCKED`. This is a control that
   localizes the observed probe divergence to the Cache Lighting/Surface Cache
   interaction, not a valid C5 equivalence pass.
+- The paired runner now records `processId`, total capture time, and per-frame
+  render seconds. An opt-in `LUMEN_C5_PAIRED_EQ_TIMEOUT_SECONDS` watchdog
+  remains disabled by default and only stops between frames; a timeout is
+  reported as `BLOCKED`/`renderError` and never changes the quality threshold.

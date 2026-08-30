@@ -1671,3 +1671,8 @@ A Cache-Lighting-off control at
 is byte-equal across the two passes, but has zero cache lookup attempts and is
 therefore correctly `BLOCKED` by the activity guard. It is useful localization
 evidence for the Cache Lighting/Surface Cache interaction only, not a C5 pass.
+
+The paired runner also records process/capture timing and supports an opt-in
+`LUMEN_C5_PAIRED_EQ_TIMEOUT_SECONDS` watchdog (default `0`, disabled). It
+checks only between frames and reports a timeout as blocked evidence, leaving
+all quality thresholds and production behavior unchanged.

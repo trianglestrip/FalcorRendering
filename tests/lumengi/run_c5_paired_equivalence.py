@@ -29,6 +29,7 @@ import json
 import math
 import os
 import sys
+import time
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -61,6 +62,21 @@ USE_TEMPORAL = os.environ.get("LUMEN_C5_PAIRED_EQ_TEMPORAL", "1") not in ("0", "
 USE_SPATIAL = os.environ.get("LUMEN_C5_PAIRED_EQ_SPATIAL", "1") not in ("0", "false", "off")
 SAVE_ARRAYS = os.environ.get("LUMEN_C5_PAIRED_EQ_SAVE_ARRAYS", "0") not in ("0", "false", "off")
 SAVE_ARRAYS_MAX_FRAMES = max(1, int(os.environ.get("LUMEN_C5_PAIRED_EQ_SAVE_ARRAYS_MAX_FRAMES", "8")))
+
+
+def _timeout_seconds() -> float:
+    raw = os.environ.get("LUMEN_C5_PAIRED_EQ_TIMEOUT_SECONDS", "0").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) and value > 0.0 else 0.0
+
+
+# Opt-in watchdog: zero keeps the historical unlimited run. The watchdog is
+# checked between frames so a slow shader compile/render remains observable in
+# the report instead of being mistaken for a Python-side hang.
+PAIR_TIMEOUT_SECONDS = _timeout_seconds()
 # Frozen by the paired-equivalence contract.  There is intentionally no
 # environment override: a runtime invocation must not be made to pass by
 # widening the threshold.
@@ -537,15 +553,25 @@ def _run() -> int:
     m.addGraph(graph)
     frames = []
     render_error = None
+    capture_start = time.monotonic()
     try:
         for frame_id in range(1, WARMUP + 1):
+            if PAIR_TIMEOUT_SECONDS and time.monotonic() - capture_start >= PAIR_TIMEOUT_SECONDS:
+                render_error = (
+                    "paired capture wall-clock timeout after %.3fs (completed %d/%d frames)"
+                    % (PAIR_TIMEOUT_SECONDS, len(frames), WARMUP)
+                )
+                break
             m.clock.frame = frame_id
+            frame_start = time.monotonic()
             m.renderFrame()
+            render_seconds = time.monotonic() - frame_start
             pair, arrays = _frame_pair(graph)
             _save_frame_arrays(frame_id, arrays)
-            frames.append({"frame": frame_id, "pair": pair})
+            frames.append({"frame": frame_id, "renderSeconds": render_seconds, "pair": pair})
     except Exception as error:
         render_error = str(error)
+    capture_elapsed = time.monotonic() - capture_start
     report = {
         "schema": "LumenGI.C5PairedEquivalence.v1",
         "scene": SCENE,
@@ -568,9 +594,12 @@ def _run() -> int:
             "strictOutputTolerance": OUTPUT_TOLERANCE,
             "comparedChannels": list(COMPARE_CHANNELS),
             "candidateStatFields": list(STATS_FIELDS),
+            "wallClockTimeoutSeconds": PAIR_TIMEOUT_SECONDS,
         },
         "status": "BLOCKED",
         "renderError": render_error,
+        "processId": os.getpid(),
+        "captureElapsedSeconds": capture_elapsed,
         "frames": frames,
     }
     report["gate"] = _evaluate(frames, render_error)

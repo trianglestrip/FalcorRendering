@@ -1142,6 +1142,11 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   correctly returns `BLOCKED`. Treat this only as localization evidence for
   the Cache Lighting/Surface Cache interaction.
 
+- C5 paired captures now include process/capture timing and per-frame render
+  seconds. `LUMEN_C5_PAIRED_EQ_TIMEOUT_SECONDS` is an opt-in between-frame
+  watchdog (default disabled); timeout is reported as `BLOCKED` and does not
+  alter any quality threshold.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：
