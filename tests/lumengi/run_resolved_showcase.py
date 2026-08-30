@@ -30,6 +30,8 @@ DISABLE_SURFACE_CACHE_LOOKUP = os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_LO
 # Test-only lookup side-effect isolation. The host keeps cache radiance replacement enabled but
 # disables feedback/request atomics and their next-frame scheduler readbacks.
 DISABLE_SURFACE_CACHE_FEEDBACK = os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK", "0").strip().lower() not in ("0", "false", "off")
+# Test-only synchronization probe for cache feedback/request readback copies.
+FORCE_CACHE_READBACK_UAV_BARRIER = os.environ.get("LUMEN_C9_FORCE_CACHE_READBACK_UAV_BARRIER", "0").strip().lower() not in ("0", "false", "off")
 # Diagnostic-only LumenGI filter switches. Defaults preserve the production
 # screenshot/C9 path; disabling either filter is for isolated producer traces.
 USE_LUMEN_TEMPORAL_FILTER = os.environ.get("LUMEN_RESOLVED_USE_LUMEN_TEMPORAL", "1").strip().lower() not in ("0", "false", "off")
@@ -1008,6 +1010,7 @@ for label, scene_path in _scenes():
                 "cacheLighting": USE_CACHE_LIGHTING,
                 "disableSurfaceCacheLookup": DISABLE_SURFACE_CACHE_LOOKUP,
                 "disableSurfaceCacheFeedback": DISABLE_SURFACE_CACHE_FEEDBACK,
+                "forceCacheReadbackUavBarrier": FORCE_CACHE_READBACK_UAV_BARRIER,
                 "lumenTemporalFilter": USE_LUMEN_TEMPORAL_FILTER,
                 "lumenSpatialFilter": USE_LUMEN_SPATIAL_FILTER,
                 "waitBeforeFrameCapture": WAIT_BEFORE_FRAME_CAPTURE,

@@ -4300,6 +4300,14 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         mCapture.pRadianceAtlas && mCacheLighting.pVisibilityAtlas && mCacheLighting.pPageMetadata &&
         mCacheLighting.pCardGrid && !mCardGridData.empty() && mLastCacheLightingPageCount > 0u;
     const bool hasSurfaceCacheFeedback = hasSurfaceCacheLookup && !disableSurfaceCacheFeedback;
+    // Test-only synchronization probe. D3D12 normally orders the UAV->COPY_SOURCE
+    // transition emitted by copyResource; this opt-in barrier tests whether an
+    // explicit UAV edge is required for the feedback/request readback pair.
+    const bool forceCacheReadbackUavBarrier = []()
+    {
+        const char* value = std::getenv("LUMEN_C9_FORCE_CACHE_READBACK_UAV_BARRIER");
+        return value && (std::string(value) == "1" || std::string(value) == "true");
+    }();
     // C4 production router: screen miss -> composed GDF -> HWRT.  The GDF is only
     // eligible after compose resources exist; a missing level table keeps the legacy
     // screen -> HWRT path intact for the first setup frame.
@@ -4759,6 +4767,8 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
     {
         // Consume on the next frame before Surface Cache scheduling. The submitted epoch is
         // carried alongside the GPU generation and checked in readbackScreenProbeCounters().
+        if (forceCacheReadbackUavBarrier && hasNormal)
+            pRenderContext->uavBarrier(mScreenProbes.pCacheFeedback.get());
         pRenderContext->copyResource(mScreenProbes.pCacheFeedbackReadback.get(), mScreenProbes.pCacheFeedback.get());
         mScreenProbes.cacheFeedbackReadbackPending = true;
         mScreenProbes.cacheFeedbackSceneGeneration = mSurfaceCacheSceneGeneration;
@@ -4766,6 +4776,8 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
     }
     if (hasSurfaceCacheFeedback && mScreenProbes.pCacheRequests && mScreenProbes.pCacheRequestsReadback)
     {
+        if (forceCacheReadbackUavBarrier && hasNormal)
+            pRenderContext->uavBarrier(mScreenProbes.pCacheRequests.get());
         pRenderContext->copyResource(mScreenProbes.pCacheRequestsReadback.get(), mScreenProbes.pCacheRequests.get());
         mScreenProbes.cacheRequestReadbackPending = true;
         mScreenProbes.cacheRequestSceneGeneration = mSurfaceCacheSceneGeneration;

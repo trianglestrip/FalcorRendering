@@ -1052,6 +1052,12 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   Keep v32 as the default-feedback `FAIL/OPEN` control; the opt-in switch is
   not a production workaround and thresholds remain frozen.
 
+- v35 tested an opt-in explicit UAV barrier before cache feedback/request
+  readback copies. Default feedback remained strict `FAIL/OPEN` (mean
+  `2.7820e-5`, p99 `4.3321e-4`, max `2.5635e-3`) and cache activity changed,
+  so the barrier is rejected as a production fix. `copyResource()` already
+  performs the UAV-to-copy transition; keep the switch diagnostic-only.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：

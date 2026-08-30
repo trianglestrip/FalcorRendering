@@ -1574,3 +1574,11 @@ telemetry in each replay JSON. With lookup still active it observed
 C9 passed (`mean=2.8565e-6`, `p99=7.1168e-5`, `max=2.1065e-3`,
 `relative=2.4669e-5`). This is the canonical diagnostic artifact; it does not
 promote the default feedback-enabled path, which remains `FAIL/OPEN` in v32.
+
+The v35 opt-in explicit UAV-barrier A/B (`LUMEN_C9_FORCE_CACHE_READBACK_UAV_BARRIER=1`)
+did not close the default path: strict C9 remained `FAIL/OPEN` at
+`mean=2.7820e-5` (`p99=4.3321e-4`, `max=2.5635e-3`). It also changed cache
+activity (`cacheLookupHits=232`, feedback hits `130291`, request raw
+`3100534`), so it is a timing perturbation rather than evidence of a missing
+state transition. Keep the switch diagnostic-only; `copyResource()` already
+emits the UAV-to-copy transition in the normal path.

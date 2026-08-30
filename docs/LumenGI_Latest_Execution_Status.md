@@ -919,3 +919,9 @@ in the replay JSON. Lookup remained active (`cacheLookupAttempts=58470`,
 passed with `mean=2.8565e-6`, `p99=7.1168e-5`, `max=2.1065e-3`, and
 `relative=2.4669e-5`. The default feedback-enabled v32 control remains the
 unmodified `FAIL/OPEN` reference.
+
+The v35 opt-in explicit UAV-barrier A/B remained strict `FAIL/OPEN` at
+`mean=2.7820e-5` (`p99=4.3321e-4`, `max=2.5635e-3`) and materially changed
+cache activity, so it is rejected as a production fix. The barrier switch is
+diagnostic-only; the normal `copyResource()` path already performs the UAV to
+copy-state transition.

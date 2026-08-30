@@ -1240,3 +1240,8 @@ active (`58470` attempts, `2905` hits), while feedback/request counters are all
 zero; strict C9 passes at mean `2.8565e-6`, p99 `7.1168e-5`, max `2.1065e-3`,
 relative `2.4669e-5`. This remains diagnostic-only; v32 with default feedback
 enabled is still the production `FAIL/OPEN` control.
+
+The v35 explicit readback-UAV-barrier A/B did not close C9 (`mean=2.7820e-5`,
+p99 `4.3321e-4`, max `2.5635e-3`) and changed lookup/feedback/request activity.
+Because `copyResource()` already inserts the resource state transition, retain
+the barrier switch only as opt-in diagnostics; it is not a production change.
