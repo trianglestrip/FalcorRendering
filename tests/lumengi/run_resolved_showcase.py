@@ -24,6 +24,12 @@ OUT_DIR = os.path.abspath(os.environ.get("LUMEN_RESOLVED_SHOWCASE_OUT", "artifac
 EXPOSURE = float(os.environ.get("LUMEN_RESOLVED_SHOWCASE_EXPOSURE", "0.0"))
 USE_SURFACE_CACHE = os.environ.get("LUMEN_RESOLVED_USE_SURFACE_CACHE", "1").strip().lower() not in ("0", "false", "off")
 USE_CACHE_LIGHTING = os.environ.get("LUMEN_RESOLVED_USE_CACHE_LIGHTING", "1").strip().lower() not in ("0", "false", "off")
+# Test-only consumer isolation. The host reads the same process environment to keep
+# Surface Cache capture/lighting active while bypassing ScreenProbe cache lookup.
+DISABLE_SURFACE_CACHE_LOOKUP = os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_LOOKUP", "0").strip().lower() not in ("0", "false", "off")
+# Test-only lookup side-effect isolation. The host keeps cache radiance replacement enabled but
+# disables feedback/request atomics and their next-frame scheduler readbacks.
+DISABLE_SURFACE_CACHE_FEEDBACK = os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK", "0").strip().lower() not in ("0", "false", "off")
 # Diagnostic-only LumenGI filter switches. Defaults preserve the production
 # screenshot/C9 path; disabling either filter is for isolated producer traces.
 USE_LUMEN_TEMPORAL_FILTER = os.environ.get("LUMEN_RESOLVED_USE_LUMEN_TEMPORAL", "1").strip().lower() not in ("0", "false", "off")
@@ -671,6 +677,17 @@ def _capture(label, scene_path, view_name):
         resolved = np.zeros((RESOLUTION[1], RESOLUTION[0], 3), dtype=np.float32)
     composite = m.activeGraph.get_output("ResolvedCompositePreview.out").to_numpy()[..., :3]
     display = m.activeGraph.get_output("ToneMapperDisplay.dst").to_numpy()[..., :3]
+    # Capture the host-side counters alongside the C9 endpoint snapshot.  This
+    # is read-only telemetry: it does not alter graph topology or scheduling,
+    # and makes cache-lookup/feedback isolation claims auditable in the artifact.
+    screen_probe_stats = {}
+    surface_cache_stats = {}
+    try:
+        lumen_pass = graph.getPass("LumenGI")
+        screen_probe_stats = dict(lumen_pass.screenProbeStats)
+        surface_cache_stats = dict(lumen_pass.surfaceCacheStats)
+    except Exception as exc:
+        print("RESOLVED_SHOWCASE telemetry unavailable", str(exc))
     producer_trace = _capture_producer_trace(graph, label, view_name)
     if FINALCOLOR_RUNTIME_OUT:
         runtime_path = Path(FINALCOLOR_RUNTIME_OUT)
@@ -878,6 +895,8 @@ def _capture(label, scene_path, view_name):
                 "emissionInDirectResolve": bool(USE_DIRECT_LIGHTING),
             },
             "producerTrace": producer_trace,
+            "screenProbeStats": screen_probe_stats,
+            "surfaceCacheStats": surface_cache_stats,
             "finalColor": {
                 "endpoint": "ResolvedCompositePreview.out",
                 "marked": True,
@@ -987,6 +1006,8 @@ for label, scene_path in _scenes():
                 "indirectDenoising": USE_INDIRECT_DENOISING,
                 "surfaceCache": USE_SURFACE_CACHE,
                 "cacheLighting": USE_CACHE_LIGHTING,
+                "disableSurfaceCacheLookup": DISABLE_SURFACE_CACHE_LOOKUP,
+                "disableSurfaceCacheFeedback": DISABLE_SURFACE_CACHE_FEEDBACK,
                 "lumenTemporalFilter": USE_LUMEN_TEMPORAL_FILTER,
                 "lumenSpatialFilter": USE_LUMEN_SPATIAL_FILTER,
                 "waitBeforeFrameCapture": WAIT_BEFORE_FRAME_CAPTURE,

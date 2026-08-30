@@ -1221,3 +1221,22 @@ pre-FrameCapture wait was recorded PASS but remained strict FAIL at
 `mean=3.0024e-5`, while v28 without the wait measured `6.1814e-5`. Keep both
 cache features enabled in production and treat this as the next barrier/
 resource-ordering investigation boundary.
+
+## 2026-08-30 C9 feedback/request isolation
+
+The v30 lookup-off diagnostic passed strict C9 while Surface Cache capture and
+Cache Lighting remained enabled. The v31 test-only switch
+`LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK=1` retained cache lookup and cache
+radiance replacement but removed feedback/request UAV atomics and their
+next-frame host readbacks; it passed with mean `3.8822e-6`, p99 `1.2207e-4`,
+and max `2.1065e-3`. A same-build v32 default-feedback control failed with
+mean `2.4613e-5`, p99 `3.6621e-4`, and max `3.4180e-3`. This is diagnostic
+localization only: the switch defaults off, production lookup/feedback/request
+behavior is unchanged, and the strict thresholds remain frozen.
+
+The v34 rerun includes a fail-closed stale-pending-readback guard and records
+`screenProbeStats`/`surfaceCacheStats` in the replay JSON. Lookup is proven
+active (`58470` attempts, `2905` hits), while feedback/request counters are all
+zero; strict C9 passes at mean `2.8565e-6`, p99 `7.1168e-5`, max `2.1065e-3`,
+relative `2.4669e-5`. This remains diagnostic-only; v32 with default feedback
+enabled is still the production `FAIL/OPEN` control.

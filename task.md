@@ -1035,6 +1035,23 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   `6.1814e-5`. Keep both cache switches enabled and treat these artifacts as
   diagnostic scheduling evidence only.
 
+- C9 cache-consumer isolation: v30 disabled only ScreenProbe cache lookup and
+  passed at the no-cache baseline. v31 retained lookup/radiance replacement but
+  disabled only feedback/request atomics and next-frame readbacks; strict C9
+  passed (`mean=3.8822e-6`, `p99=1.2207e-4`, `max=2.1065e-3`). The same-build
+  v32 default-feedback control failed (`mean=2.4613e-5`, `p99=3.6621e-4`,
+  `max=3.4180e-3`). The residual is now localized to feedback/request side
+  effects or host scheduler interaction. `LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK`
+  is test-only and defaults off; do not weaken thresholds or disable production
+  cache behavior.
+
+- v34 is the canonical rerun with stale-pending-readback protection and host
+  telemetry. Cache lookup remained active (`58470` attempts / `2905` hits),
+  while feedback/request counters were zero; strict C9 passed with
+  `mean=2.8565e-6`, `p99=7.1168e-5`, `max=2.1065e-3`, `relative=2.4669e-5`.
+  Keep v32 as the default-feedback `FAIL/OPEN` control; the opt-in switch is
+  not a production workaround and thresholds remain frozen.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：

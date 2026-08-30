@@ -1554,3 +1554,23 @@ The opt-in v27 pre-FrameCapture `m.device.wait()` fence was recorded PASS on
 both phases but still failed the frozen mean bound (`3.0024e-5`); the v28
 no-wait control was higher (`6.1814e-5`). This is scheduling evidence only,
 not a production fix or a threshold change.
+
+The v30 diagnostic disabled only the ScreenProbe Surface Cache lookup while
+leaving capture and Cache Lighting enabled; strict C9 passed at the v29
+baseline (`mean=2.8565e-6`, `p99=7.1168e-5`, `max=2.1065e-3`). The v31
+diagnostic then kept lookup and cache-radiance replacement enabled but disabled
+only feedback/request atomics and their next-frame readbacks; strict C9 again
+passed (`mean=3.8822e-6`, `p99=1.2207e-4`, `max=2.1065e-3`). A same-build
+default-feedback v32 control failed (`mean=2.4613e-5`, `p99=3.6621e-4`,
+`max=3.4180e-3`). This localizes the residual to the feedback/request side
+effects or their host scheduling interaction. The new
+`LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK` switch is test-only and defaults off;
+production lookup, feedback, request, and all C9 thresholds remain unchanged.
+
+The v34 rerun includes the stale-pending-readback guard and records host
+telemetry in each replay JSON. With lookup still active it observed
+`cacheLookupAttempts=58470` and `cacheLookupHits=2905`, while
+`surfaceCacheFeedbackHits/Pages=0` and `surfaceCacheRequestRaw/Cards=0`; strict
+C9 passed (`mean=2.8565e-6`, `p99=7.1168e-5`, `max=2.1065e-3`,
+`relative=2.4669e-5`). This is the canonical diagnostic artifact; it does not
+promote the default feedback-enabled path, which remains `FAIL/OPEN` in v32.

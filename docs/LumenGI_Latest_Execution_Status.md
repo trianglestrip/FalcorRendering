@@ -902,3 +902,20 @@ direct/non-cache baseline. The v27 opt-in wait before FrameCapture was fenced
 successfully but still failed C9 at `mean=3.0024e-5`; v28 no-wait was
 `6.1814e-5`. These are scheduling diagnostics only; frozen thresholds and
 production behavior are unchanged.
+
+The v30 lookup-off diagnostic passed strict C9 at the no-cache baseline while
+Surface Cache capture and Cache Lighting stayed enabled. The v31 diagnostic
+kept lookup/radiance replacement enabled but suppressed only feedback/request
+atomics and next-frame readbacks, and also passed (`mean=3.8822e-6`,
+`p99=1.2207e-4`, `max=2.1065e-3`). The same-build v32 default-feedback control
+failed at `mean=2.4613e-5` (`p99=3.6621e-4`, `max=3.4180e-3`). This isolates
+the remaining C9 variance to feedback/request side effects or host scheduler
+interaction. `LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK` is test-only, defaults
+off, and does not alter production behavior or thresholds.
+
+The v34 rerun adds the stale-pending-readback guard and captures host counters
+in the replay JSON. Lookup remained active (`cacheLookupAttempts=58470`,
+`cacheLookupHits=2905`) while feedback/request counters stayed zero; strict C9
+passed with `mean=2.8565e-6`, `p99=7.1168e-5`, `max=2.1065e-3`, and
+`relative=2.4669e-5`. The default feedback-enabled v32 control remains the
+unmodified `FAIL/OPEN` reference.
