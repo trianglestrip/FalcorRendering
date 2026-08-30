@@ -1419,3 +1419,9 @@ deferred GPU resources to be reclaimed between reloads. Release `Mogwai` was
 rebuilt with `/m:1`, CodeGraph was synchronized, and all offline self-tests
 passed. A fresh post-fix two-hour churn is still required; until it produces
 complete evidence, S2 remains `BLOCKED` and shutdown is not authorized.
+
+The S2 launcher now writes a strict `RUNNING`/`BLOCKED` manifest at startup and
+after each phase. This preserves completed dynamic evidence if the launcher is
+interrupted before the soak phase or final aggregation; the offline gate still
+requires `READY_FOR_OFFLINE_GATE` and all authoritative duration/provenance
+checks.

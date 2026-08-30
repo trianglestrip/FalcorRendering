@@ -937,6 +937,9 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
 - Re-run the strict two-hour churn after this guard. Keep S2 `BLOCKED` until a
   complete post-fix child artifact and authoritative launcher/gate PASS exist;
   do not lower cadence, alter thresholds, or authorize shutdown meanwhile.
+- The launcher now checkpoints `launcher-manifest.json` as `RUNNING`/`BLOCKED`
+  after setup and each phase, preserving partial process/VRAM evidence across
+  an interrupted orchestration without weakening the offline gate.
 
 ## 21. 最终完成条件
 

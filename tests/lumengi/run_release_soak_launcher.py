@@ -586,7 +586,29 @@ def main(argv=None):
         "gpu_index": args.gpu_index,
         "vram_sample_seconds": args.vram_sample_seconds,
     }
+
+    def persist_manifest(phases, status, run_state):
+        """Persist resumable launcher state after every orchestration boundary.
+
+        A Mogwai phase can outlive the terminal that launched it (or be
+        interrupted while the child has already written its JSON).  Keeping a
+        strict, non-ready manifest on disk makes that partial evidence
+        inspectable instead of losing the completed phase when the launcher
+        itself is interrupted.  The offline gate already rejects every status
+        other than READY_FOR_OFFLINE_GATE.
+        """
+        manifest = build_manifest(config, root, phases, status)
+        manifest["run_state"] = run_state
+        manifest["launcher_initial_vram"] = initial_vram
+        manifest["selected_gpu"] = {
+            "gpu_index": initial_vram.get("gpu_index"),
+            "gpu_name": initial_vram.get("gpu_name"),
+            "driver_version": initial_vram.get("driver_version"),
+        }
+        _write_json(root / "launcher-manifest.json", manifest)
+
     phases = {}
+    persist_manifest(phases, "RUNNING", "RUNNING")
     for role, seconds in (("dynamic", config["dynamic_seconds"]), ("soak", config["soak_seconds"])):
         timeout = seconds + max(0.0, args.timeout_slack_seconds)
         phases[role] = run_phase(
@@ -600,6 +622,11 @@ def main(argv=None):
             args.vram_sample_seconds,
             timeout,
         )
+        # Persist the completed phase before starting the next one.  A
+        # cancelled/failed soak therefore leaves the dynamic artifact and its
+        # exact process/VRAM evidence available for diagnosis.
+        phase_status = "RUNNING" if phases[role]["status"] == "READY_FOR_OFFLINE_GATE" else "BLOCKED"
+        persist_manifest(phases, phase_status, "RUNNING" if phase_status == "RUNNING" else "BLOCKED")
         # Keep the two phases strictly serial on the single selected GPU.
         if phases[role]["status"] == "BLOCKED":
             break
@@ -613,6 +640,7 @@ def main(argv=None):
         "gpu_name": initial_vram.get("gpu_name"),
         "driver_version": initial_vram.get("driver_version"),
     }
+    manifest["run_state"] = "COMPLETE"
     _write_json(root / "launcher-manifest.json", manifest)
     print("S2_RELEASE_SOAK_LAUNCHER", status, root)
     return 0 if status == "READY_FOR_OFFLINE_GATE" else 2
