@@ -1520,6 +1520,18 @@ relative max `2.4668e-5`). Keep the telemetry opt-in and investigate queue/barri
 ordering only if a future trace shows a real hazard; do not infer physical aliasing
 from the lifetime metadata or relax the frozen C9 thresholds.
 
+The test-only producer-trace path now adds three `BlitPass` sentinels when
+`LUMEN_C9_PRODUCER_TRACE_OUT` is set, preserving the source endpoints as
+unmarked resources while exporting float32 sidecars. The v20 diagnostic run
+measured DirectResolve mean delta `2.1424e-6`, LumenGI `4.6613e-5`, and
+Composite `4.7884e-5`, localizing the residual C9 error to LumenGI rather than
+the direct producer. Disabling only Lumen temporal filtering (v21) reduced the
+Lumen delta to `3.3638e-5` but increased max error to `1.8646e-2`; disabling
+both temporal and spatial filters (v22) still measured `2.8192e-5`. These
+diagnostic topologies do not close C9 and the production defaults remain
+unchanged. The companion offline diff is
+`tests/lumengi/run_c9_producer_snapshot_diff.py`.
+
 The v17 readback extension of the same opt-in trace confirms the scheduling
 asymmetry directly: mark-on performs four frame-capture readbacks (including
 `LumenGI.resolvedDiffuseGI`), while mark-off performs three. Each readback logs

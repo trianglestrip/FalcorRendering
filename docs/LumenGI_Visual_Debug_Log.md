@@ -1193,3 +1193,18 @@ is clean at 320x180 for lookup-on/off: outputs are finite/nonnegative, page
 clear/metadata and request/capture completion telemetry are readable, and
 validated feedback touches are observed. It does not exercise tiny-atlas
 eviction, stale-owner reuse, dirty-card mutation, or next-frame validity.
+
+## 2026-08-30 C9 producer-trace localization
+
+The strict C9 replay remains unchanged and `FAIL/OPEN`; the new test-only
+`LUMEN_C9_PRODUCER_TRACE_OUT` mode adds three marked `BlitPass` sentinels so
+DirectResolve, LumenGI, and Composite can be read back as float32 sidecars.
+The v20 run measured mean deltas of `2.1424e-6` (DirectResolve), `4.6613e-5`
+(LumenGI), and `4.7884e-5` (Composite), showing that the residual is on the
+LumenGI producer path rather than direct lighting. V21 disabled only Lumen
+temporal filtering (`3.3638e-5`, max `1.8646e-2`); v22 disabled temporal and
+spatial filters (`2.8192e-5`). Neither diagnostic topology is a strict gate
+candidate. The default v23 regression left both filters enabled and sentinels
+off, and measured `4.3798e-5`. Keep the production path and frozen C9 limits;
+the companion offline tool is
+[`run_c9_producer_snapshot_diff.py`](../tests/lumengi/run_c9_producer_snapshot_diff.py).

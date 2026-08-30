@@ -24,6 +24,10 @@ OUT_DIR = os.path.abspath(os.environ.get("LUMEN_RESOLVED_SHOWCASE_OUT", "artifac
 EXPOSURE = float(os.environ.get("LUMEN_RESOLVED_SHOWCASE_EXPOSURE", "0.0"))
 USE_SURFACE_CACHE = os.environ.get("LUMEN_RESOLVED_USE_SURFACE_CACHE", "1").strip().lower() not in ("0", "false", "off")
 USE_CACHE_LIGHTING = os.environ.get("LUMEN_RESOLVED_USE_CACHE_LIGHTING", "1").strip().lower() not in ("0", "false", "off")
+# Diagnostic-only LumenGI filter switches. Defaults preserve the production
+# screenshot/C9 path; disabling either filter is for isolated producer traces.
+USE_LUMEN_TEMPORAL_FILTER = os.environ.get("LUMEN_RESOLVED_USE_LUMEN_TEMPORAL", "1").strip().lower() not in ("0", "false", "off")
+USE_LUMEN_SPATIAL_FILTER = os.environ.get("LUMEN_RESOLVED_USE_LUMEN_SPATIAL", "1").strip().lower() not in ("0", "false", "off")
 GI_PREVIEW_SCALE = float(os.environ.get("LUMEN_RESOLVED_GI_PREVIEW_SCALE", "1.0"))
 PROBE_DIRECTIONS_PER_PROBE = int(os.environ.get("LUMEN_RESOLVED_PROBE_DIRECTIONS", "32"))
 # UE-style spatial quality sweep knobs.  Defaults preserve the production preset;
@@ -49,6 +53,11 @@ PROFILER_OUT = os.environ.get("LUMEN_RESOLVED_PROFILER_OUT", "").strip()
 PROFILER_FRAMES = max(1, int(os.environ.get("LUMEN_RESOLVED_PROFILER_FRAMES", "30")))
 FINALCOLOR_RUNTIME_OUT = os.environ.get("LUMEN_C9_FINALCOLOR_RUNTIME_OUT", "").strip()
 FINALCOLOR_REFERENCE_JSON = os.environ.get("LUMEN_C9_REFERENCE_RUNTIME_JSON", "").strip()
+# Optional test-only producer tracing.  When enabled, the graph adds marked
+# BlitPass sentinels fed by the direct, LumenGI, and composite producers.  This
+# deliberately changes the diagnostic graph topology and must never be used as
+# strict C9 export-equivalence evidence.
+PRODUCER_TRACE_OUT = os.environ.get("LUMEN_C9_PRODUCER_TRACE_OUT", "").strip()
 # Optional strict C9 pair mode.  One Mogwai process recreates the scene and
 # RenderGraph twice, with an identical frame schedule, and changes only whether
 # the LumenGI diagnostic outputs are marked.  The two phase artifacts are
@@ -206,8 +215,8 @@ def _graph():
                 # This remains a bounded 32-direction/probe path, not a path-tracing
                 # replacement; production presets can lower it explicitly.
                 "probeDirectionsPerProbe": max(1, PROBE_DIRECTIONS_PER_PROBE),
-                "useTemporalFilter": True,
-                "useSpatialFilter": True,
+                "useTemporalFilter": USE_LUMEN_TEMPORAL_FILTER,
+                "useSpatialFilter": USE_LUMEN_SPATIAL_FILTER,
                 "spatialRadiusMin": max(0.0, SPATIAL_RADIUS_MIN),
                 "spatialRadiusMax": max(0.0, SPATIAL_RADIUS_MAX),
                 "spatialVarianceThresholdLow": max(0.0, SPATIAL_VARIANCE_LOW),
@@ -373,6 +382,22 @@ def _graph():
     graph.addEdge("LumenGI.resolvedDiffuseGI", "ResolvedCompositePreview.B")
     graph.addEdge("ResolvedCompositePreview.out", "ToneMapperDisplay.src")
     graph.markOutput("ToneMapperDisplay.dst")
+    if PRODUCER_TRACE_OUT:
+        # Test-only readback sentinels keep the source endpoints unmarked while
+        # making their same-frame values available through legal graph outputs.
+        # This adds copy passes and therefore changes topology; never mix this
+        # diagnostic run with the strict C9 baseline.
+        sentinel_options = {"filter": "Point", "outputFormat": "RGBA32Float"}
+        producer_sentinels = {
+            "DirectResolve.output": "C9TraceDirect",
+            "LumenGI.resolvedDiffuseGI": "C9TraceLumen",
+            "ResolvedCompositePreview.out": "C9TraceComposite",
+        }
+        if USE_DIRECT_LIGHTING and USE_DIRECT_DENOISING:
+            for source, pass_name in producer_sentinels.items():
+                graph.addPass(createPass("BlitPass", sentinel_options), pass_name)
+                graph.addEdge(source, pass_name + ".src")
+                graph.markOutput(pass_name + ".dst")
     return graph
 
 
@@ -508,6 +533,77 @@ def _strict_replay_unload_scene():
         raise RuntimeError("strict replay scene-unload fence failed: " + str(fence.get("reason", "unknown error")))
 
 
+def _capture_producer_trace(graph, label, view_name):
+    """Capture test-only float producer sentinels without changing strict gate data.
+
+    The sentinels are added only when ``LUMEN_C9_PRODUCER_TRACE_OUT`` is set.
+    They add copy passes and marked outputs, so their artifacts diagnose source
+    deltas but are intentionally not consumed by the strict C9 verifier.
+    """
+    if not PRODUCER_TRACE_OUT:
+        return None
+
+    phase = str(DETERMINISTIC_REPLAY_CONTEXT.get("phase", "single")) or "single"
+    trace_dir = Path(PRODUCER_TRACE_OUT) / (label + "-" + view_name) / phase
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    producer_sentinels = {
+        "direct": ("DirectResolve.output", "C9TraceDirect.dst"),
+        "lumen": ("LumenGI.resolvedDiffuseGI", "C9TraceLumen.dst"),
+        "composite": ("ResolvedCompositePreview.out", "C9TraceComposite.dst"),
+    }
+    outputs = {}
+    all_ok = True
+    for key, (source_endpoint, readback_endpoint) in producer_sentinels.items():
+        record = {
+            "sourceEndpoint": source_endpoint,
+            "readbackEndpoint": readback_endpoint,
+            "readbackFormat": "RGBA32Float",
+        }
+        try:
+            data = np.asarray(graph.get_output(readback_endpoint).to_numpy()).copy()
+            data = np.ascontiguousarray(data)
+            path = trace_dir / (key + ".npy")
+            np.save(path, data, allow_pickle=False)
+            record.update(
+                {
+                    "status": "PASS" if np.isfinite(data).all() else "FAIL",
+                    "path": str(path),
+                    "shape": list(data.shape),
+                    "dtype": str(data.dtype),
+                    "finite": bool(np.isfinite(data).all()),
+                    "min": float(data.min()) if data.size else 0.0,
+                    "max": float(data.max()) if data.size else 0.0,
+                    "mean": float(data.mean()) if data.size else 0.0,
+                    "sha256": hashlib.sha256(data.tobytes()).hexdigest(),
+                }
+            )
+        except Exception as exc:
+            record.update({"status": "FAIL", "error": str(exc)})
+        outputs[key] = record
+        all_ok = all_ok and record.get("status") == "PASS"
+
+    trace_scene = str(
+        DETERMINISTIC_REPLAY_CONTEXT.get("config", {}).get("scene", "")
+        if isinstance(DETERMINISTIC_REPLAY_CONTEXT.get("config"), dict)
+        else ""
+    )
+    metadata = {
+        "schema": "LumenGI.C9.ProducerTrace.v1",
+        "status": "PASS" if all_ok else "FAIL",
+        "diagnosticOnly": True,
+        "topologyChanged": True,
+        "phase": phase,
+        "scene": trace_scene or None,
+        "view": view_name,
+        "frame": SETTLE_FRAMES,
+        "outputs": outputs,
+    }
+    metadata_path = trace_dir / "producer-trace.json"
+    metadata["metadataPath"] = str(metadata_path)
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return metadata
+
+
 def _capture(label, scene_path, view_name):
     m.loadScene(scene_path)
     _apply_scene_overrides()
@@ -553,6 +649,7 @@ def _capture(label, scene_path, view_name):
         resolved = np.zeros((RESOLUTION[1], RESOLUTION[0], 3), dtype=np.float32)
     composite = m.activeGraph.get_output("ResolvedCompositePreview.out").to_numpy()[..., :3]
     display = m.activeGraph.get_output("ToneMapperDisplay.dst").to_numpy()[..., :3]
+    producer_trace = _capture_producer_trace(graph, label, view_name)
     if FINALCOLOR_RUNTIME_OUT:
         runtime_path = Path(FINALCOLOR_RUNTIME_OUT)
         if runtime_path.suffix.lower() != ".json":
@@ -757,6 +854,7 @@ def _capture(label, scene_path, view_name):
                 "indirectPath": "LumenGI.resolvedDiffuseGI",
                 "emissionInDirectResolve": bool(USE_DIRECT_LIGHTING),
             },
+            "producerTrace": producer_trace,
             "finalColor": {
                 "endpoint": "ResolvedCompositePreview.out",
                 "marked": True,
@@ -866,6 +964,8 @@ for label, scene_path in _scenes():
                 "indirectDenoising": USE_INDIRECT_DENOISING,
                 "surfaceCache": USE_SURFACE_CACHE,
                 "cacheLighting": USE_CACHE_LIGHTING,
+                "lumenTemporalFilter": USE_LUMEN_TEMPORAL_FILTER,
+                "lumenSpatialFilter": USE_LUMEN_SPATIAL_FILTER,
                 "probeDirections": PROBE_DIRECTIONS_PER_PROBE,
                 "spatial": [SPATIAL_RADIUS_MIN, SPATIAL_RADIUS_MAX, SPATIAL_VARIANCE_LOW, SPATIAL_VARIANCE_HIGH],
                 "lightingOverrides": [ENV_INTENSITY, POINT_LIGHT_SCALE, DIRECTIONAL_LIGHT_SCALE, EMISSIVE_FACTOR_SCALE],

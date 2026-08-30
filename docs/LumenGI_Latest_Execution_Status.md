@@ -882,3 +882,12 @@ dynamic soak, and the 2-hour release soak remain open.
   `to_numpy()` reads are no-op barriers. v17 measured mean `4.3308e-5`; the
   telemetry-off v18 control measured `3.3280e-5`. Keep this as diagnostic
   evidence only; no production behavior or threshold changed.
+- The v20 test-only producer trace added three float32 BlitPass sentinels and
+  measured DirectResolve mean delta `2.1424e-6`, LumenGI `4.6613e-5`, and
+  Composite `4.7884e-5`; the residual is concentrated in LumenGI. Disabling
+  only Lumen temporal filtering (v21) reduced Lumen delta to `3.3638e-5` but
+  raised max error to `1.8646e-2`; disabling both temporal and spatial filters
+  (v22) still measured `2.8192e-5`. These runs are diagnostic-only because
+  sentinel copy passes change graph topology. The default v23 regression kept
+  both filters enabled and no sentinel, and remains strict `FAIL/OPEN` at
+  mean `4.3798e-5`; production defaults are unchanged.

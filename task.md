@@ -1018,6 +1018,13 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   readback logs its barrier and fence. v17 mean was `4.3308e-5` and the
   telemetry-off v18 control was `3.3280e-5`, so this is evidence only and not a
   fix. Keep production behavior and C9 thresholds unchanged.
+- The opt-in v20 producer trace uses three float32 BlitPass sentinels to split
+  C9 deltas. DirectResolve measured `2.1424e-6`, LumenGI `4.6613e-5`, and
+  Composite `4.7884e-5`. Disabling Lumen temporal only (v21) gave `3.3638e-5`
+  with a `1.8646e-2` max; disabling temporal+spatial (v22) gave `2.8192e-5`.
+  These topologies are diagnostic-only; v23 default regression remains
+  `FAIL/OPEN` at mean `4.3798e-5`, with production filters and thresholds
+  unchanged. Use `run_c9_producer_snapshot_diff.py` for the offline comparison.
 
 ## 21. 最终完成条件
 
