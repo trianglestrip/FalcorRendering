@@ -85,10 +85,71 @@ import RenderPasses.LumenGI.Lighting.LumenGILighting; // lumenGIEvaluateEnvironm
 #ifndef is_valid_gProbeDebug
 #define is_valid_gProbeDebug 0
 #endif
+#ifndef is_valid_gProbeValidity
+#define is_valid_gProbeValidity 0
+#endif
+#ifndef is_valid_gScreenRadianceMoments
+#define is_valid_gScreenRadianceMoments 0
+#endif
+#ifndef is_valid_gScreenRadianceHistoryValidity
+#define is_valid_gScreenRadianceHistoryValidity 0
+#endif
 
 #define is_valid(name) (is_valid_##name != 0)
 
+#if is_valid_gScreenRadianceMoments
+Texture2D<float2> gScreenRadianceMoments;
+#endif
+
+#if is_valid_gProbeValidity
+uint lumenProbeDirectionFingerprint(const float3 direction)
+{
+    // Compact eight-bit octahedral identity for direction-union diagnostics.
+    // Exact reconstruction still uses the fixed seed, producer frame and slot.
+    float3 n = direction / max(dot(abs(direction), float3(1.f)), 1e-8f);
+    float2 oct = n.xy;
+    if (n.z < 0.f)
+        oct = (1.f - abs(oct.yx)) * float2(oct.x >= 0.f ? 1.f : -1.f, oct.y >= 0.f ? 1.f : -1.f);
+    const uint qx = min(15u, uint(saturate(oct.x * 0.5f + 0.5f) * 16.f));
+    const uint qy = min(15u, uint(saturate(oct.y * 0.5f + 0.5f) * 16.f));
+    return qx | (qy << 4u);
+}
+
+void lumenProbeWriteValidity(
+    const uint recordIndex,
+    const LumenScreenProbeMeta meta,
+    const LumenProbeHit hit,
+    const uint backend,
+    const uint producerFrame,
+    const uint sampleIndex,
+    const uint directionFingerprint
+)
+{
+    const bool geometryValid = backend != 0u;
+    const bool radianceValid = all(isfinite(hit.radiance));
+    const uint packed = backend | (geometryValid ? (1u << 8) : 0u) | (radianceValid ? (1u << 9) : 0u) |
+        ((sampleIndex & 0x3fu) << 10u) | ((gResetReason & 0xffu) << 16u) |
+        ((directionFingerprint & 0xffu) << 24u);
+    gProbeValidity.Store4(recordIndex * 16u, uint4(packed, producerFrame, gHistoryGeneration, meta.age));
+}
+
+void lumenProbeWriteInvalidValidity(const uint recordIndex, const LumenScreenProbeMeta meta, const uint producerFrame)
+{
+    gProbeValidity.Store4(
+        recordIndex * 16u, uint4((gResetReason & 0xffu) << 16, producerFrame, gHistoryGeneration, meta.age)
+    );
+}
+#endif
+
 static const float kLumenProbeMinProjectDenom = 1e-8f;
+static const float kLumenProbeMissHitDistance = 65504.f; ///< RGBA16F miss sentinel.
+// Keep the screen-radiance source bounded before it is accumulated into a
+// probe.  This mirrors UE's MaxRayIntensity default and the S1 producer's
+// exposure-independent radiance ceiling.
+static const float kLumenProbeScreenMaxRadiance = 10.f;
+static const float kLumenProbeScreenDepthWeightScale = 1000.f;
+static const float kLumenProbeScreenDepthWeightEpsilon = 1e-3f;
+static const float kLumenProbeScreenMomentClipSigma = 2.5f;
 ///< Screen-march hits closer than this many texels of equivalent world depth
 ///< are skipped (the probe's own 8x8 tile). Converted to meters per probe depth.
 static const float kLumenProbeStartBiasTexels = 8.0f;
@@ -230,16 +291,151 @@ float3 lumenProbeDecodeNormal(const float2 octXY)
     return normalize(n);
 }
 
-/** Radiance at a hit: S4.2 degradation = reuse the S1 per-pixel indirect
-    radiance (gDiffuseRadianceHitDist RGB). S4.3 replaces this with the surface
-    cache radiance lookup (LumenScreenProbeGather/A3-B3).
+bool lumenProbeScreenSampleIsFinite(const float4 sample)
+{
+    return !any(isnan(sample)) && !any(isinf(sample));
+}
+
+/** The alpha channel is a world-space secondary hit distance.  Misses use the
+    RGBA16F sentinel and must not become spatial neighbors; finite black RGB is
+    still a valid hit and therefore is intentionally not part of this test. */
+bool lumenProbeScreenSampleIsValid(const float4 sample)
+{
+    return lumenProbeScreenSampleIsFinite(sample) &&
+           sample.w > 0.f && sample.w < kLumenProbeMissHitDistance;
+}
+
+/** Reject cross-surface source samples before the radiance gather.  UE's probe
+    filter uses a normal/depth validity contract; the Falcor source texture is
+    only 1-spp radiance, so allowing a neighboring wall/object normal to enter
+    this gather creates low-frequency edge mottle.  Keep legal black radiance
+    valid and only apply the normal test when both pixels have a surface depth. */
+bool lumenProbeScreenNormalsAgree(const uint2 centerTexel, const uint2 sampleTexel)
+{
+#if is_valid_gNormalRoughnessMaterialID
+    const float centerDepth = gLinearZ[centerTexel].x;
+    const float sampleDepth = gLinearZ[sampleTexel].x;
+    if (centerDepth > 0.f && sampleDepth > 0.f)
+    {
+        const float3 centerNormal = lumenProbeDecodeNormal(gNormalRoughnessMaterialID[centerTexel].xy);
+        const float3 sampleNormal = lumenProbeDecodeNormal(gNormalRoughnessMaterialID[sampleTexel].xy);
+        if (dot(centerNormal, sampleNormal) < 0.70710678f)
+            return false;
+    }
+#endif
+    return true;
+}
+
+float3 lumenProbeClampScreenRadiance(const float3 radiance)
+{
+    return min(max(radiance, float3(0.f)), float3(kLumenProbeScreenMaxRadiance));
+}
+
+/** Radiance at a hit: reuse the S1 per-pixel indirect radiance, but apply the
+    small screen-space gather used by UE's probe filtering before a probe ray
+    consumes it. A single HWRT sample is a very noisy estimator; averaging a
+    3x3 depth-weighted neighborhood removes isolated fireflies without
+    crossing a visible surface boundary. Out-of-bounds neighbors are skipped
+    instead of clamped repeatedly, and miss-sentinel neighbors are excluded.
 */
-float3 lumenProbeScreenRadiance(const uint2 texel)
+bool lumenProbeScreenRadiance(const uint2 texel, out float3 radiance)
 {
 #if is_valid_gDiffuseRadianceHitDist
-    return max(gDiffuseRadianceHitDist[texel].xyz, float3(0.f));
+    const float centerDepth = gLinearZ[texel].x;
+    float3 sum = float3(0.f);
+    float weightSum = 0.f;
+    for (int oy = -1; oy <= 1; ++oy)
+    {
+        for (int ox = -1; ox <= 1; ++ox)
+        {
+            int2 q = int2(texel) + int2(ox, oy);
+            if (q.x < 0 || q.y < 0 || q.x >= int(gFrameDim.x) || q.y >= int(gFrameDim.y))
+                continue;
+            const uint2 sampleTexel = uint2(q);
+            if (!lumenProbeScreenNormalsAgree(texel, sampleTexel))
+                continue;
+            float4 sample = gDiffuseRadianceHitDist[sampleTexel];
+            bool sampleValid = lumenProbeScreenSampleIsValid(sample);
+            float2 sourceMoments = float2(0.f);
+            bool sourceMomentsValid = false;
+#if is_valid_gScreenRadianceHistory
+            const float4 historySample = gScreenRadianceHistory[sampleTexel];
+            bool historyValid = lumenProbeScreenSampleIsValid(historySample);
+#if is_valid_gScreenRadianceHistoryValidity
+            historyValid = historyValid && gScreenRadianceHistoryValidity[sampleTexel] != 0u;
+#endif
+            if (historyValid)
+            {
+                // The history pass already reprojects and depth-rejects the
+                // previous frame. Prefer it strongly, while retaining a
+                // current-frame contribution so lighting changes converge.
+                // Source moments increase history weight only for a genuinely
+                // noisy luminance distribution; they never change the hit-distance
+                // alpha contract and are not the downstream irradiance moments.
+                float historyWeight = 0.75f;
+#if is_valid_gScreenRadianceMoments
+                sourceMoments = gScreenRadianceMoments[sampleTexel];
+                sourceMomentsValid = all(!isnan(sourceMoments)) && all(!isinf(sourceMoments)) &&
+                    sourceMoments.x >= 0.f && sourceMoments.y >= sourceMoments.x * sourceMoments.x;
+                if (sourceMomentsValid)
+                {
+                    const float variance = max(sourceMoments.y - sourceMoments.x * sourceMoments.x, 0.f);
+                    const float sigmaOverMean = sqrt(variance) / max(sourceMoments.x, 1e-3f);
+                    historyWeight = lerp(0.75f, 0.8f, saturate(0.5f * sigmaOverMean));
+                }
+#endif
+                // Preserve the current hit-distance contract when the current
+                // sample is valid.  Only a current miss may borrow history's
+                // hit distance; mixing current RGB with an unrelated historical
+                // alpha can otherwise make source validity appear to jump across
+                // surfaces and frames.
+                sample = sampleValid
+                    ? float4(lerp(sample.xyz, historySample.xyz, historyWeight), sample.w)
+                    : historySample;
+                sampleValid = true;
+            }
+#endif
+            if (!sampleValid)
+                continue;
+
+            float3 sampleRadiance = lumenProbeClampScreenRadiance(sample.xyz);
+#if is_valid_gScreenRadianceMoments
+            if (sourceMomentsValid)
+            {
+                const float variance = max(sourceMoments.y - sourceMoments.x * sourceMoments.x, 0.f);
+                const float sigma = sqrt(variance);
+                const float sampleLuminance = dot(sampleRadiance, float3(0.2126f, 0.7152f, 0.0722f));
+                const float clipLuminance = sourceMoments.x + kLumenProbeScreenMomentClipSigma * sigma;
+                if (sampleLuminance > clipLuminance && sampleLuminance > 1e-5f)
+                    sampleRadiance *= clipLuminance / sampleLuminance;
+            }
+#endif
+
+            float depthWeight = 1.f;
+            const float sampleDepth = gLinearZ[sampleTexel].x;
+            if (centerDepth > 0.f && sampleDepth > 0.f)
+            {
+                const float relativeDepth = (sampleDepth - centerDepth) / max(centerDepth, 1e-3f);
+                depthWeight = exp2(-kLumenProbeScreenDepthWeightScale * relativeDepth * relativeDepth);
+                if (depthWeight <= kLumenProbeScreenDepthWeightEpsilon)
+                    continue;
+            }
+
+            const float w = ((ox == 0 && oy == 0) ? 1.f : 0.75f) * depthWeight;
+            sum += w * sampleRadiance;
+            weightSum += w;
+        }
+    }
+    if (weightSum > 0.f)
+    {
+        radiance = sum / weightSum;
+        return true;
+    }
+    radiance = float3(0.f);
+    return false;
 #else
-    return float3(0.f);
+    radiance = float3(0.f);
+    return false;
 #endif
 }
 
@@ -325,7 +521,8 @@ bool lumenProbeTraceScreenFirst(const float2 probePixel, const float3 o, const f
                 continue;
             }
             const float confidence = saturate(1.f - diff / max(thickness, 1e-6f));
-            hit.radiance = lumenProbeScreenRadiance(p);
+            if (!lumenProbeScreenRadiance(p, hit.radiance))
+                return false; // A screen depth hit without valid radiance must use HWRT fallback.
             hit.hitDistance = t;
             hit.flags = kLumenProbeHitFlagScreenHit | kLumenProbeHitFlagRadianceReused;
             hit.confidence = confidence;
@@ -366,14 +563,48 @@ void lumenProbeResolveFallbackRadiance(const float3 dirW, const float3 hitPosW, 
         const float surfDepth = gLinearZ[texel].x;
         if (surfDepth > 0.f && abs(hitDepth - surfDepth) <= gDepthChangeThreshold * 50.f)
         {
-            hit.radiance = lumenProbeScreenRadiance(uint2(texel));
-            hit.flags |= kLumenProbeHitFlagRadianceReused;
-            return;
+            float3 reusedRadiance;
+            if (lumenProbeScreenRadiance(uint2(texel), reusedRadiance))
+            {
+                hit.radiance = reusedRadiance;
+                hit.flags |= kLumenProbeHitFlagRadianceReused;
+                return;
+            }
         }
     }
     hit.radiance = lumenProbeEnvRadiance(dirW);
     hit.flags |= kLumenProbeHitFlagEnvironment;
 }
+
+#if LUMEN_GI_PROBE_GDF_ROUTE
+/** Route a probe ray through the composed GDF after screen reuse misses.  The GDF
+    contributes geometry only; radiance still uses the existing probe resolver so this
+    stage does not invent a second lighting model. */
+bool lumenProbeTraceGDF(const float3 originW, const float3 dirW, out LumenProbeHit hit)
+{
+    hit = (LumenProbeHit)0;
+    LumenGDFTraceParams params;
+    params.maxSteps = gGDFMaxSteps;
+    params.minStepScale = 0.f;
+    params.hitEpsScale = 0.f;
+    params.tMax = gGDFTraceMaxDistance;
+    LumenGDFTraceResult result;
+    const bool gdfHit = traceGDF(
+        LumenGDFBindings(gGDFLevels, gGDFLevelTable), gGDFClipmap, originW, dirW, params, result
+    );
+    if (!gdfHit || !isfinite(result.t) || result.t <= 0.f)
+        return false;
+
+    const float3 hitPosW = originW + dirW * result.t;
+    hit.hitDistance = result.t;
+    hit.flags = kLumenProbeHitFlagGDFHit;
+    hit.confidence = 1.f;
+    hit.hitUV = float2(-1.f, -1.f);
+    lumenProbeResolveFallbackRadiance(dirW, hitPosW, hit);
+    hit.flags |= kLumenProbeHitFlagGDFHit;
+    return true;
+}
+#endif
 
 /** HWRT inline fallback. Returns true when a hit was resolved (flags has
     kLumenProbeHitFlagHWRTHit); false on miss or degraded fallback.
@@ -448,20 +679,29 @@ void updateProbe(const uint probeIndex)
 {
     const uint2 probeGridDims = gProbeGridDims;
     const uint2 gridPos = uint2(probeIndex % probeGridDims.x, probeIndex / probeGridDims.x);
-    const float2 probePixel = float2(gridPos) * float(kLumenScreenProbeTileSize) +
-                              0.5f * float(kLumenScreenProbeTileSize) + 0.5f;
+    // A ceil-sized probe grid has a partial tile at the right/bottom edge for
+    // non-multiple-of-8 resolutions.  Keep the metadata center in-bounds so
+    // the update pass never samples linearZ outside the frame (800x450 would
+    // otherwise address y=452 on its last probe row).
+    const float2 unclampedProbePixel = float2(gridPos) * float(kLumenScreenProbeTileSize) +
+                                        0.5f * float(kLumenScreenProbeTileSize) + 0.5f;
+    const float2 frameMaxPixel = max(float2(gFrameDim) - 0.5f, float2(0.5f));
+    const float2 probePixel = clamp(unclampedProbePixel, float2(0.5f), frameMaxPixel);
 
-    const uint2 pixel = uint2(probePixel);
+    const uint2 pixel = min(uint2(probePixel), max(gFrameDim, uint2(1u, 1u)) - 1u);
     const float z = gLinearZ[pixel].x;
     const bool active = z > 0.f;
 
     LumenScreenProbeMeta meta = gProbeMeta[probeIndex];
     const float lastDepth = meta.depth;
+    const float3 lastWorldPos = meta.worldPos;
+    const float3 lastNormalW = meta.normalW;
+    const uint lastMaterialID = meta.materialID;
     const uint wasActive = meta.active;
 
     meta.screenPos = probePixel;
     meta.active = active ? kLumenScreenProbeMetaFlagActive : 0u;
-    meta.flags = meta.flags & ~kLumenScreenProbeMetaFlagDirty;
+    meta.dirty = meta.dirty & ~kLumenScreenProbeMetaFlagDirty;
 
     if (active)
     {
@@ -470,16 +710,22 @@ void updateProbe(const uint probeIndex)
 #if is_valid_gNormalRoughnessMaterialID
         const float4 gb = gNormalRoughnessMaterialID[pixel];
         float3 n = lumenProbeDecodeNormal(gb.xy);
-        meta.normalW = any(isnan(n)) ? float3(0.f, 1.f, 0.f) : normalize(n);
+        meta.normalW = (any(isnan(n)) || any(isinf(n))) ? float3(0.f, 1.f, 0.f) : normalize(n);
         meta.materialID = uint(round(saturate(gb.w) * 3.f));
 #else
         meta.normalW = float3(0.f, 1.f, 0.f);
         meta.materialID = 0u;
 #endif
-        // Dirty when the depth moved since the last update or on first activation.
+        // Dirty when the probe identity changed since the last update or on
+        // first activation.  Depth alone is insufficient: a moving normal,
+        // material, or world position must not keep mixing old radiance into
+        // the new surface.
         const bool moved = wasActive != 0u && lastDepth > 0.f && abs(z - lastDepth) > gDepthChangeThreshold;
-        if (moved || wasActive == 0u)
-            meta.flags |= kLumenScreenProbeMetaFlagDirty;
+        const bool normalChanged = wasActive != 0u && dot(normalize(lastNormalW), meta.normalW) < 0.995f;
+        const bool materialChanged = wasActive != 0u && lastMaterialID != meta.materialID;
+        const bool worldMoved = wasActive != 0u && length(meta.worldPos - lastWorldPos) > gDepthChangeThreshold;
+        if (moved || normalChanged || materialChanged || worldMoved || wasActive == 0u)
+            meta.dirty |= kLumenScreenProbeMetaFlagDirty;
         meta.age = gFrameIndex - min(meta.lastUpdateFrame, gFrameIndex);
     }
     else
@@ -502,17 +748,23 @@ void traceProbeDirection(const uint probeIndex, const uint dirIndex)
     {
         if (dirIndex == 0u)
             InterlockedAdd(gProbeCounters[0].inactiveProbes, 1u);
+#if is_valid_gProbeValidity
+        lumenProbeWriteInvalidValidity(recordIndex, meta, meta.lastUpdateFrame);
+#endif
         return; // No surface at this probe: leave the record stale.
     }
 
     // Per-frame budget: round-robin over gUpdateInterval plus immediate dirty.
     const uint interval = max(1u, gUpdateInterval);
-    const bool due = (meta.flags & kLumenScreenProbeMetaFlagDirty) != 0u ||
+    const bool due = (meta.dirty & kLumenScreenProbeMetaFlagDirty) != 0u ||
                      (probeIndex % interval) == (gFrameIndex % interval);
     if (!due)
     {
         if (dirIndex == 0u)
             InterlockedAdd(gProbeCounters[0].budgetSkipped, 1u);
+#if is_valid_gProbeValidity
+        lumenProbeWriteInvalidValidity(recordIndex, meta, meta.lastUpdateFrame);
+#endif
         return;
     }
 
@@ -535,26 +787,79 @@ void traceProbeDirection(const uint probeIndex, const uint dirIndex)
     hit.hitUV = float2(-1.f, -1.f);
 
     bool screenHit = false;
+    uint validityBackend = 0u;
     if (d.z > 0.f) // Forward rays only can screen-hit; toward-camera rays go straight to HWRT.
         screenHit = lumenProbeTraceScreenFirst(meta.screenPos, o, d, hit);
 
     if (screenHit)
     {
+        // The screen march parameter `t` is in trace-view coordinates.  The
+        // unified hit ABI, however, defines hitDistance as meters along the
+        // probe's world-space direction so downstream Surface Cache lookup can
+        // reconstruct `probeWorldPos + dirW * hitDistance`.  Reproject the
+        // screen hit using the authoritative GBuffer linear depth before
+        // storing the record; using the view-space `t` here aliases cache pages
+        // whenever the probe ray is not parallel to the camera ray.
+        const float2 hitPixel = clamp(hit.hitUV * float2(gFrameDim), float2(0.f), float2(gFrameDim) - 1.f);
+        const uint2 hitTexel = uint2(hitPixel);
+        const float hitDepth = gLinearZ[hitTexel].x;
+        if (hitDepth > 0.f && !isnan(hitDepth) && !isinf(hitDepth))
+        {
+            const float3 hitPosW = lumenProbeUnprojectToWorld(hitPixel, hitDepth);
+            hit.hitDistance = max(dot(hitPosW - meta.worldPos, dirW), 0.f);
+        }
         InterlockedAdd(gProbeCounters[0].screenHits, 1u);
+        validityBackend = 1u;
     }
     else
     {
         InterlockedAdd(gProbeCounters[0].fallbackAttempts, 1u);
         const float3 originW = lumenProbeRayOrigin(meta.worldPos, meta.normalW, dirW);
+#if LUMEN_GI_PROBE_GDF_ROUTE
+        if (gGDFRouteEnabled != 0u && lumenProbeTraceGDF(originW, dirW, hit))
+        {
+            InterlockedAdd(gProbeCounters[0].gdfHits, 1u);
+            validityBackend = 3u;
+        }
+        else
+        {
+            InterlockedAdd(gProbeCounters[0].gdfMisses, 1u);
+            if (lumenProbeTraceFallback(originW, dirW, hit))
+            {
+                InterlockedAdd(gProbeCounters[0].fallbackHits, 1u);
+                validityBackend = 2u;
+            }
+            else if ((hit.flags & kLumenProbeHitFlagFallbackUnavailable) != 0u)
+                InterlockedAdd(gProbeCounters[0].fallbackUnavailable, 1u);
+            else
+                InterlockedAdd(gProbeCounters[0].fallbackMisses, 1u);
+        }
+#else
         if (lumenProbeTraceFallback(originW, dirW, hit))
+        {
             InterlockedAdd(gProbeCounters[0].fallbackHits, 1u);
+            validityBackend = 2u;
+        }
         else if ((hit.flags & kLumenProbeHitFlagFallbackUnavailable) != 0u)
             InterlockedAdd(gProbeCounters[0].fallbackUnavailable, 1u);
         else
             InterlockedAdd(gProbeCounters[0].fallbackMisses, 1u);
+#endif
     }
 
     gProbeHitRecords[recordIndex] = hit;
+
+#if is_valid_gProbeValidity
+    lumenProbeWriteValidity(
+        recordIndex,
+        meta,
+        hit,
+        validityBackend,
+        gFrameIndex,
+        sampleIndex,
+        lumenProbeDirectionFingerprint(dirW)
+    );
+#endif
 
 #if is_valid_gProbeDebug
     // Per-probe march diagnostics (tests only): probe 0 slot holds probe 0, etc.
@@ -580,7 +885,7 @@ void finalizeProbe(const uint probeIndex)
     if (meta.active == 0u)
         return;
     const uint interval = max(1u, gUpdateInterval);
-    const bool due = (meta.flags & kLumenScreenProbeMetaFlagDirty) != 0u ||
+    const bool due = (meta.dirty & kLumenScreenProbeMetaFlagDirty) != 0u ||
                      (probeIndex % interval) == (gFrameIndex % interval);
     if (!due)
         return;

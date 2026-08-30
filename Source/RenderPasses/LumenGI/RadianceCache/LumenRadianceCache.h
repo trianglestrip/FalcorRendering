@@ -72,6 +72,8 @@ constexpr uint32_t kRadianceCacheDefaultLevelCount = 6;
 constexpr float kRadianceCacheDefaultBaseExtentMeters = 4.0f;
 ///< Default probes per side (all levels share one resolution). 8^3 = 512 probes/level.
 constexpr uint32_t kRadianceCacheDefaultResolution = 8;
+///< Probe-grid resolution cap imposed by the 10-bit cell fields in makeProbeKey().
+constexpr uint32_t kRadianceCacheMaxResolution = 1024;
 ///< Default number of probes refreshed per frame (the per-frame refresh budget).
 constexpr uint32_t kRadianceCacheDefaultRefreshBudgetPerFrame = 64;
 ///< Default slot-pool capacity (probe cache slots, page allocation pool).
@@ -151,7 +153,8 @@ public:
         float radiance[3] = {0.f, 0.f, 0.f};                 ///< Interpolated radiance RGB.
         uint32_t directionEncoding = kRadianceCacheInvalidDirectionEncoding; ///< Octahedral dir.
         float confidence = 0.f;                              ///< 0..1 update confidence.
-        uint64_t lastUpdateFrame = 0;                        ///< Frame of the last update.
+        uint64_t lastUpdateFrame = 0;                        ///< Frame of the last radiance update.
+        mutable uint64_t lastUsedFrame = 0;                  ///< Last frame consumed by a query/usage feedback.
         uint32_t generation = 0;                             ///< Allocation epochs (key part).
         uint32_t level = 0;                                  ///< Clipmap level this slot lives in.
         index3 cell;                                         ///< Level-local probe cell.
@@ -351,6 +354,11 @@ public:
     ///<   first update : confidence = kRadianceCacheFirstUpdateConfidence
     ///<   later updates: confidence = min(1, confidence + (1 - confidence) * alpha)
     bool updateProbe(uint32_t slot, const float radiance[3], uint32_t directionEncoding);
+
+    ///< Mark a resident probe as consumed by the current frame. This is the CPU-side
+    ///< counterpart of UE's ProbeLastUsedFrame feedback; GPU integrations should feed it
+    ///< from their readback/usage buffer rather than relying on update age alone.
+    bool touchProbe(uint32_t slot);
 
     ///< Override the refresh visibility weight of a slot (0..1, default 1). The root pass
     ///< feeds this from view-dependent signals (frustum/shadow); refreshScore() multiplies
@@ -562,7 +570,9 @@ inline LumenRadianceCache::LumenRadianceCache(
     : mMemoryBudgetBytes(memoryBudgetBytes)
 {
     const float base = baseExtentMeters > 0.f ? baseExtentMeters : kRadianceCacheDefaultBaseExtentMeters;
-    const uint32_t res = std::max(1u, resolution);
+    // makeProbeKey() reserves 10 bits per signed cell component. Clamp the
+    // public resolution so a legal configuration can never produce key aliasing.
+    const uint32_t res = std::min(std::max(1u, resolution), kRadianceCacheMaxResolution);
     const uint32_t count = std::min(std::max(levelCount, kRadianceCacheDynamicLevels), kRadianceCacheMaxLevels);
     const uint32_t slots = std::max(1u, maxSlots);
 
@@ -800,11 +810,22 @@ inline bool LumenRadianceCache::updateProbe(uint32_t slot, const float radiance[
     s.radiance[2] = radiance[2];
     s.directionEncoding = directionEncoding;
     s.lastUpdateFrame = mFrameIndex;
+    s.lastUsedFrame = mFrameIndex;
     // Confidence: first update jumps to kFirstUpdateConfidence, later updates blend up.
     s.confidence = s.confidence <= 0.f
         ? kRadianceCacheFirstUpdateConfidence
         : std::min(1.0f, s.confidence + (1.0f - s.confidence) * kRadianceCacheConfidenceAlpha);
     ++mUpdateCount;
+    return true;
+}
+
+inline bool LumenRadianceCache::touchProbe(uint32_t slot)
+{
+    if (slot == kInvalidProbeSlot || slot >= mSlots.size() || !mSlots[slot].allocated)
+    {
+        return false;
+    }
+    mSlots[slot].lastUsedFrame = mFrameIndex;
     return true;
 }
 
@@ -926,9 +947,15 @@ inline const std::vector<LumenRadianceCache::RadianceCacheRefreshRequest>& Lumen
         }
     }
 
-    // 2. Deterministic sort: score desc, then level/cell/slot asc.
+    // 2. Deterministic sort: cold empty cells first, then score desc and
+    // level/cell/slot asc.  Without the explicit cold-cell class, an allocated
+    // level-0 slot whose GPU commit has not yet fed confidence back to the CPU
+    // ties with nearby empty cells and can starve every static clipmap level.
+    // Empty-cell priority is bounded by the same refresh budget and does not
+    // change LRU behavior once the current clipmap footprint is populated.
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b)
               {
+                  if (a.allocated != b.allocated) return !a.allocated;
                   if (a.score != b.score) return a.score > b.score;
                   if (a.level != b.level) return a.level < b.level;
                   if (a.cell.x != b.cell.x) return a.cell.x < b.cell.x;
@@ -937,10 +964,77 @@ inline const std::vector<LumenRadianceCache::RadianceCacheRefreshRequest>& Lumen
                   return a.slot < b.slot;
               });
 
-    // 3. Take the first mRefreshBudgetPerFrame candidates; allocate slots for empty cells.
-    const size_t n = std::min(candidates.size(), static_cast<size_t>(mRefreshBudgetPerFrame));
-    for (size_t i = 0; i < n; ++i)
+    // 3. Reserve one candidate per clipmap level when the budget allows it.
+    // A pure global score can keep selecting level-0/near static cells while a
+    // cold level remains completely unpopulated; the GPU then reports valid
+    // producer work but zero query attempts for that level. The reservation is
+    // bounded (at most one slot per level), deterministic, and only applies
+    // when the frame budget can cover every level. The remaining budget keeps
+    // the original score/tie-break ordering.
+    const size_t budget = std::min(candidates.size(), static_cast<size_t>(mRefreshBudgetPerFrame));
+    std::vector<uint8_t> reserved(candidates.size(), uint8_t(0));
+    size_t reservedCount = 0;
+    if (mRefreshBudgetPerFrame >= mLevelCount)
     {
+        for (uint32_t level = 0; level < mLevelCount; ++level)
+        {
+            size_t selected = candidates.size();
+            // Prefer a cold cell so the reservation creates ownership instead
+            // of repeatedly refreshing an already allocated slot.
+            for (size_t i = 0; i < candidates.size(); ++i)
+            {
+                if (!reserved[i] && candidates[i].level == level && !candidates[i].allocated)
+                {
+                    selected = i;
+                    break;
+                }
+            }
+            if (selected == candidates.size())
+            {
+                for (size_t i = 0; i < candidates.size(); ++i)
+                {
+                    if (!reserved[i] && candidates[i].level == level)
+                    {
+                        selected = i;
+                        break;
+                    }
+                }
+            }
+            if (selected != candidates.size())
+            {
+                reserved[selected] = uint8_t(1);
+                ++reservedCount;
+            }
+        }
+    }
+
+    std::vector<uint8_t> selected(candidates.size(), uint8_t(0));
+    size_t selectedCount = 0;
+    for (size_t i = 0; i < candidates.size() && selectedCount < budget; ++i)
+    {
+        if (reserved[i] || selectedCount + (reservedCount - selectedCount) >= budget)
+        {
+            selected[i] = uint8_t(1);
+            ++selectedCount;
+        }
+    }
+    // Fill any remaining budget in the original sorted order. This second pass
+    // is intentionally separate so the reservation cannot reorder ties or
+    // make allocation/reuse behavior depend on hash/container iteration.
+    for (size_t i = 0; i < candidates.size() && selectedCount < budget; ++i)
+    {
+        if (!selected[i])
+        {
+            selected[i] = uint8_t(1);
+            ++selectedCount;
+        }
+    }
+
+    for (size_t i = 0; i < candidates.size() && selectedCount > 0; ++i)
+    {
+        if (!selected[i])
+            continue;
+        --selectedCount;
         Candidate& c = candidates[i];
         uint32_t slot = c.slot;
         bool isNew = false;
@@ -1024,6 +1118,9 @@ inline LumenRadianceCache::RadianceCacheQueryResult LumenRadianceCache::query(co
             anyExpired = true;
         }
         ++result.allocatedCornerCount;
+        // Query consumption is usage feedback for the CPU contract. The field is mutable
+        // so a const query can still update the LRU timestamp without changing payload.
+        mSlots[slot].lastUsedFrame = mFrameIndex;
         const float wi = w[i];
         wx += wi * s.radiance[0];
         wy += wi * s.radiance[1];
@@ -1241,6 +1338,7 @@ inline uint32_t LumenRadianceCache::allocateSlot(uint32_t level, const index3& c
     s.directionEncoding = kRadianceCacheInvalidDirectionEncoding;
     s.confidence = 0.f;
     s.lastUpdateFrame = 0;
+    s.lastUsedFrame = 0;
     s.level = level;
     s.cell = cell;
     s.visibilityWeight = 1.f;
@@ -1321,10 +1419,12 @@ inline uint32_t LumenRadianceCache::findEvictionCandidate() const
         {
             continue;
         }
-        // Strict '<' keeps the smallest slot ID as the tie-break (deterministic).
-        if (s.lastUpdateFrame < oldest)
+        // Prefer least recently used consumption, falling back to update age for probes
+        // that have never been queried. Strict '<' keeps the smallest slot ID as tie-break.
+        const uint64_t usedFrame = s.lastUsedFrame > 0 ? s.lastUsedFrame : s.lastUpdateFrame;
+        if (usedFrame < oldest)
         {
-            oldest = s.lastUpdateFrame;
+            oldest = usedFrame;
             best = static_cast<uint32_t>(i);
         }
     }

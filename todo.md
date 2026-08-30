@@ -3,6 +3,7 @@
 > [!IMPORTANT]
 > **当前唯一权威执行计划：[`docs/LumenGI_Production_Chain_Closure_Plan.md`](docs/LumenGI_Production_Chain_Closure_Plan.md)。**
 > 目标仍是实现借鉴 UE5 Lumen 公开架构思想的实时动态 GI；本次调整的是生产主链闭环、完成定义和执行顺序，不是把项目改成离线渲染或普通 HWRT 降噪器。
+> **UE5.8 参考对齐计划：[`docs/LumenGI_UE5.8_Reference_Optimization_Plan.md`](docs/LumenGI_UE5.8_Reference_Optimization_Plan.md)。** 该文档记录 `F:\UE_5.8` CodeGraph 初始化状态、源码契约、C4 Trace Router 优先级、C0-C12 依赖和 Luna 接手提示。
 
 > [!WARNING]
 > **当前权威状态以本节和上述生产主链计划为准。** 本文件后半部分保留的 2026-08-09 状态、Gate 结论、下一步和 agent 分工均为历史记录，仅用于追溯证据；即使旧段落写有“Gate 已关闭”“下一步”或可直接复制的开场指令，也不得据此跳过新的 C0→C12 执行顺序。
@@ -345,3 +346,45 @@ tools\.packman\cmake\bin\cmake.exe --build build\windows-vs2022 `
 - C8/C9: mark-on/export equivalence PASS for both filter policies in `artifacts/lumengi/C8/export-equivalence-20260811d/export-equivalence.json`; mark-off cases are correctly `BLOCKED` because direct production endpoints are unavailable without graph marking. Sentinel data is diagnostic only; `finalColor` is still SKIP.
 - Host fix: GDF sphere trace now receives logical frame dimensions; rerun only after compose dispatch is fixed.
 - Latest GPU evidence: fresh R32Float atlas build still returns `E_INVALIDARG` in `artifacts/lumengi/C4/r32-verified-20260811.log`; E1/E2 compile PASS is recorded in `artifacts/lumengi/C4/gdf-diag-compile-20260811d.json` (the harness then hits shutdown-only DXGI_DEVICE_REMOVED). C7 history/count is finite and monotonic in `artifacts/lumengi/C7/probe-direction-union-20260811/probe-direction-union.json`, while `directionUnionGate=SKIP` until sample identity telemetry exists.
+
+### Runtime evidence delta (2026-08-22)
+
+- Live renderer provenance is now available through `m.device.info` after the
+  additive Mogwai binding and Release rebuild. The 60-second smoke is a
+  provenance PASS, not a soak result.
+- C9 same-frame endpoint/resource invariance is `PASS_BOUNDED`; strict
+  recompiled export equivalence remains `FAIL/OPEN` at the frozen error limits.
+- S2 30-minute dynamic churn completed, but the 2-hour churn failed at
+  `m.renderFrame()` with `MemoryError: bad allocation` after approximately
+  422.6 seconds. This is a renderer resource-lifetime blocker; do not lower
+  mutation cadence or mark the soak complete.
+- Keep the final completion checklist below intentionally unmarked until the
+  renderer lifetime issue, C9 strict equivalence, production rough/transmission
+  paths, and the remaining release matrix are closed with authoritative evidence.
+
+### Runtime evidence delta (2026-08-12)
+
+- C4 E1 passes with host wiring and a fresh binary: `artifacts/lumengi/C4/E1-20260812/mogwai.log`.
+- C4 E2 full descriptors and production compose still fail `E_INVALIDARG`; valid production groups `(8,1,512)` are logged in `artifacts/lumengi/C4/production-20260812/mogwai.log`.
+- E2a CB+GDF buffers and E2b atlas/scalars pass independently (`artifacts/lumengi/C4/E2a-20260812b/gdf-diagnostic.json`, `artifacts/lumengi/C4/E2b-20260812/gdf-diagnostic.json`). Keep C4/C5 BLOCKED and debug the combined descriptor/root contract next.
+- C8 sentinel BlitPass outputs are now explicitly `RGBA16Float`; mark-off direct endpoints remain a documented API BLOCKED case, not a GI failure.
+
+### Runtime evidence delta (2026-08-12b)
+
+- E2d confirms the failing boundary is explicit compose CB plus a global uniform
+  (`artifacts/lumengi/C4/E2d-20260812b/mogwai.log`).
+- Moving all atlas scalars into `LumenGDFComposeCB` fixes the production compose
+  dispatch; both GDF levels complete at `(8,1,512)` in
+  `artifacts/lumengi/C4/production-cbfix-20260812/mogwai.log`.
+- C4 is now “compose dispatch fixed, Trace Router gate open”; C5 Hybrid and
+  C10-C12 remain blocked by the missing end-to-end backend evidence.
+
+### Runtime evidence delta (2026-08-30)
+
+- [ ] S2 strict two-hour churn remains BLOCKED after v4 `MemoryError: bad allocation`
+  (~422.6s). Material-only 1200s/72k-frame isolation passed; scene replacement
+  now fences before/after release in `Source/Mogwai/Mogwai.cpp`. Re-run the
+  authoritative launcher with unchanged cadence and thresholds; require a
+  complete post-fix child artifact before changing the gate.
+- [ ] C9 strict export equivalence remains OPEN/FAIL at the frozen mean/max
+  bounds; `PASS_BOUNDED` same-frame retention is not a substitute.

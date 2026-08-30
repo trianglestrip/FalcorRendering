@@ -161,8 +161,17 @@ namespace Mogwai
         const std::string outputName = pGraph->getOutputName(outputIndex);
         const std::string basename = getOutputNamePrefix(outputName) + std::to_string(mpRenderer->getGlobalClock().getFrame());
 
-        const ref<Texture> pOutput = pGraph->getOutput(outputIndex)->asTexture();
-        if (!pOutput) FALCOR_THROW("Graph output {} is not a texture", outputName);
+        const ref<Resource> pResource = pGraph->getOutput(outputIndex);
+        const ref<Texture> pOutput = pResource ? pResource->asTexture() : nullptr;
+        if (!pOutput)
+        {
+            // captureAllOutputs may temporarily mark diagnostic raw-buffer outputs (for
+            // example LumenGI producer-validity sidecars). FrameCapture currently writes
+            // texture/image files only; skip such resources and leave them to their dedicated
+            // readback gate instead of failing the entire texture capture transaction.
+            logWarning("Graph output {} is not a texture; skipping image capture.", outputName);
+            return;
+        }
 
         const ResourceFormat format = pOutput->getFormat();
         const uint32_t channels = getFormatChannelCount(format);

@@ -171,7 +171,7 @@
 // overridable by the host through the same define. Used as the firefly clamp
 // default (gFireflyMaxRadiance) and to sanitize the output.
 #ifndef LUMEN_GI_MAX_RADIANCE
-#define LUMEN_GI_MAX_RADIANCE 10000.f
+#define LUMEN_GI_MAX_RADIANCE 10.f
 #endif
 
 /** Minimum accumulated validation weight for a history gather to be accepted.
@@ -194,7 +194,7 @@ cbuffer LumenTemporalFilterCB
     uint   gFrameIndex;              // +8   Frame index (diagnostics / reserved).
     uint   gClampHistory;            // +12  != 0: AABB-clamp history RGB to the current 3x3 neighborhood (TAA anti-ghost). Default 1.
     float  gHistoryAlpha;            // +16  Base EMA weight toward the current frame (0.1). Larger = faster, noisier.
-    float  gHistoryLengthCap;        // +20  Cap for the output history length (255). Prevents overflow (task §10 gate).
+    float  gHistoryLengthCap;        // +20  Cap for the output history length (UE-style default 10).
     float  gClampBoxMargin;          // +24  AABB clamp margin as a fraction of the neighborhood range (0.0 = exact min/max).
     float  gDepthThreshold;          // +28  Meters; |curZ - prevZ| dead zone below which depthW = 1 (0.05).
     float  gDepthSigmaInv;           // +32  1/meters; depthW exponential falloff rate beyond the dead zone (8.0).
@@ -207,7 +207,7 @@ cbuffer LumenTemporalFilterCB
     float  gMaxRejectAlpha;          // +60  Blend alpha used on disocclusion / soft reject (1.0 = use the current frame immediately).
     float  gMotionVectorScale;       // +64  Multiplies the motion vector before reprojection (1.0 = Falcor normalized convention).
     float  gMotionLengthThreshold;   // +68  Hard reject when |mvec| exceeds this (normalized units, 0.5 = half screen). 0 disables.
-    float  gFireflyMaxRadiance;      // +72  Firefly ceiling on the output RGB (default LUMEN_GI_MAX_RADIANCE = 10000).
+    float  gFireflyMaxRadiance;      // +72  Firefly ceiling on the output RGB (default LUMEN_GI_MAX_RADIANCE = 10).
     float2 gInvFrameDim;             // +76  1 / frame dims (UV math).
     uint   gPad0;                    // +84
     uint   gPad1;                    // +88

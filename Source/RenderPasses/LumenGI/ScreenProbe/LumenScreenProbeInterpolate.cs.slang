@@ -236,6 +236,19 @@ float4 lumenScreenProbeInterpRadiance(const LumenScreenProbeMeta meta)
     return gProbeRadiance[p];
 }
 
+// The probe metadata's `active` bit only says that a surface exists at the
+// probe location.  It does not say that integration produced a usable record:
+// a budget-skipped probe, a miss-only probe, or a non-finite write can still be
+// active.  Use confidence as the validity sentinel and deliberately do not
+// inspect RGB, so a valid black radiance sample is retained.
+static const float kLumenScreenProbeInterpValidityEpsilon = 1e-4f;
+
+bool lumenScreenProbeInterpRecordIsValid(const float4 record)
+{
+    return !any(isnan(record)) && !any(isinf(record)) &&
+           record.a > kLumenScreenProbeInterpValidityEpsilon;
+}
+
 /** Direct sample of the nearest valid probe for the degraded path. Returns
  *  false when no valid probe exists within the search radius.
  *
@@ -274,7 +287,8 @@ bool lumenScreenProbeFindNearestValid(
         if (!lumenScreenProbeClampCoord(baseCoord + taps[i], c))
             continue;
         const uint idx = lumenScreenProbeIndex(c, gProbeGridDim.x);
-        if (gProbeMeta[idx].active != 0u && is_valid(gProbeRadiance))
+        if (gProbeMeta[idx].active != 0u && is_valid(gProbeRadiance) &&
+            lumenScreenProbeInterpRecordIsValid(lumenScreenProbeInterpRadiance(gProbeMeta[idx])))
         {
             if (tapW[i] > bestTapW)
             {
@@ -308,7 +322,8 @@ bool lumenScreenProbeFindNearestValid(
             if (lumenScreenProbeClampCoord(cand, c))
             {
                 const uint idx = lumenScreenProbeIndex(c, gProbeGridDim.x);
-                if (gProbeMeta[idx].active != 0u)
+                if (gProbeMeta[idx].active != 0u && is_valid(gProbeRadiance) &&
+                    lumenScreenProbeInterpRecordIsValid(lumenScreenProbeInterpRadiance(gProbeMeta[idx])))
                 {
                     probeIndex = idx;
                     distW = 0.f;
@@ -320,7 +335,8 @@ bool lumenScreenProbeFindNearestValid(
             if (lumenScreenProbeClampCoord(cand, c))
             {
                 const uint idx = lumenScreenProbeIndex(c, gProbeGridDim.x);
-                if (gProbeMeta[idx].active != 0u)
+                if (gProbeMeta[idx].active != 0u && is_valid(gProbeRadiance) &&
+                    lumenScreenProbeInterpRecordIsValid(lumenScreenProbeInterpRadiance(gProbeMeta[idx])))
                 {
                     probeIndex = idx;
                     distW = 0.f;
@@ -332,7 +348,8 @@ bool lumenScreenProbeFindNearestValid(
             if (s > -r && s < r && lumenScreenProbeClampCoord(cand, c))
             {
                 const uint idx = lumenScreenProbeIndex(c, gProbeGridDim.x);
-                if (gProbeMeta[idx].active != 0u)
+                if (gProbeMeta[idx].active != 0u && is_valid(gProbeRadiance) &&
+                    lumenScreenProbeInterpRecordIsValid(lumenScreenProbeInterpRadiance(gProbeMeta[idx])))
                 {
                     probeIndex = idx;
                     distW = 0.f;
@@ -344,7 +361,8 @@ bool lumenScreenProbeFindNearestValid(
             if (s > -r && s < r && lumenScreenProbeClampCoord(cand, c))
             {
                 const uint idx = lumenScreenProbeIndex(c, gProbeGridDim.x);
-                if (gProbeMeta[idx].active != 0u)
+                if (gProbeMeta[idx].active != 0u && is_valid(gProbeRadiance) &&
+                    lumenScreenProbeInterpRecordIsValid(lumenScreenProbeInterpRadiance(gProbeMeta[idx])))
                 {
                     probeIndex = idx;
                     distW = 0.f;
@@ -422,6 +440,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 continue;
 
             const float4 pr = lumenScreenProbeInterpRadiance(meta);
+            // Do not let an active-but-invalid probe consume interpolation weight.
+            // Valid black radiance is retained because validity is confidence-based,
+            // not an RGB>0 test.
+            if (!lumenScreenProbeInterpRecordIsValid(pr))
+                continue;
             accRadiance += w * pr.rgb;
             accConfidence += w * saturate(pr.a);
             accWeight += w;

@@ -407,7 +407,7 @@ public:
         uint32_t frameDim[2] = { 0u, 0u };       // +0
         uint32_t filterEnabled = 1u;             // +8
         uint32_t fireflyClamp = 1u;              // +12
-        float fireflyMaxRadiance = 10000.f;      // +16
+        float fireflyMaxRadiance = 10.f;         // +16; UE Lumen-style max ray intensity guard.
         float fireflyStdDevFactor = 4.0f;        // +20
         float varianceThresholdLow = 0.01f;      // +24
         float varianceThresholdHigh = 0.25f;     // +28

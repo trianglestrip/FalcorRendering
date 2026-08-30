@@ -18,6 +18,7 @@ target_sources(LumenGI PRIVATE
     SurfaceCache/LumenSurfaceCache.h
     Capture/LumenCardCaptureData.slang
     Capture/LumenCardCapture.3d.slang
+    Capture/LumenSurfaceCachePageClear.cs.slang
     ScreenTrace/LumenScreenTraceData.slang
     ScreenTrace/LumenScreenTrace.cs.slang
     ScreenTrace/LumenHZB.h
@@ -25,6 +26,7 @@ target_sources(LumenGI PRIVATE
     ScreenProbe/LumenScreenProbe.h
     ScreenProbe/LumenScreenProbeData.slang
     ScreenProbe/LumenScreenProbeTrace.cs.slang
+    ScreenProbe/LumenScreenRadianceHistory.cs.slang
     ScreenProbe/LumenScreenProbeIntegrate.cs.slang
     ScreenProbe/LumenScreenProbeInterpolate.cs.slang
     Temporal/LumenTemporalFilterData.slang
@@ -33,6 +35,15 @@ target_sources(LumenGI PRIVATE
     Spatial/LumenSpatialFilter.cs.slang
     Spatial/LumenReconstruction.h
     Resolve/LumenFinalResolve.cs.slang
+    RadianceCache/LumenRadianceCache.h
+    RadianceCache/LumenRadianceCacheData.slang
+    RadianceCache/LumenRadianceCacheTrace.cs.slang
+    RadianceCache/LumenRadianceCacheInterpolate.cs.slang
+    RoughSpecular/LumenRoughSpecularData.slang
+    RoughSpecular/LumenRoughSpecularIndirect.cs.slang
+    RoughSpecular/LumenRoughSpecularTrace.cs.slang
+    Transmission/LumenTransmissionData.slang
+    Transmission/LumenTransmissionDiagnostic.cs.slang
     MeshSDF/LumenMeshSDF.h
     MeshSDF/LumenMeshSDFCache.h
     MeshSDF/LumenMeshSDFAtlas.h
@@ -46,6 +57,10 @@ target_sources(LumenGI PRIVATE
     MeshSDF/LumenGDFCompose.cs.slang
     MeshSDF/LumenGDFComposeDiag.cs.slang
     MeshSDF/LumenGDFComposeDiagAll.cs.slang
+    MeshSDF/LumenGDFComposeDiagBuffers.cs.slang
+    MeshSDF/LumenGDFComposeDiagAtlas.cs.slang
+    MeshSDF/LumenGDFComposeDiagBuffersScalar.cs.slang
+    MeshSDF/LumenGDFComposeDiagCBScalar.cs.slang
     MeshSDF/LumenGDFSphereTrace.3d.slang
     MeshSDF/LumenGDFTrace.cs.slang
 )

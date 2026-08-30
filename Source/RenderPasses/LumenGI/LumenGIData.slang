@@ -54,14 +54,13 @@ static const float kLumenGIMissHitDistance = 65504.f;
 /** Per-sample radiance ceiling applied per RGB component before any output
     write. Samples above the ceiling are clamped and counted as fireflies.
 
-    The default of 10000 is far above the typical single-bounce secondary-hit
-    signal in Falcor demo scenes (analytic light intensities are <= 1e4, and
-    the diffuse NEE estimator is bounded by the emitted radiance for area
-    lights), so only genuine outliers are affected. The host may override the
-    value through the LUMEN_GI_MAX_RADIANCE define.
+    The default follows UE Lumen's Screen Probe max-ray-intensity guard: a
+    bounded 10-unit per-channel ceiling prevents one emissive or analytic-light
+    sample from dominating a realtime frame. The host may override the value
+    through the LUMEN_GI_MAX_RADIANCE define.
 */
 #ifndef LUMEN_GI_MAX_RADIANCE
-#define LUMEN_GI_MAX_RADIANCE 10000.f
+#define LUMEN_GI_MAX_RADIANCE 10.f
 #endif
 static const float kLumenGIMaxRadiance = LUMEN_GI_MAX_RADIANCE;
 

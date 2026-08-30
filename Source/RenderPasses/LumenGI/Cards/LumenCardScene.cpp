@@ -32,9 +32,62 @@
 #include "Scene/Scene.h"
 #include "Scene/Animation/AnimationController.h"
 #include <algorithm>
+#include <cmath>
 
 namespace
 {
+struct LumenCardBounds
+{
+    Falcor::float3 minPoint;
+    Falcor::float3 maxPoint;
+    Falcor::float3 center;
+    Falcor::float3 extent;
+};
+
+bool isFinite(const Falcor::float3& value)
+{
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+/**
+ * Build the bounds consumed by the card capture/grid paths.
+ *
+ * A planar quad has a valid, non-zero-area AABB with one zero (or sub-minimum)
+ * axis. Keep line/point bounds excluded by requiring at least two axes to have
+ * a meaningful extent, then pad only the thin axis so min/max/center/extent
+ * describe one consistent thin slab. The instance's raw AABB remains separate
+ * and is still used for change detection.
+ */
+bool computeCardBounds(const Falcor::AABB& worldBounds, LumenCardBounds& cardBounds)
+{
+    if (!worldBounds.valid() || !isFinite(worldBounds.minPoint) || !isFinite(worldBounds.maxPoint))
+        return false;
+
+    const Falcor::float3 rawExtent = worldBounds.extent();
+    if (!isFinite(rawExtent))
+        return false;
+
+    const uint32_t nonThinAxes = (rawExtent.x >= kLumenCardMinExtent ? 1u : 0u) +
+        (rawExtent.y >= kLumenCardMinExtent ? 1u : 0u) +
+        (rawExtent.z >= kLumenCardMinExtent ? 1u : 0u);
+    if (nonThinAxes < 2u)
+        return false;
+
+    const Falcor::float3 extent{
+        std::max(rawExtent.x, kLumenCardMinExtent),
+        std::max(rawExtent.y, kLumenCardMinExtent),
+        std::max(rawExtent.z, kLumenCardMinExtent),
+    };
+    const Falcor::float3 center = worldBounds.center();
+    const Falcor::float3 halfExtent = extent * 0.5f;
+
+    cardBounds.center = center;
+    cardBounds.extent = extent;
+    cardBounds.minPoint = center - halfExtent;
+    cardBounds.maxPoint = center + halfExtent;
+    return true;
+}
+
 /** Capture priority of a card face: the world-space area of the box face the card
     covers, i.e. the product of the two AABB extents perpendicular to the face normal.
     Clamped to a positive floor so every supported card has a usable priority.
@@ -197,10 +250,8 @@ void LumenCardScene::rebuild()
             else
             {
                 const Falcor::AABB worldBounds = pScene->getMeshBounds(instance.geometryID).transform(transform);
-                const Falcor::float3 extent = worldBounds.extent();
-                const bool degenerate = !worldBounds.valid() ||
-                    extent.x < kLumenCardMinExtent || extent.y < kLumenCardMinExtent || extent.z < kLumenCardMinExtent;
-                if (degenerate)
+                LumenCardBounds cardBounds;
+                if (!computeCardBounds(worldBounds, cardBounds))
                 {
                     record.unsupportedReasons |= (uint32_t)LumenCardUnsupportedReason::DegenerateBounds;
                 }
@@ -216,11 +267,11 @@ void LumenCardScene::rebuild()
                         card.instanceID = sceneInstanceID;
                         card.faceIndex = faceIndex;
                         card.dirtyFlags = (uint32_t)LumenCardDirtyFlags::Bounds | (uint32_t)LumenCardDirtyFlags::Material;
-                        card.boundsMin = Falcor::float4(worldBounds.minPoint, 0.f);
-                        card.boundsMax = Falcor::float4(worldBounds.maxPoint, 0.f);
-                        card.center = Falcor::float4(worldBounds.center(), 0.f);
-                        card.extent = Falcor::float4(extent, 0.f);
-                        card.priority = computeCardPriority(faceIndex, extent);
+                        card.boundsMin = Falcor::float4(cardBounds.minPoint, 0.f);
+                        card.boundsMax = Falcor::float4(cardBounds.maxPoint, 0.f);
+                        card.center = Falcor::float4(cardBounds.center, 0.f);
+                        card.extent = Falcor::float4(cardBounds.extent, 0.f);
+                        card.priority = computeCardPriority(faceIndex, cardBounds.extent);
                         mCards.push_back(card);
                     }
                 }
@@ -264,17 +315,20 @@ void LumenCardScene::recomputeInstanceBounds()
         if (!matrixChanged && worldBounds == record.worldBounds)
             continue;
 
+        LumenCardBounds cardBounds;
+        if (!computeCardBounds(worldBounds, cardBounds))
+            continue;
+
         record.worldBounds = worldBounds;
         record.worldTransform = transform;
-        const Falcor::float3 extent = worldBounds.extent();
         for (uint32_t faceIndex = 0; faceIndex < kLumenCardFaceCount; ++faceIndex)
         {
             LumenCard& card = mCards[record.firstCardIndex + faceIndex];
-            card.boundsMin = Falcor::float4(worldBounds.minPoint, 0.f);
-            card.boundsMax = Falcor::float4(worldBounds.maxPoint, 0.f);
-            card.center = Falcor::float4(worldBounds.center(), 0.f);
-            card.extent = Falcor::float4(extent, 0.f);
-            card.priority = computeCardPriority(faceIndex, extent);
+            card.boundsMin = Falcor::float4(cardBounds.minPoint, 0.f);
+            card.boundsMax = Falcor::float4(cardBounds.maxPoint, 0.f);
+            card.center = Falcor::float4(cardBounds.center, 0.f);
+            card.extent = Falcor::float4(cardBounds.extent, 0.f);
+            card.priority = computeCardPriority(faceIndex, cardBounds.extent);
             card.dirtyFlags |= (uint32_t)LumenCardDirtyFlags::Bounds;
         }
     }

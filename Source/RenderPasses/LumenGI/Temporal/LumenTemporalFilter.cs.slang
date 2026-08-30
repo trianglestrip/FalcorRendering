@@ -341,7 +341,13 @@ bool lumenTemporalCurrentNeighborhoodBox(
                 continue;
             if (!is_valid(gCurrent))
                 continue;
-            const float3 gi = lumenTemporalSanitize(gCurrent.Load(int3(p, 0)).rgb);
+            const float4 current = gCurrent.Load(int3(p, 0));
+            // Do not let an unproduced/zero-confidence probe participate in the AABB clamp.
+            // Otherwise its sanitized zero pulls valid history toward black and creates tile
+            // shaped holes.  RGB may legitimately be black; confidence is the validity sentinel.
+            if (any(isnan(current)) || any(isinf(current)) || current.a <= 1e-4f)
+                continue;
+            const float3 gi = lumenTemporalSanitize(current.rgb);
             boxMin = min(boxMin, gi);
             boxMax = max(boxMax, gi);
             found = true;

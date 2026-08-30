@@ -38,6 +38,28 @@
 #ifndef LUMEN_GI_PROBE_HISTORY
 #define LUMEN_GI_PROBE_HISTORY 0
 #endif
+#ifndef is_valid_gScreenRadianceHistory
+#define is_valid_gScreenRadianceHistory 0
+#endif
+#ifndef is_valid_gScreenRadianceHistoryValidity
+#define is_valid_gScreenRadianceHistoryValidity 0
+#endif
+#ifndef is_valid_gProbeValidity
+#define is_valid_gProbeValidity 0
+#endif
+#ifndef is_valid_gProbeCacheFeedback
+#define is_valid_gProbeCacheFeedback 0
+#endif
+#ifndef is_valid_gProbeCacheRequests
+#define is_valid_gProbeCacheRequests 0
+#endif
+#ifndef LUMEN_GI_PROBE_GDF_ROUTE
+#define LUMEN_GI_PROBE_GDF_ROUTE 0
+#endif
+#if LUMEN_GI_PROBE_GDF_ROUTE
+#include "../MeshSDF/LumenGDFData.slang"
+#include "../MeshSDF/LumenGDFSphereTrace.3d.slang"
+#endif
 
 /** Frozen data contract for the S4.2 screen probe gather (S4-A2/B2, Agent Z1).
  *
@@ -128,9 +150,9 @@ static const uint kLumenScreenProbeSeedDefault = 0x51B8DC0Du;      ///< Fixed ba
 static const uint kLumenScreenProbeMaxMipDefault = 12u;
 static const uint kLumenScreenProbeCounterCount = 8u;
 
-// LumenScreenProbeMeta.flags
+// LumenScreenProbeMeta.active / dirty
 static const uint kLumenScreenProbeMetaFlagActive = 1u << 0;  ///< linearZ at the probe > 0.
-static const uint kLumenScreenProbeMetaFlagDirty = 1u << 1;   ///< Depth moved by > gDepthChangeThreshold since last update.
+static const uint kLumenScreenProbeMetaFlagDirty = 1u << 1;   ///< Probe identity changed since last update.
 
 // LumenScreenProbeMeta.materialID: the GBuffer normWRoughnessMaterialID A channel carries a
 // 2-bit material ID (0..3). kLumenScreenProbeMaterialIDNone marks an unknown/unset material
@@ -153,12 +175,13 @@ static const uint kLumenProbeHitFlagHWRTMiss = 1u << 2;            ///< HWRT fal
 static const uint kLumenProbeHitFlagFallbackUnavailable = 1u << 3; ///< No scene/TLAS data (degraded fallback).
 static const uint kLumenProbeHitFlagRadianceReused = 1u << 4;      ///< Radiance sampled from per-pixel GI (S4.2 degradation).
 static const uint kLumenProbeHitFlagEnvironment = 1u << 5;         ///< Radiance is the environment.
+static const uint kLumenProbeHitFlagGDFHit = 1u << 6;              ///< GDF geometry hit routed into the probe record.
 
 ///< LumenScreenProbeMeta, 64 bytes, 16-byte aligned. Host mirror in LumenScreenProbe.h.
 struct LumenScreenProbeMeta
 {
     float2 screenPos;     ///< +0  Probe pixel (tile center texel + 0.5). Host-prefilled per resize.
-    uint   active;        ///< +8  kLumenScreenProbeMetaFlagActive.
+    uint   active;        ///< +8  kLumenScreenProbeMetaFlagActive (0/1).
     uint   lastUpdateFrame; ///< +12 Frame of the last trace (S5 history / age).
     float3 worldPos;      ///< +16 Probe world position (linearZ unprojection).
     uint   materialID;    ///< +28 GBuffer material ID (RGB10A2 A), reserved for S4.3 interpolation.
@@ -167,7 +190,7 @@ struct LumenScreenProbeMeta
     uint   age;           ///< +48 Frames since the last trace (frameIndex - lastUpdateFrame).
     uint   updateInterval; ///< +52 gUpdateInterval used for the last trace.
     uint   dirty;         ///< +56 kLumenScreenProbeMetaFlagDirty.
-    uint   flags;         ///< +60 Reserved (adaptive list, S4.3+).
+    uint   flags;         ///< +60 Reserved (adaptive list, S4.3+); never used for dirty.
 };
 // Layout verified by LumenScreenProbe::Meta (64 B, C++ static_assert) and tests/lumengi/run_screenprobe.py.
 
@@ -182,7 +205,7 @@ struct LumenProbeHit
 };
 // Layout verified by LumenScreenProbe::Hit (32 B, C++ static_assert) and tests/lumengi/run_screenprobe.py.
 
-///< LumenScreenProbeCounters, 32 bytes, one element. InterlockedAdd targets.
+///< LumenScreenProbeCounters, 112 bytes, one element. InterlockedAdd targets.
 struct LumenScreenProbeCounters
 {
     uint screenHits;          ///< +0  Screen-first confirmed hits.
@@ -193,8 +216,28 @@ struct LumenScreenProbeCounters
     uint inactiveProbes;      ///< +20 Probes with no surface this frame (per-probe count, dir 0 only).
     uint budgetSkipped;       ///< +24 Probes skipped by the update interval budget (dir 0 only).
     uint directionsTraced;    ///< +28 Total directions actually traced.
+    uint gdfHits;             ///< +32 Probe rays routed through GDF and hit geometry.
+    uint gdfMisses;           ///< +36 GDF was attempted but missed; HWRT fallback followed.
+    uint cacheLookupHits;     ///< +40 Probe directions whose hit lighting came from a valid Surface Cache page.
+    uint cacheLookupAttempts; ///< +44 Probe directions entering the Surface Cache lookup.
+    uint cachePageRejects;    ///< +48 Page ID/generation/state rejected.
+    uint cacheCoverageRejects;///< +52 Card plane/extent did not cover the hit position.
+    uint cacheMetadataRejects;///< +56 Card texel metadata was invalid/fallback.
+    uint cacheVisibilityRejects; ///< +60 Card texel visibility was zero/invalid.
+    uint historyAccepted;      ///< +64 Raw screen-radiance history accepted.
+    uint historyRejectDepth;   ///< +68 Previous/current depth mismatch.
+    uint historyRejectGuide;   ///< +72 Normal/material guide mismatch.
+    uint historyRejectMotion;  ///< +76 Reprojection outside the frame.
+    uint historyRejectLighting;///< +80 Lighting generation mismatch.
+    uint historyRejectCurrentInvalid;  ///< +84 Current raw radiance invalid.
+    uint historyRejectPreviousInvalid; ///< +88 Previous raw radiance invalid.
+    uint historyReset;         ///< +92 Hard reset or explicit reset reason.
+    uint cacheDepthRejects;    ///< +96 Face-depth/slab coverage rejects.
+    uint cacheAxisRejects;     ///< +100 Perpendicular card extent rejects.
+    uint cacheFacingRejects;   ///< +104 Card-facing rejects.
+    uint cacheOwnerValid;      ///< +108 Candidate with matching owner/page generation/state.
 };
-// Layout verified by LumenScreenProbe::Counters (32 B, C++ static_assert) and tests/lumengi/run_screenprobe.py.
+// Layout verified by LumenScreenProbe::Counters (112 B, C++ static_assert).
 
 /** Constant buffer filled by the host every dispatch. All values are named
     (set through the ShaderVar binding by both the C++ host and the Python
@@ -236,7 +279,18 @@ cbuffer LumenScreenProbeCB
     uint    gPad5;              // +168
     uint    gPad6;              // +172
     uint    gWeightMode;        // +176 S4.3 integrate weight mode (kLumenScreenProbeWeightMode*, 0 = cosine hemisphere default). Host-bound per dispatch; all pre-S4.3 offsets preserved.
-};  // 192 bytes (gWeightMode sits in the previously-padded tail).
+    uint    gHistoryGeneration; // +180 Producer history generation for the validity sidecar.
+    uint    gLightingGeneration;// +184 Lighting epoch for the validity sidecar.
+    uint    gResetReason;       // +188 History reset reason enum (0 = none).
+    uint    gValidityStride;    // +192 Fixed per-probe sidecar stride (32).
+    uint    gSurfaceCacheFrameIndex; // +196 Monotonic Surface Cache scheduler clock for page-ready fences.
+#if LUMEN_GI_PROBE_GDF_ROUTE
+    LumenGDFClipmapParams gGDFClipmap; // +208 GDF clipmap used by the probe router.
+    float   gGDFTraceMaxDistance;
+    uint    gGDFMaxSteps;
+    uint    gGDFRouteEnabled;
+#endif
+};  // 208 bytes with the appended Surface Cache clock; route variant appends GDF.
 
 /** Input / output resources. Optional ones are guarded by is_valid_* defines
     (all default 0). gProbeTLAS is only declared in the non-scene fallback mode.
@@ -250,17 +304,45 @@ Texture2D<float2> gLinearZ;
 Texture2D<float>  gHZBMips;
 Texture2D<float4> gNormalRoughnessMaterialID;
 Texture2D<float4> gDiffuseRadianceHitDist;
+#if is_valid_gScreenRadianceHistory
+Texture2D<float4> gScreenRadianceHistory;
+#endif
+#if is_valid_gScreenRadianceHistoryValidity
+Texture2D<uint> gScreenRadianceHistoryValidity;
+#endif
 Texture2D<float4> gScreenTraceResult;
+#if LUMEN_GI_PROBE_GDF_ROUTE
+Texture3D<float> gGDFLevels[kLumenGDFMaxLevels];
+StructuredBuffer<LumenGDFLevelParams> gGDFLevelTable;
+#endif
 #if !LUMEN_GI_PROBE_SCENE_TRACE
 RaytracingAccelerationStructure gProbeTLAS;
 #endif
 RWStructuredBuffer<LumenScreenProbeMeta> gProbeMeta;
 RWStructuredBuffer<LumenProbeHit> gProbeHitRecords;
 RWStructuredBuffer<LumenScreenProbeCounters> gProbeCounters;
+#if is_valid_gProbeCacheFeedback
+// C6.1 demand feedback: x = cache-hit count for the page, y = page generation
+// observed by the shader. Host validates both fields before touching the page.
+RWStructuredBuffer<uint2> gProbeCacheFeedback;
+#endif
+#if is_valid_gProbeCacheRequests
+// C6.2 demand requests: one entry per card; x = raw miss count, y = miss-reason bits.
+// Host validates the scene epoch and card index before enqueueing the request.
+RWStructuredBuffer<uint2> gProbeCacheRequests;
+#endif
 RWTexture2D<float4> gProbeRadiance;
 #if LUMEN_GI_PROBE_HISTORY
 RWTexture2D<float4> gProbeRadianceHistory;
 #endif
 RWStructuredBuffer<float4> gProbeDebug; // Optional (tests only): per-probe march diagnostics.
+#if is_valid_gProbeValidity
+// Per-direction validity sidecar: raw uint4 packed flags/backend, sample slot and
+// quantized direction fingerprint, producer frame, history generation, and probe
+// age. x bits 10..15 hold sampleIndex and bits 24..31 hold the 8-bit oct identity.
+// RenderPassReflection exposes this as a raw byte buffer, so use ByteAddressBuffer
+// stores rather than a structured-buffer view.
+RWByteAddressBuffer gProbeValidity;
+#endif
 
 #endif // __LUMEN_SCREEN_PROBE_DATA_SLANG__

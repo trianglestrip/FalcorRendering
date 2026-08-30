@@ -138,7 +138,12 @@ import RenderPasses.LumenGI.Capture.LumenCardCaptureData;
 #if LUMEN_GI_PROBE_CACHE_LOOKUP
 StructuredBuffer<LumenCard> gProbeCards;
 StructuredBuffer<uint> gProbeCardPageTable;
+StructuredBuffer<uint> gProbeCardPageGeneration;
+// pageID -> {allocator generation, page state, first frame visible to ScreenProbe, reserved}.
+StructuredBuffer<uint4> gProbePageMetadata;
+StructuredBuffer<uint> gProbeCardGrid;
 Texture2D<float4> gProbeRadianceAtlas;
+Texture2D<float4> gProbeMetadataAtlas;
 Texture2D<float> gProbeVisibilityAtlas;
 
 cbuffer LumenProbeCacheCB
@@ -146,47 +151,261 @@ cbuffer LumenProbeCacheCB
     uint gProbeCacheCardCount;
     uint gProbeCachePagesPerSide;
     uint2 gProbeCacheAtlasSize;
+    uint3 gProbeCacheGridDim;
+    uint gProbeCacheGridMaxCandidates;
+    float3 gProbeCacheGridMin;
+    float gProbeCacheGridPadding;
+    float3 gProbeCacheGridInvCellSize;
+    uint gProbeCacheGridCellStride;
+    uint gProbeCacheUseCardGrid;
 };
 
-bool tryLookupSurfaceCache(const float3 hitPosition, out float3 radiance, out float confidence)
+// The host continues to publish the grid and its telemetry, but acceleration
+// stays opt-in until a per-cell completeness/ordering proof is available.
+// Keeping this compile-time default at zero makes grid-on and grid-off use the
+// same deterministic authority path instead of merely relying on a runtime
+// branch with a different reduction schedule.
+#ifndef LUMEN_GI_CARD_GRID_ACCELERATION
+#define LUMEN_GI_CARD_GRID_ACCELERATION 0
+#endif
+
+bool tryLookupSurfaceCache(
+    const float3 hitPosition,
+    const float3 hitDirection,
+    out float3 radiance,
+    out float confidence,
+    out uint feedbackPageID,
+    out uint feedbackPageGeneration,
+    out uint requestCardID,
+    out uint requestReason
+)
 {
     radiance = float3(0.f);
     confidence = 0.f;
+    feedbackPageID = kInvalidPageID;
+    feedbackPageGeneration = 0u;
+    requestCardID = kLumenCardInvalidID;
+    requestReason = 0u;
     const float eps = 0.04f;
-    for (uint cardIndex = 0u; cardIndex < gProbeCacheCardCount; ++cardIndex)
+    const float3 rayDir = normalize(hitDirection);
+    float bestScore = -1.f;
+    float3 bestRadiance = float3(0.f);
+    float bestConfidence = 0.f;
+    uint bestPageID = kInvalidPageID;
+    uint bestPageGeneration = 0u;
+    float bestRequestScore = -1.f;
+    uint bestRequestCardID = kLumenCardInvalidID;
+    uint bestRequestReason = 0u;
+    bool found = false;
+    uint gridBase = 0u;
+    bool gridOverflow = false;
+    const bool useCardGrid = gProbeCacheUseCardGrid != 0u && LUMEN_GI_CARD_GRID_ACCELERATION != 0;
+    uint candidateCount = gProbeCacheCardCount;
+    if (useCardGrid)
     {
-        const uint pageID = gProbeCardPageTable[cardIndex];
-        if (pageID == kInvalidPageID)
+        const float3 gridCoord = (hitPosition - gProbeCacheGridMin) * gProbeCacheGridInvCellSize;
+        const int3 gridCellI = clamp(
+            int3(floor(gridCoord)), int3(0), int3(gProbeCacheGridDim) - int3(1)
+        );
+        const uint3 gridCell = uint3(gridCellI);
+        const uint gridCellIndex = (gridCell.z * gProbeCacheGridDim.y + gridCell.y) * gProbeCacheGridDim.x + gridCell.x;
+        gridBase = gridCellIndex * gProbeCacheGridCellStride;
+        const uint packedCandidateCount = gProbeCardGrid[gridBase];
+        gridOverflow = (packedCandidateCount & 0x80000000u) != 0u;
+        const uint boundedCandidateCount = packedCandidateCount & 0x7fffffffu;
+        candidateCount = gridOverflow
+            ? gProbeCacheCardCount
+            : min(boundedCandidateCount, gProbeCacheGridMaxCandidates);
+        // The bounded grid path is intentionally disabled until the host
+        // publishes a per-cell completeness proof. Even a cell whose list
+        // happens to contain all cards can take a different divergent shader
+        // path and change atomic/history reduction order between grid-on and
+        // grid-off runs. Keep the grid data/telemetry alive, but use the
+        // authoritative full-card scan for deterministic production output.
+        if (!gridOverflow)
+        {
+            gridOverflow = true;
+            candidateCount = gProbeCacheCardCount;
+        }
+    }
+    // A conservative grid is an acceleration structure, not a correctness
+    // fence. If its bounded cell list yields no valid page, retry once with
+    // the authoritative full-card scan so grid-on cannot drop a cache hit.
+    const uint gridCandidateCount = candidateCount;
+    for (uint gridPass = 0u; gridPass < 2u; ++gridPass)
+    {
+        if (gridPass == 1u &&
+            (!useCardGrid || gridOverflow || found))
+            break;
+        const uint passCandidateCount = gridPass == 0u ? gridCandidateCount : gProbeCacheCardCount;
+        for (uint candidateOrdinal = 0u; candidateOrdinal < passCandidateCount; ++candidateOrdinal)
+        {
+            const uint cardIndex = (!useCardGrid || gridOverflow || gridPass == 1u)
+                ? candidateOrdinal
+                : gProbeCardGrid[gridBase + 1u + candidateOrdinal];
+        if (cardIndex >= gProbeCacheCardCount)
             continue;
+        const uint pageID = gProbeCardPageTable[cardIndex];
+        const uint cardGeneration = gProbeCardPageGeneration[cardIndex];
+        const uint4 pageMetadata = pageID != kInvalidPageID ? gProbePageMetadata[pageID] : uint4(0u);
+        const uint pageGeneration = pageMetadata.x;
+        const uint pageState = pageMetadata.y;
+        const uint pageReadyFrame = pageMetadata.z;
+        const bool pageOwnerValid = pageID != kInvalidPageID && cardGeneration != 0u && pageGeneration != 0u &&
+            cardGeneration == pageGeneration && (pageState == 1u || pageState == 2u) &&
+            pageReadyFrame <= gSurfaceCacheFrameIndex;
         const LumenCard card = gProbeCards[cardIndex];
         const uint axis = lumenCardFaceAxis(card.faceIndex);
         const bool positive = lumenCardFaceIsPositive(card.faceIndex);
         const float3 extent = max(card.extent, float3(1e-5f));
         const float3 local = hitPosition - card.center;
-        const float plane = positive ? 0.5f * lumenCardComponent(extent, axis)
-                                     : -0.5f * lumenCardComponent(extent, axis);
-        if (abs(lumenCardComponent(local, axis) - plane) > eps)
+        const float halfAxis = 0.5f * lumenCardComponent(extent, axis);
+        const float axisCoord = lumenCardComponent(local, axis);
+        // A card is captured from the AABB face, but the actual mesh surface
+        // can be behind that face by an arbitrary capture depth. Treat the
+        // axis as a slab instead of requiring the hit to lie on the exact
+        // AABB plane; this is the missing per-face refinement in the MVP card
+        // representation. The face orientation and depth still reject points
+        // outside the card volume.
+        const float faceDepth = positive ? halfAxis - axisCoord : axisCoord + halfAxis;
+        if (faceDepth < -eps || faceDepth > 2.f * halfAxis + eps)
+        {
+            InterlockedAdd(gProbeCounters[0].cacheCoverageRejects, 1u);
+            InterlockedAdd(gProbeCounters[0].cacheDepthRejects, 1u);
             continue;
+        }
         const uint2 axes = lumenCardFacePerpendicularAxes(card.faceIndex);
         if (abs(lumenCardComponent(local, axes.x)) > 0.5f * lumenCardComponent(extent, axes.x) + eps ||
             abs(lumenCardComponent(local, axes.y)) > 0.5f * lumenCardComponent(extent, axes.y) + eps)
+        {
+            InterlockedAdd(gProbeCounters[0].cacheCoverageRejects, 1u);
+            InterlockedAdd(gProbeCounters[0].cacheAxisRejects, 1u);
             continue;
+        }
 
         float3 viewDir, right, up;
         lumenCardFaceBasis(card.faceIndex, viewDir, right, up);
+        // The probe ray points toward the card; compare against the incident
+        // view direction used by the capture convention.
+        const float facing = dot(-rayDir, viewDir);
+        if (facing <= 0.01f)
+        {
+            InterlockedAdd(gProbeCounters[0].cacheCoverageRejects, 1u);
+            InterlockedAdd(gProbeCounters[0].cacheFacingRejects, 1u);
+            continue;
+        }
+        InterlockedAdd(gProbeCounters[0].cacheOwnerValid, pageOwnerValid ? 1u : 0u);
         const float halfW = 0.5f * lumenCardComponent(extent, axes.x);
         const float halfH = 0.5f * lumenCardComponent(extent, axes.y);
+        const float requestScore = facing / max(1.f + faceDepth, 1e-3f);
+        if (!pageOwnerValid)
+        {
+            if (!found && requestScore > bestRequestScore)
+            {
+                bestRequestScore = requestScore;
+                bestRequestCardID = cardIndex;
+                bestRequestReason = pageID == kInvalidPageID ? 1u : 2u; // unmapped / stale owner
+            }
+            InterlockedAdd(gProbeCounters[0].cachePageRejects, 1u);
+            continue;
+        }
         const float2 uv = saturate(float2(dot(local, right) / max(halfW, 1e-5f), dot(local, up) / max(halfH, 1e-5f)) * 0.5f + 0.5f);
         const uint2 origin = lumenCardPageTexelOrigin(pageID, gProbeCachePagesPerSide);
         const uint2 texel = min(origin + uint2(uv * float(kLumenSurfaceCacheTileSize - 1u)), gProbeCacheAtlasSize - 1u);
-        const float vis = saturate(gProbeVisibilityAtlas[texel]);
-        if (vis <= 0.f)
+        const uint2 pageMax = min(
+            origin + uint2(kLumenSurfaceCacheTileSize - 1u),
+            gProbeCacheAtlasSize - 1u);
+        uint2 selectedTexel = texel;
+        uint selectedMetadataFlags = uint(gProbeMetadataAtlas[texel].g);
+        float selectedVisibility = saturate(gProbeVisibilityAtlas[texel]);
+        const bool exactMetadataValid =
+            (selectedMetadataFlags & kLumenCardMetadataFlagValid) != 0u &&
+            (selectedMetadataFlags & kLumenCardMetadataFlagFallbackAny) == 0u;
+        bool anyMetadataValid = exactMetadataValid;
+        bool selectedVisible = exactMetadataValid && selectedVisibility > 0.f;
+
+        // Capture can leave a single texel invalid (or visibility-unready) at a
+        // page boundary even though the page owner/generation is valid. Search
+        // only the bounded 3x3 neighborhood inside this same 16x16 page. This
+        // preserves all card/page/ generation/extent fences while avoiding a
+        // false miss caused by one uncovered raster texel; never cross into a
+        // neighboring page or use a fallback-marked texel.
+        if (!selectedVisible)
+        {
+            const int2 localTexel = int2(texel - origin);
+            const int2 localMax = int2(pageMax - origin);
+            for (int dy = -1; dy <= 1; ++dy)
+            {
+                for (int dx = -1; dx <= 1; ++dx)
+                {
+                    const int2 localCandidate = clamp(
+                        localTexel + int2(dx, dy), int2(0, 0), localMax);
+                    const uint2 candidateTexel = origin + uint2(localCandidate);
+                    const uint candidateFlags = uint(gProbeMetadataAtlas[candidateTexel].g);
+                    const bool candidateMetadataValid =
+                        (candidateFlags & kLumenCardMetadataFlagValid) != 0u &&
+                        (candidateFlags & kLumenCardMetadataFlagFallbackAny) == 0u;
+                    anyMetadataValid = anyMetadataValid || candidateMetadataValid;
+                    if (!candidateMetadataValid)
+                    {
+                        continue;
+                    }
+                    const float candidateVisibility = saturate(gProbeVisibilityAtlas[candidateTexel]);
+                    if (candidateVisibility > selectedVisibility)
+                    {
+                        selectedTexel = candidateTexel;
+                        selectedMetadataFlags = candidateFlags;
+                        selectedVisibility = candidateVisibility;
+                    }
+                }
+            }
+            selectedVisible = anyMetadataValid && selectedVisibility > 0.f;
+        }
+
+        if (!selectedVisible)
+        {
+            const bool requestSelected = !found && requestScore > bestRequestScore;
+            if (requestSelected)
+            {
+                bestRequestScore = requestScore;
+                bestRequestCardID = cardIndex;
+                bestRequestReason = anyMetadataValid ? 8u : 4u;
+            }
+            if (!anyMetadataValid)
+            {
+                InterlockedAdd(gProbeCounters[0].cacheMetadataRejects, 1u);
+            }
+            else
+            {
+                InterlockedAdd(gProbeCounters[0].cacheVisibilityRejects, 1u);
+            }
             continue;
-        radiance = max(gProbeRadianceAtlas[texel].rgb, float3(0.f));
-        confidence = vis;
-        return true;
+        }
+        const float score = requestScore;
+            if (!found || score > bestScore)
+            {
+                bestScore = score;
+                bestRadiance = max(gProbeRadianceAtlas[selectedTexel].rgb, float3(0.f));
+                bestConfidence = selectedVisibility;
+                bestPageID = pageID;
+                bestPageGeneration = pageGeneration;
+                found = true;
+            }
+        }
     }
-    return false;
+    if (found)
+    {
+        radiance = bestRadiance;
+        confidence = bestConfidence;
+        feedbackPageID = bestPageID;
+        feedbackPageGeneration = bestPageGeneration;
+    }
+    else if (bestRequestCardID != kLumenCardInvalidID)
+    {
+        requestCardID = bestRequestCardID;
+        requestReason = bestRequestReason;
+    }
+    return found;
 }
 #endif
 
@@ -195,7 +414,7 @@ bool tryLookupSurfaceCache(const float3 hitPosition, out float3 radiance, out fl
 // before accumulation to prevent single-sample fireflies from dominating a
 // probe, and again on the integrated output.
 #ifndef LUMEN_GI_MAX_RADIANCE
-#define LUMEN_GI_MAX_RADIANCE 10000.f
+#define LUMEN_GI_MAX_RADIANCE 10.f
 #endif
 static const float kLumenScreenProbeMaxRadiance = LUMEN_GI_MAX_RADIANCE;
 
@@ -339,7 +558,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     // records with the current frame's direction sequence would falsely claim new
     // samples and corrupt the cross-frame estimator.
     const uint interval = max(1u, gUpdateInterval);
-    const bool due = (meta.flags & kLumenScreenProbeMetaFlagDirty) != 0u ||
+    const bool dirty = (meta.dirty & kLumenScreenProbeMetaFlagDirty) != 0u;
+    const bool due = dirty ||
                      (probeIndex % interval) == (gFrameIndex % interval);
     if (!due)
         return;
@@ -358,31 +578,66 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         // Hit record index: probe * FIXED STRIDE + dir (Z1 trace contract; the stride is
         // kLumenScreenProbeMaxDirectionsPerProbe, not the runtime gDirectionsPerProbe).
         const LumenProbeHit hit = gProbeHitRecords[probeIndex * gMaxHitRecordStride + dir];
-        if ((hit.flags & (kLumenProbeHitFlagScreenHit | kLumenProbeHitFlagHWRTHit)) == 0u)
+        if ((hit.flags & (kLumenProbeHitFlagScreenHit | kLumenProbeHitFlagHWRTHit | kLumenProbeHitFlagGDFHit)) == 0u)
             continue; // Traced but no radiance (screen miss / fallback miss): Li = 0, lowers confidence via hit fraction.
 
+        // A finite black hit is a valid zero-radiance sample. Only non-finite
+        // radiance is invalid; do not use RGB > 0 as the hit-validity test.
+        if (!lumenScreenProbeRadianceIsFinite(hit.radiance))
+            continue;
         float3 li = lumenScreenProbeSanitizeRadiance(hit.radiance);
+        // The cache candidate uses the same deterministic direction as the
+        // weighting below, including its ray-facing card selection.
+        const float3 dirW = lumenProbeIntegrateSampleDirection(probeIndex, dir, gFrameIndex, probeNormal);
 #if LUMEN_GI_PROBE_CACHE_LOOKUP
         // Surface Cache is authoritative when a valid captured card/page covers
-        // this hit. A partial visibility value blends cache and HWRT radiance,
-        // while a stale/invalid page naturally falls back to the hit record.
+        // this hit. Cache visibility is a validity gate, not a lerp weight;
+        // stale/invalid cache data falls back to the finite HWRT hit record.
         const float3 hitPosition = meta.worldPos + lumenProbeIntegrateSampleDirection(
             probeIndex, dir, gFrameIndex, probeNormal
         ) * max(hit.hitDistance, 0.f);
         float3 cacheRadiance;
         float cacheConfidence;
-        if (tryLookupSurfaceCache(hitPosition, cacheRadiance, cacheConfidence))
+        uint cachePageID;
+        uint cachePageGeneration;
+        uint requestCardID;
+        uint requestReason;
+        InterlockedAdd(gProbeCounters[0].cacheLookupAttempts, 1u);
+        const bool cacheFound = tryLookupSurfaceCache(
+            hitPosition, dirW, cacheRadiance, cacheConfidence, cachePageID, cachePageGeneration, requestCardID, requestReason
+        );
+        if (cacheFound &&
+            cacheConfidence > 0.f && lumenScreenProbeRadianceIsFinite(cacheRadiance))
         {
-            li = lerp(li, cacheRadiance, cacheConfidence);
+            li = lumenScreenProbeSanitizeRadiance(cacheRadiance);
+            InterlockedAdd(gProbeCounters[0].cacheLookupHits, 1u);
+#if is_valid_gProbeCacheFeedback
+            if (cachePageID != kInvalidPageID && cachePageGeneration != 0u)
+            {
+                InterlockedAdd(gProbeCacheFeedback[cachePageID].x, 1u);
+                // All hits for a page in one dispatch observe the same validated generation;
+                // InterlockedMax is supported by DXC and remains safe if a stale write races
+                // with a newer generation during a resource transition.
+                InterlockedMax(gProbeCacheFeedback[cachePageID].y, cachePageGeneration);
+            }
+#endif
+        }
+#if is_valid_gProbeCacheRequests
+        else if (requestCardID != kLumenCardInvalidID && requestReason != 0u)
+        {
+            InterlockedAdd(gProbeCacheRequests[requestCardID].x, 1u);
+            InterlockedOr(gProbeCacheRequests[requestCardID].y, requestReason);
         }
 #endif
-        if (!any(li > float3(0.f)))
-            continue; // Zero / sanitized radiance: same as a miss for the estimator and confidence.
+#endif
+        // Sanitization preserves finite black as a valid contribution while
+        // retaining zero output for non-finite/invalid records above.
+        if (!lumenScreenProbeRadianceIsFinite(li))
+            continue;
         ++validHitCount;
 
         // Recompute the traced direction (identical formula to the trace) for the mode 1/2
         // cosTheta; mode 0 is direction-independent (constant π/N weight).
-        const float3 dirW = lumenProbeIntegrateSampleDirection(probeIndex, dir, gFrameIndex, probeNormal);
         const float cosTheta = dot(dirW, probeNormal);
         const float weight = lumenScreenProbeDirectionWeight(cosTheta, 1.f, gWeightMode, tracedCount);
         if (weight <= 0.f)
@@ -406,7 +661,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     // N-direction estimator (including misses), so the estimator remains unbiased
     // while the effective direction union grows beyond the fixed per-frame set.
     const float4 previous = gProbeRadianceHistory[outPixel];
-    const float previousCount = max(previous.a, 0.f);
+    const float previousCount = dirty ? 0.f : max(previous.a, 0.f);
     const float currentCount = float(tracedCount);
     const float totalCount = min(previousCount + currentCount, 65504.f);
     const float currentWeight = currentCount / max(totalCount, 1.f);

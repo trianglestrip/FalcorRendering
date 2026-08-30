@@ -1,0 +1,60 @@
+############################################################################
+# C10 diagnostic scene: geometry extends beyond the level-4 clipmap so the
+# coarsest static level can be queried without changing production assets.
+############################################################################
+
+# No environment map is required for this coverage gate.  Geometry and
+# hit-distance validity are the authoritative far-field evidence.
+
+sphereMesh = TriangleMesh.createSphere()
+NX = 8
+NY = 8
+SPACING = 12.0
+
+for x in range(NX):
+    for y in range(NY):
+        translation = float3((x - 0.5 * (NX - 1)) * SPACING,
+                             (y - 0.5 * (NY - 1)) * SPACING,
+                             0)
+        roughness = 1 - x / float(NX - 1)
+        metallic = 1 - y / float(NY - 1)
+        name = 'farfield-roughness={:.2f}-metallic={:.2f}'.format(roughness, metallic)
+        material = StandardMaterial(name)
+        material.baseColor = float4(0.5, 0.5, 0.5, 1.0)
+        material.roughness = roughness
+        material.metallic = metallic
+        sceneBuilder.addMeshInstance(
+            sceneBuilder.addNode(name, Transform(translation=translation)),
+            sceneBuilder.addTriangleMesh(sphereMesh, material)
+        )
+
+# Add one probe target in each static clipmap band. The regular 8x8 lattice
+# intentionally has no surface inside level-1's +/-4m footprint and skips the
+# level-3/4 transition bands, so a coverage run could not distinguish missing
+# scheduler ownership from simply having no geometry there. These five small
+# spheres exercise dynamic level 0 and static levels 1..5 without changing the
+# production Cornell/sphere-array assets.
+for index, distance in enumerate((0.0, 3.0, 12.0, 24.0, 48.0)):
+    name = 'coverage-band-{}'.format(index)
+    material = StandardMaterial(name)
+    material.baseColor = float4(0.7, 0.7, 0.7, 1.0)
+    material.roughness = 0.7
+    sceneBuilder.addMeshInstance(
+        sceneBuilder.addNode(name, Transform(translation=float3(distance, 0, 0))),
+        sceneBuilder.addTriangleMesh(sphereMesh, material)
+    )
+
+# Keep fallback validation non-black without relying on an EnvMap asset.
+coverageLight = DistantLight('C10CoverageLight')
+coverageLight.direction = float3(-0.25, -0.7, -0.55)
+coverageLight.intensity = float3(3.0)
+coverageLight.angle = 0.05
+sceneBuilder.addLight(coverageLight)
+
+camera = Camera()
+camera.position = float3(0, 0, 220)
+camera.target = float3(0, 0, 0)
+camera.up = float3(0, 1, 0)
+camera.focalLength = 35
+sceneBuilder.addCamera(camera)
+sceneBuilder.cameraSpeed = 20

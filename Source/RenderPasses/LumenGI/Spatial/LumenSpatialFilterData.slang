@@ -189,7 +189,7 @@
 // overridable by the host through the same define. Used as the firefly absolute
 // ceiling (gFireflyMaxRadiance) and to sanitize the output.
 #ifndef LUMEN_GI_MAX_RADIANCE
-#define LUMEN_GI_MAX_RADIANCE 10000.f
+#define LUMEN_GI_MAX_RADIANCE 10.f
 #endif
 
 /** Minimum accumulated weight for a tap to contribute to the bilateral gather
@@ -221,13 +221,13 @@ cbuffer LumenSpatialFilterCB
     uint2  gFrameDim;                // +0   Frame (GI) dims in pixels; guards the dispatch.
     uint   gFilterEnabled;           // +8   != 0: run the filter; 0: pass-through copy (debug).
     uint   gFireflyClamp;            // +12  != 0: enable firefly replace + clamp. Default 1.
-    float  gFireflyMaxRadiance;      // +16  Absolute per-channel ceiling on the output (default LUMEN_GI_MAX_RADIANCE = 10000).
+    float  gFireflyMaxRadiance;      // +16  Absolute per-channel ceiling on the output (default LUMEN_GI_MAX_RADIANCE = 10).
     float  gFireflyStdDevFactor;     // +20  Outlier band: |lum - mean| > factor * std (default 4.0).
-    float  gVarianceThresholdLow;    // +24  Relative variance below which radius = gRadiusMin (default 0.01 = 10% RMS noise).
-    float  gVarianceThresholdHigh;   // +28  Relative variance above which radius = gRadiusMax (default 0.25 = 50% RMS noise).
+    float  gVarianceThresholdLow;    // +24  Relative variance below which radius = gRadiusMin (default 0.0).
+    float  gVarianceThresholdHigh;   // +28  Relative variance above which radius = gRadiusMax (default 0.20).
     float  gRadiusMin;               // +32  Minimum filter radius in pixels (default 0 = keep detail in clean regions).
-    float  gRadiusMax;               // +36  Maximum filter radius in pixels (default 3, clamped to kLumenSpatialFilterMaxTapRadius).
-    float  gSpatialSigmaScale;       // +40  Gaussian sigma of the spatial term = scale * radius (default 0.5 = sigma = r/2).
+    float  gRadiusMax;               // +36  Maximum filter radius in pixels (default 4, clamped to kLumenSpatialFilterMaxTapRadius).
+    float  gSpatialSigmaScale;       // +40  Gaussian sigma of the spatial term = scale * radius (default 0.75).
     float  gDepthThreshold;          // +44  Meters; |z_p - z_Q| dead zone below which depthW = 1 (default 0.05).
     float  gDepthSigmaInv;           // +48  1/meters; depthW exponential falloff rate beyond the dead zone (default 8.0).
     float  gNormalExponent;          // +52  pow(saturate(dot(n_p, n_Q)), exponent) (default 8.0).
@@ -236,7 +236,7 @@ cbuffer LumenSpatialFilterCB
     float  gMaxVarianceClamp;        // +64  Clamp on the combined variance estimate (numerical guard, default 1e4).
     float  gVarianceEpsilon;         // +68  Floor for variance / mean^2 division and the firefly band (default 1e-6).
     float2 gInvFrameDim;             // +72  1 / frame dims (UV math).
-    uint   gNeighborhoodRadius;      // +80  Variance window radius: 1 = 3x3, 2 = 5x5 (clamped to kLumenSpatialFilterMaxVarianceRadius).
+    uint   gNeighborhoodRadius;      // +80  Variance window radius (default 2 = 5x5; clamped to kLumenSpatialFilterMaxVarianceRadius).
     uint   gPad0;                    // +84
     uint   gPad1;                    // +88
     uint   gPad2;                    // +92

@@ -153,6 +153,11 @@ namespace Mogwai
         renderer.def_property_readonly(kScene.c_str(), &Renderer::getScene);
         renderer.def_property_readonly(kActiveGraph.c_str(), &Renderer::getActiveGraph);
         renderer.def_property_readonly(kClock.c_str(), [] (Renderer* pRenderer) { return &pRenderer->getGlobalClock(); });
+        // Expose the live renderer device for authoritative runtime
+        // provenance.  Scripts must inspect ``m.device.info`` rather than
+        // constructing a second ``falcor.Device`` (which could target a
+        // different adapter and would not describe Mogwai's renderer).
+        renderer.def_property_readonly("device", [] (Renderer* pRenderer) { return pRenderer->getDevice(); });
         renderer.def_property_readonly(kProfiler.c_str(), [] (Renderer* pRenderer) { return pRenderer->getDevice()->getProfiler(); });
 
         auto getUI = [](Renderer* pRenderer) { return pRenderer->isUiEnabled(); };

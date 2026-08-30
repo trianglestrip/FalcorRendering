@@ -1,0 +1,30 @@
+############################################################################
+# C10 near-field phase scene.  A large authored surface is 20 m in front of
+# the z=220 camera so level-0 probe projection is measured against real GBuffer
+# depth, independently of the far-field clipmap-band scene.
+############################################################################
+
+surfaceMesh = TriangleMesh.createCube(float3(18.0, 12.0, 0.5))
+surfaceMaterial = StandardMaterial('near-field-surface')
+surfaceMaterial.baseColor = float4(0.65, 0.65, 0.65, 1.0)
+surfaceMaterial.roughness = 0.65
+surfaceMaterial.emissiveColor = float3(0.08, 0.08, 0.08)
+surfaceMaterial.emissiveFactor = 1.0
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('near-field-surface', Transform(translation=float3(0, 0, 200))),
+    sceneBuilder.addTriangleMesh(surfaceMesh, surfaceMaterial)
+)
+
+coverageLight = DistantLight('C10NearFieldLight')
+coverageLight.direction = float3(-0.25, -0.7, -0.55)
+coverageLight.intensity = float3(3.0)
+coverageLight.angle = 0.05
+sceneBuilder.addLight(coverageLight)
+
+camera = Camera()
+camera.position = float3(0, 0, 220)
+camera.target = float3(0, 0, 200)
+camera.up = float3(0, 1, 0)
+camera.focalLength = 35
+sceneBuilder.addCamera(camera)
+sceneBuilder.cameraSpeed = 20

@@ -176,6 +176,14 @@ struct LumenSurfaceCacheStats
     uint64_t invalidationCount = 0;    ///< Total pages dropped by resize() shrinking.
     uint64_t touchCount = 0;           ///< Total successful touchPage() calls.
     uint32_t minResidencyFrames = 0;   ///< Minimum residency frames in effect.
+    uint32_t lastAllocatedPageID = kInvalidPageID; ///< Most recent allocation/reuse page.
+    uint32_t lastAllocatedGeneration = 0;          ///< Generation assigned by that allocation.
+    uint64_t lastAllocatedFrame = 0;               ///< Allocator frame of that allocation.
+    uint32_t lastEvictedPageID = kInvalidPageID;   ///< Most recent LRU/budget victim.
+    uint32_t lastEvictedGeneration = 0;             ///< Victim generation before eviction.
+    uint64_t lastEvictedFrame = 0;                  ///< Allocator frame of that eviction.
+    uint32_t lastTouchedPageID = kInvalidPageID;    ///< Most recent successful touch.
+    uint64_t lastTouchedFrame = 0;                  ///< Allocator frame of that touch.
 };
 
 /**
@@ -341,6 +349,14 @@ private:
     uint64_t mEvictionCount = 0;               ///< Evicted pages (LRU/budget passes).
     uint64_t mInvalidationCount = 0;           ///< Pages dropped by resize() shrinking.
     uint64_t mTouchCount = 0;                  ///< Successful touches.
+    uint32_t mLastAllocatedPageID = kInvalidPageID;
+    uint32_t mLastAllocatedGeneration = 0;
+    uint64_t mLastAllocatedFrame = 0;
+    uint32_t mLastEvictedPageID = kInvalidPageID;
+    uint32_t mLastEvictedGeneration = 0;
+    uint64_t mLastEvictedFrame = 0;
+    uint32_t mLastTouchedPageID = kInvalidPageID;
+    uint64_t mLastTouchedFrame = 0;
 };
 
 inline LumenSurfaceCache::LumenSurfaceCache(
@@ -397,6 +413,9 @@ inline uint32_t LumenSurfaceCache::allocatePage()
     page.lastTouchedFrame = mFrameIndex;
     page.allocated = true;
     ++mAllocationCount;
+    mLastAllocatedPageID = pageID;
+    mLastAllocatedGeneration = page.generation;
+    mLastAllocatedFrame = mFrameIndex;
 
     enforceMemoryBudget();
     return pageID;
@@ -432,6 +451,8 @@ inline bool LumenSurfaceCache::touchPage(uint32_t pageID)
     }
     page.lastTouchedFrame = mFrameIndex;
     ++mTouchCount;
+    mLastTouchedPageID = pageID;
+    mLastTouchedFrame = mFrameIndex;
     return true;
 }
 
@@ -601,6 +622,14 @@ inline void LumenSurfaceCache::reset()
     mEvictionCount = 0;
     mInvalidationCount = 0;
     mTouchCount = 0;
+    mLastAllocatedPageID = kInvalidPageID;
+    mLastAllocatedGeneration = 0;
+    mLastAllocatedFrame = 0;
+    mLastEvictedPageID = kInvalidPageID;
+    mLastEvictedGeneration = 0;
+    mLastEvictedFrame = 0;
+    mLastTouchedPageID = kInvalidPageID;
+    mLastTouchedFrame = 0;
 }
 
 inline LumenSurfaceCacheStats LumenSurfaceCache::getStats() const
@@ -619,6 +648,14 @@ inline LumenSurfaceCacheStats LumenSurfaceCache::getStats() const
     stats.invalidationCount = mInvalidationCount;
     stats.touchCount = mTouchCount;
     stats.minResidencyFrames = mMinResidencyFrames;
+    stats.lastAllocatedPageID = mLastAllocatedPageID;
+    stats.lastAllocatedGeneration = mLastAllocatedGeneration;
+    stats.lastAllocatedFrame = mLastAllocatedFrame;
+    stats.lastEvictedPageID = mLastEvictedPageID;
+    stats.lastEvictedGeneration = mLastEvictedGeneration;
+    stats.lastEvictedFrame = mLastEvictedFrame;
+    stats.lastTouchedPageID = mLastTouchedPageID;
+    stats.lastTouchedFrame = mLastTouchedFrame;
     return stats;
 }
 
@@ -669,6 +706,9 @@ inline uint32_t LumenSurfaceCache::findEvictionCandidate() const
 
 inline void LumenSurfaceCache::evictPage(uint32_t pageID)
 {
+    mLastEvictedPageID = pageID;
+    mLastEvictedGeneration = mPages[pageID].generation;
+    mLastEvictedFrame = mFrameIndex;
     mPages[pageID].allocated = false;
     mEvictedPending.push_back(pageID);
     ++mEvictionCount;

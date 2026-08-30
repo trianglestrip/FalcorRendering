@@ -136,6 +136,9 @@
 #ifndef is_valid_gLumenPageToCard
 #define is_valid_gLumenPageToCard 1
 #endif
+#ifndef is_valid_gLumenPageMetadata
+#define is_valid_gLumenPageMetadata 1
+#endif
 #ifndef is_valid_gMaterialParamsAtlas
 #define is_valid_gMaterialParamsAtlas 0
 #endif
@@ -384,6 +387,8 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
     const uint2 texel = origin + uint2(groupThreadID.xy);
     if (any(texel >= gAtlasSize))
         return;
+    if (is_valid(gLumenVisibilityAtlas))
+        gLumenVisibilityAtlas[texel] = 0.f;
 
     const float4 material = gMaterialAtlas[texel];
     const float4 metadata = gMetadataAtlas[texel];
@@ -412,6 +417,13 @@ void main(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
     const uint cardIndex = is_valid(gLumenPageToCard) ? gLumenPageToCard[pageID] : kLumenCardInvalidID;
     if (cardIndex == kLumenCardInvalidID)
         return; // page without a card (evicted/host bug): cannot light.
+
+    // Generation/state ownership check. A page ID can be reused after eviction;
+    // reject stale or non-resident entries before reading the card or lighting data.
+    const uint4 pageMetadata = is_valid(gLumenPageMetadata) ? gLumenPageMetadata[pageID] : uint4(0u);
+    const uint pageState = pageMetadata.y;
+    if (pageMetadata.x == 0u || (pageState != 1u && pageState != 2u))
+        return;
 
     const LumenCard card = gCards[cardIndex];
     const float2 localUV = (float2(groupThreadID.xy) + 0.5f) / float(kLumenSurfaceCacheTileSize);

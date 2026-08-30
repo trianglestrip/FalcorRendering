@@ -31,9 +31,12 @@
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Utils/Math/Float16.h" // float32ToFloat16 (fine-atlas upload).
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <sstream>
 
@@ -49,10 +52,15 @@ namespace s6scene = LumenGI::MeshSDF::Scene; ///< Alias for the Mesh SDF scene p
 const char kShaderFile[] = "RenderPasses/LumenGI/LumenGIDebug.cs.slang";
 const char kTraceShaderFile[] = "RenderPasses/LumenGI/Tracing/LumenHardwareTrace.rt.slang";
 const char kCaptureShaderFile[] = "RenderPasses/LumenGI/Capture/LumenCardCapture.3d.slang";
+const char kPageClearShaderFile[] = "RenderPasses/LumenGI/Capture/LumenSurfaceCachePageClear.cs.slang";
 const char kCacheLightingShaderFile[] = "RenderPasses/LumenGI/Lighting/LumenSurfaceCacheLighting.cs.slang";
 const char kHZBBuildShaderFile[] = "RenderPasses/LumenGI/ScreenTrace/LumenHZBBuild.cs.slang";
 const char kScreenTraceShaderFile[] = "RenderPasses/LumenGI/ScreenTrace/LumenScreenTrace.cs.slang";
 const char kScreenProbeShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeTrace.cs.slang";
+const char kScreenRadianceHistoryShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenRadianceHistory.cs.slang";
+const char kRadianceCacheShaderFile[] = "RenderPasses/LumenGI/RadianceCache/LumenRadianceCacheInterpolate.cs.slang";
+const char kRadianceCacheTraceShaderFile[] = "RenderPasses/LumenGI/RadianceCache/LumenRadianceCacheTrace.cs.slang";
+constexpr uint32_t kLumenRadianceCacheLevelStride = 8u;
 const char kScreenProbeIntegrateShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeIntegrate.cs.slang";
 const char kScreenProbeInterpolateShaderFile[] = "RenderPasses/LumenGI/ScreenProbe/LumenScreenProbeInterpolate.cs.slang";
 const char kTemporalFilterShaderFile[] = "RenderPasses/LumenGI/Temporal/LumenTemporalFilter.cs.slang";
@@ -63,20 +71,18 @@ const char kFinalResolveShaderFile[] = "RenderPasses/LumenGI/Resolve/LumenFinalR
 ///< with Z5's LumenTemporalFilterData.slang comments (all but the last three are inert while the
 ///< corresponding optional validation inputs are unbound).
 constexpr float kTemporalClampBoxMargin = 0.0f;      ///< gClampBoxMargin (fraction of the neighborhood range).
-constexpr float kTemporalNormalCosMin = 0.8f;        ///< gNormalCosMin (no normal input in the MVP).
-constexpr float kTemporalNormalExponent = 8.0f;      ///< gNormalExponent (no normal input in the MVP).
-constexpr float kTemporalMaterialMismatchWeight = 0.05f; ///< gMaterialMismatchWeight (no material input in the MVP).
+constexpr float kTemporalNormalCosMin = 0.8f;        ///< gNormalCosMin (UE-style 45 degree rejection floor).
+constexpr float kTemporalNormalExponent = 8.0f;      ///< gNormalExponent (UE-style normal affinity).
+constexpr float kTemporalMaterialMismatchWeight = 0.05f; ///< gMaterialMismatchWeight.
 constexpr float kTemporalHitDistanceThreshold = 0.5f; ///< gHitDistanceThreshold (m; no hit-distance input in the MVP).
-///< gConfidenceWeight (confidence gating strength in wConf). DEFAULT 0 in the S5 MVP: the S4.3
-///< interpolate confidence is currently dominated by the probe miss penalty (uniformly ~0.03 on
-///< Cornell, see the S5 report) and a weight of 1.0 would make wConf ~0.03 for every pixel, which
-///< pins alpha near gMaxRejectAlpha and disables the temporal accumulation entirely. With gating
-///< off, history trust is driven by the working depth + motion validation; re-enable (1.0) once a
-///< meaningful per-pixel confidence channel lands (S4-B3 fix / S5-B2).
-constexpr float kTemporalConfidenceWeight = 0.0f;
+///< gConfidenceWeight (confidence gating strength in wConf). The current 0.2 value is deliberately
+///< conservative: the S4.3 confidence remains low on sparse-probe misses, so a value of 1.0 would
+///< reject nearly all history. Spatial now receives the separate temporalConfidence channel, which
+///< allows a future preset sweep (0.25 -> 0.5 -> 1.0) after producer-validity telemetry lands.
+constexpr float kTemporalConfidenceWeight = 0.2f;
 ///< gFireflyMaxRadiance; mirrors the kLumenGIMaxRadiance default in LumenGIData.slang / the
 ///< LUMEN_GI_MAX_RADIANCE fallback in LumenTemporalFilterData.slang.
-constexpr float kTemporalFireflyMaxRadiance = 10000.f;
+constexpr float kTemporalFireflyMaxRadiance = 10.f;
 
 ///< Host mirror of cbuffer LumenTemporalFilterCB in LumenTemporalFilterData.slang (frozen 96-byte
 ///< layout). The host sets every field by name each dispatch; this struct only documents and
@@ -151,12 +157,11 @@ const uint32_t kTraceRecursionDepth = 1u;
 ///< so adjacent frames sample different points while the sequence stays reproducible.
 const uint32_t kCacheLightingSeed = 0x51B8DC0Du;
 
-// C1 safety fallback: the D3D12 cache-lighting dispatch currently rejects the
-// optional EnvMapSampler resource variant (E_INVALIDARG) even with a valid
-// 16x16 group shape and populated descriptor inputs. Keep environment lighting
-// enabled via the shader's unbiased uniform-sphere path until the sampler
-// descriptor issue is isolated; do not claim importance-sampler coverage.
-constexpr bool kUseCacheLightingEnvImportanceSampler = false;
+// C1 production variant: the environment importance sampler is bound through a
+// ParameterBlock<EnvMapSampler>. The uniform-sphere path remains available only
+// when the scene has no environment sampler; toggling the resource shape requires
+// rebuilding the ComputePass so the D3D12 root signature stays stable.
+constexpr bool kUseCacheLightingEnvImportanceSampler = true;
 
 const char kEnabled[] = "enabled";
 const char kTraceMode[] = "traceMode";
@@ -164,6 +169,7 @@ const char kQualityPreset[] = "qualityPreset";
 const char kDebugMode[] = "debugMode";
 const char kUseSurfaceCache[] = "useSurfaceCache";
 const char kUseCacheLighting[] = "useCacheLighting";
+const char kUseCacheCardGrid[] = "useCacheCardGrid";
 const char kCacheLightingFeedback[] = "cacheLightingFeedback";
 const char kCacheLightingFeedbackStrength[] = "cacheLightingFeedbackStrength";
 const char kCacheLightingFeedbackMaxBounces[] = "cacheLightingFeedbackMaxBounces";
@@ -172,6 +178,8 @@ const char kUseScreenProbes[] = "useScreenProbes";
 const char kProbeDirectionsPerProbe[] = "probeDirectionsPerProbe";
 const char kProbeMaxProbesPerFrame[] = "probeMaxProbesPerFrame";
 const char kUseTemporalFilter[] = "useTemporalFilter";
+const char kUseScreenRadianceMoments[] = "useScreenRadianceMoments";
+const char kTemporalHistoryLengthCap[] = "temporalHistoryLengthCap";
 const char kUseSpatialFilter[] = "useSpatialFilter";
 const char kSpatialRadiusMin[] = "spatialRadiusMin";
 const char kSpatialRadiusMax[] = "spatialRadiusMax";
@@ -202,9 +210,16 @@ const char kGDFBaseExtent[] = "gdfBaseExtent";
 const char kGDFTraceMaxSteps[] = "gdfTraceMaxSteps";
 const char kGDFTraceMaxDistance[] = "gdfTraceMaxDistance";
 const char kGDFEmptyDistanceScale[] = "gdfEmptyDistanceScale";
+const char kGDFDiagnosticStage[] = "gdfDiagnosticStage";
 
 // S6 shader files.
 const char kGDFComposeShaderFile[] = "RenderPasses/LumenGI/MeshSDF/LumenGDFCompose.cs.slang";
+const char kGDFComposeDiagShaderFile[] = "RenderPasses/LumenGI/MeshSDF/LumenGDFComposeDiag.cs.slang";
+const char kGDFComposeDiagAllShaderFile[] = "RenderPasses/LumenGI/MeshSDF/LumenGDFComposeDiagAll.cs.slang";
+const char kGDFComposeDiagBuffersShaderFile[] = "RenderPasses/LumenGI/MeshSDF/LumenGDFComposeDiagBuffers.cs.slang";
+const char kGDFComposeDiagAtlasShaderFile[] = "RenderPasses/LumenGI/MeshSDF/LumenGDFComposeDiagAtlas.cs.slang";
+const char kGDFComposeDiagBuffersScalarShaderFile[] = "RenderPasses/LumenGI/MeshSDF/LumenGDFComposeDiagBuffersScalar.cs.slang";
+const char kGDFComposeDiagCBScalarShaderFile[] = "RenderPasses/LumenGI/MeshSDF/LumenGDFComposeDiagCBScalar.cs.slang";
 const char kGDFTraceShaderFile[] = "RenderPasses/LumenGI/MeshSDF/LumenGDFTrace.cs.slang";
 
 ///< Camera margin in front of the captured card face, in meters. Mirrors
@@ -279,6 +294,16 @@ const ChannelList kOutputChannels = {
     { "temporalAlpha",                 "gTemporalAlpha",                 "S5-B1 effective EMA alpha (1 = full reject / reset). Accept/reject cross-check.", true, ResourceFormat::R32Float },
     { "temporalConfidence",            "gTemporalConfidence",            "S5-B1 updated confidence; input to the S5-B2 spatial filter.", true, ResourceFormat::R32Float },
     { "temporalMoments",               "gTemporalMoments",               "C8 diagnostic running luminance moments: R=mean, G=mean square.", true, ResourceFormat::RG32Float },
+    { "screenRadianceLightingGeneration", "gScreenRadianceLightingGeneration", "C7 diagnostic screen-radiance lighting epoch (R32Uint; zero means invalid).", true, ResourceFormat::R32Uint },
+    { "screenRadianceHistoryAge",      "gScreenRadianceHistoryAge",      "A2 diagnostic raw screen-radiance history age (R32Uint; zero means invalid/reset).", true, ResourceFormat::R32Uint },
+    { "screenRadianceHistoryValidity", "gScreenRadianceHistoryValidity", "A2 diagnostic raw screen-radiance validity sidecar (R32Uint; 1 means valid, 0 means reset/miss).", true, ResourceFormat::R32Uint },
+    { "radianceCache",                 "gRadianceCacheOutput",            "C10 GPU Radiance Cache output: RGB incident radiance, A confidence/validity.", true, ResourceFormat::RGBA16Float },
+    { "radianceCacheHitDist",          "gRadianceCacheHitDist",             "C10 GPU Radiance Cache hit-distance output: RGB incident radiance, A hit distance.", true, ResourceFormat::RGBA16Float },
+    { "radianceCacheValidity",         "gRadianceCacheValidityOutput",      "C10 GPU Radiance Cache validity bitmask: hit/sky/radiance/producer bits; zero means invalid.", true, ResourceFormat::R32Uint },
+    { "roughSpecularIndirect",         "gRoughSpecularIndirect",             "E1 diagnostic rough-specular indirect radiance; disabled until directional producer is bound.", true, ResourceFormat::RGBA16Float },
+    { "roughSpecularValidity",         "gRoughSpecularValidity",             "E1 rough-specular validity bitmask; diagnostic only.", true, ResourceFormat::R32Uint },
+    { "transmissionIndirect",           "gTransmissionIndirect",              "E1 reference-only transmission radiance; disabled until medium-aware producer is bound.", true, ResourceFormat::RGBA16Float },
+    { "transmissionValidity",           "gTransmissionValidityOutput",        "E1 transmission validity bitmask; reference-only diagnostic.", true, ResourceFormat::R32Uint },
     { "spatialFiltered",               "gSpatialOutput",                 "S5-B2 spatial filter: RGB=variance-guided filtered incident irradiance, A=filtered confidence. Consumes temporalFiltered + temporalConfidence.", true, ResourceFormat::RGBA16Float },
     { "filteredVariance",              "gFilteredVariance",               "C8 diagnostic combined temporal/spatial luminance variance.", true, ResourceFormat::R32Float },
     { "resolvedDiffuseGI",             "gResolvedDiffuseGI",              "C9 final resolve: filtered incident irradiance modulated by diffuse reflectance / PI, or HWRT radiance passthrough.", true, ResourceFormat::RGBA16Float },
@@ -645,6 +670,15 @@ void registerBindings(pybind11::module& m)
     pass.def_property_readonly("gdfStats", &LumenGIPass::getGDFStats);
     // Scriptable S4/C2/C7 probe-resource and counter snapshot.
     pass.def_property_readonly("screenProbeStats", &LumenGIPass::getScreenProbeStats);
+    // C10 CPU clipmap preparation snapshot. GPU channels are intentionally separate
+    // and are not reported as produced until the bounded trace/commit path exists.
+    pass.def_property_readonly("radianceCacheStats", &LumenGIPass::getRadianceCacheStats);
+    // C11 effective preset/derived configuration snapshot for hot-switch validation.
+    pass.def_property_readonly("qualityPresetStats", &LumenGIPass::getQualityPresetStats);
+    // C6 card-specific request -> capture -> ready -> hit provenance.  This is kept
+    // separate from the aggregate surfaceCacheStats map so a validator cannot infer
+    // ownership or frame ordering from unrelated cumulative counters.
+    pass.def_property_readonly("surfaceCacheEvents", &LumenGIPass::getSurfaceCacheEvents);
     // Compatibility alias for the Z15 S6-C2 atlas test skeleton (run_sdf_atlas.py) which probes
     // a `meshSDFSceneStats` dict binding; the scene-pipeline counters live in gdfStats.
     pass.def_property_readonly("meshSDFSceneStats", &LumenGIPass::getGDFStats);
@@ -671,7 +705,7 @@ LumenGIPass::LumenGIPass(ref<Device> pDevice, const Properties& props)
     if (!mpDevice->isFeatureSupported(Device::SupportedFeatures::RaytracingTier1_1))
         FALCOR_THROW("LumenGI requires Raytracing Tier 1.1 support.");
 
-    parseProperties(props);
+    parseProperties(props, true);
 
     // Normalize the configured atlas size to whole tiles and rebuild the CPU components with
     // it. The scheduler re-points at mpCardScene and mPageCache on setScene().
@@ -688,8 +722,83 @@ LumenGIPass::LumenGIPass(ref<Device> pDevice, const Properties& props)
     createDebugPass();
 }
 
-void LumenGIPass::parseProperties(const Properties& props)
+void LumenGIPass::setProperties(const Properties& props)
 {
+    // A graph update supplies only the fields that changed.  Apply the preset
+    // defaults only when the update explicitly changes qualityPreset; partial
+    // updates must preserve the other derived values and user overrides.
+    parseProperties(props, props.has(kQualityPreset));
+    mOptionsChanged = true;
+    resetHistory(HistoryResetReason::SceneChange);
+}
+
+void LumenGIPass::parseProperties(const Properties& props, bool applyPresetDefaults)
+{
+    if (applyPresetDefaults)
+    {
+        // Resolve the quality preset before applying its defaults. Every derived value remains
+        // explicitly overridable through Properties, so a graph can pin one dimension while still
+        // using the preset for the rest. The mapping is intentionally monotonic: higher presets
+        // spend more probe directions, history capacity, cache-lighting work and GDF trace budget;
+        // it never enables a producer that the graph did not request.
+        const QualityPreset requestedPreset = props.has(kQualityPreset) ? props[kQualityPreset] : mQualityPreset;
+        mQualityPreset = requestedPreset;
+        struct PresetDefaults
+        {
+            uint32_t probeDirections;
+            uint32_t capturePages;
+            uint32_t cacheBounces;
+            float spatialRadiusMin;
+            float spatialRadiusMax;
+            uint32_t spatialNeighborhood;
+            float temporalHistoryCap;
+            uint32_t gdfTraceSteps;
+            float gdfTraceDistance;
+            uint32_t meshSDFResolution;
+            uint32_t meshSDFQuality;
+        } defaults{};
+        switch (requestedPreset)
+        {
+        case QualityPreset::Low:
+            defaults = {8u, 16u, 1u, 1.0f, 2.0f, 1u, 4.0f, 32u, 10.0f, 32u, 1u};
+            break;
+        case QualityPreset::Medium:
+            defaults = {16u, 32u, 2u, 1.5f, 3.0f, 1u, 6.0f, 48u, 15.0f, 40u, 0u};
+            break;
+        case QualityPreset::High:
+            defaults = {32u, 64u, 4u, 2.0f, 4.0f, 2u, 10.0f, 64u, 20.0f, 48u, 0u};
+            break;
+        case QualityPreset::Reference:
+            defaults = {64u, 128u, 8u, 2.0f, 5.0f, 2u, 16.0f, 96u, 40.0f, 64u, 0u};
+            break;
+        default:
+            defaults = {32u, 64u, 4u, 2.0f, 4.0f, 2u, 10.0f, 64u, 20.0f, 48u, 0u};
+            break;
+        }
+        if (!props.has(kProbeDirectionsPerProbe))
+            mProbeDirectionsPerProbe = std::clamp<uint32_t>(defaults.probeDirections, 1u, LumenScreenProbe::kMaxDirectionsPerProbe);
+        if (!props.has(kCaptureMaxPagesPerFrame))
+            mCaptureMaxPagesPerFrame = defaults.capturePages;
+        if (!props.has(kCacheLightingFeedbackMaxBounces))
+            mCacheLightingFeedbackMaxBounces = defaults.cacheBounces;
+        if (!props.has(kSpatialRadiusMin))
+            mSpatialRadiusMin = defaults.spatialRadiusMin;
+        if (!props.has(kSpatialRadiusMax))
+            mSpatialRadiusMax = defaults.spatialRadiusMax;
+        if (!props.has(kSpatialNeighborhoodRadius))
+            mSpatialNeighborhoodRadius = std::clamp<uint32_t>(defaults.spatialNeighborhood, 1u, 2u);
+        if (!props.has(kTemporalHistoryLengthCap))
+            mTemporalHistoryLengthCap = defaults.temporalHistoryCap;
+        if (!props.has(kGDFTraceMaxSteps))
+            mGDFTraceMaxSteps = defaults.gdfTraceSteps;
+        if (!props.has(kGDFTraceMaxDistance))
+            mGDFTraceMaxDistance = defaults.gdfTraceDistance;
+        if (!props.has(kMeshSDFResolution))
+            mMeshSDFResolution = std::max<uint32_t>(defaults.meshSDFResolution, 8u);
+        if (!props.has(kMeshSDFQuality))
+            mMeshSDFQuality = defaults.meshSDFQuality;
+    }
+
     for (const auto& [key, value] : props)
     {
         if (key == kEnabled)
@@ -704,6 +813,8 @@ void LumenGIPass::parseProperties(const Properties& props)
             mUseSurfaceCache = value;
         else if (key == kUseCacheLighting)
             mUseCacheLighting = value;
+        else if (key == kUseCacheCardGrid)
+            mUseCacheCardGrid = value;
         else if (key == kCacheLightingFeedback)
             mCacheLightingFeedbackEnabled = value;
         else if (key == kCacheLightingFeedbackStrength)
@@ -720,6 +831,10 @@ void LumenGIPass::parseProperties(const Properties& props)
             mProbeMaxProbesPerFrame = value;
         else if (key == kUseTemporalFilter)
             mUseTemporalFilter = value;
+        else if (key == kUseScreenRadianceMoments)
+            mUseScreenRadianceMoments = value;
+        else if (key == kTemporalHistoryLengthCap)
+            mTemporalHistoryLengthCap = std::clamp<float>(value, 1.0f, 64.0f);
         else if (key == kUseSpatialFilter)
             mUseSpatialFilter = value;
         else if (key == kSpatialRadiusMin)
@@ -803,6 +918,11 @@ void LumenGIPass::parseProperties(const Properties& props)
             const float v = value;
             mGDFEmptyDistanceScale = std::max(v, 1.f);
         }
+        else if (key == kGDFDiagnosticStage)
+        {
+            const uint32_t v = value;
+            mGDFDiagnosticStage = std::min<uint32_t>(v, 6u);
+        }
         else
             logWarning("Unknown property '{}' in LumenGI properties.", key);
     }
@@ -817,6 +937,7 @@ Properties LumenGIPass::getProperties() const
     props[kDebugMode] = mDebugMode;
     props[kUseSurfaceCache] = mUseSurfaceCache;
     props[kUseCacheLighting] = mUseCacheLighting;
+    props[kUseCacheCardGrid] = mUseCacheCardGrid;
     props[kCacheLightingFeedback] = mCacheLightingFeedbackEnabled;
     props[kCacheLightingFeedbackStrength] = mCacheLightingFeedbackStrength;
     props[kCacheLightingFeedbackMaxBounces] = mCacheLightingFeedbackMaxBounces;
@@ -825,6 +946,8 @@ Properties LumenGIPass::getProperties() const
     props[kProbeDirectionsPerProbe] = mProbeDirectionsPerProbe;
     props[kProbeMaxProbesPerFrame] = mProbeMaxProbesPerFrame;
     props[kUseTemporalFilter] = mUseTemporalFilter;
+    props[kUseScreenRadianceMoments] = mUseScreenRadianceMoments;
+    props[kTemporalHistoryLengthCap] = mTemporalHistoryLengthCap;
     props[kUseSpatialFilter] = mUseSpatialFilter;
     props[kSpatialRadiusMin] = mSpatialRadiusMin;
     props[kSpatialRadiusMax] = mSpatialRadiusMax;
@@ -853,6 +976,7 @@ Properties LumenGIPass::getProperties() const
     props[kGDFTraceMaxSteps] = mGDFTraceMaxSteps;
     props[kGDFTraceMaxDistance] = mGDFTraceMaxDistance;
     props[kGDFEmptyDistanceScale] = mGDFEmptyDistanceScale;
+    props[kGDFDiagnosticStage] = mGDFDiagnosticStage;
     return props;
 }
 
@@ -877,6 +1001,25 @@ RenderPassReflection LumenGIPass::reflect(const CompileData& compileData)
     cacheDirect.format(ResourceFormat::RGBA16Float);
     cacheDirect.bindFlags(ResourceBindFlags::ShaderResource | ResourceBindFlags::RenderTarget);
     cacheDirect.flags(RenderPassReflection::Field::Flags::Optional);
+    auto& cacheCapture = reflector.addOutput(kCacheCaptureRadiance, "Surface cache capture radiance atlas before lighting");
+    cacheCapture.texture2D(mAtlasSizeTexels, mAtlasSizeTexels);
+    cacheCapture.format(ResourceFormat::RGBA16Float);
+    cacheCapture.bindFlags(ResourceBindFlags::ShaderResource | ResourceBindFlags::RenderTarget);
+    cacheCapture.flags(RenderPassReflection::Field::Flags::Optional);
+
+    // C7 producer validity sidecar: one packed uint4 per probe direction. The buffer is
+    // optional and only allocated by validity/convergence graphs; production GI never depends
+    // on the diagnostic readback. x packs backend/geometry/radiance/reset bits, y producer frame,
+    // z history generation, and w probe age.
+    const uint64_t probeCount = ((uint64_t)compileData.defaultTexDims.x + LumenScreenProbe::kTileSize - 1u) /
+        LumenScreenProbe::kTileSize * (((uint64_t)compileData.defaultTexDims.y + LumenScreenProbe::kTileSize - 1u) /
+        LumenScreenProbe::kTileSize);
+    const uint64_t validityBytes = probeCount * LumenScreenProbe::kMaxDirectionsPerProbe * sizeof(uint4);
+    FALCOR_ASSERT(validityBytes <= std::numeric_limits<uint32_t>::max());
+    auto& validity = reflector.addOutput("probeValidity", "C7 per-direction producer validity sidecar");
+    validity.rawBuffer((uint32_t)validityBytes);
+    validity.bindFlags(ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+    validity.flags(RenderPassReflection::Field::Flags::Optional);
     return reflector;
 }
 
@@ -885,12 +1028,22 @@ void LumenGIPass::compile(RenderContext* pRenderContext, const CompileData& comp
     if (any(mFrameDim != compileData.defaultTexDims))
     {
         mFrameDim = compileData.defaultTexDims;
-        resetHistory();
+        resetHistory(HistoryResetReason::Resize);
     }
 }
 
 void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    // Surface Cache publication/request fences use the scheduler clock, not
+    // the GI history clock. resetHistory() may rewind mFrameIndex on material,
+    // geometry, or camera invalidation while the page scheduler remains live.
+    mSurfaceCacheFrameIndex = static_cast<uint32_t>(mCaptureScheduler.getFrameIndex());
+    mHistoryResetThisFrame = false;
+    mSurfaceCacheRequestRawThisFrame = 0;
+    mSurfaceCacheRequestCardsThisFrame = 0;
+    mSurfaceCacheRequestCaptureCompletedThisFrame = 0;
+    mSurfaceCachePageMetadataPendingThisFrame = 0;
+    mSurfaceCachePageMetadataReadyThisFrame = 0;
     auto& dict = renderData.getDictionary();
     if (mOptionsChanged)
     {
@@ -905,7 +1058,7 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
     if (any(frameDim != mFrameDim))
     {
         mFrameDim = frameDim;
-        resetHistory();
+        resetHistory(HistoryResetReason::Resize);
     }
 
     // Snapshot the accumulated scene updates before they are consumed below: both the
@@ -913,6 +1066,28 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
     const IScene::UpdateFlags sceneUpdates = mSceneUpdates;
     if (mSceneUpdates != IScene::UpdateFlags::None)
     {
+        const bool lightingChanged =
+            is_set(mSceneUpdates, IScene::UpdateFlags::LightsMoved) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::LightIntensityChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::LightPropertiesChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::LightCollectionChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::MaterialsChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::EmissiveMaterialsChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::EnvMapChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::EnvMapPropertiesChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::LightCountChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::RenderSettingsChanged);
+        if (lightingChanged)
+            ++mLightingGeneration;
+        if (is_set(mSceneUpdates, IScene::UpdateFlags::EnvMapChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::EnvMapPropertiesChanged))
+        {
+            // The importance map is built from the scene's current env map;
+            // discard both it and the reflected variant before rebinding.
+            mpEnvMapSampler = nullptr;
+            mCacheLighting.pPass = nullptr;
+            mCacheLighting.envSamplerVariant = false;
+        }
         if (is_set(mSceneUpdates, IScene::UpdateFlags::RecompileNeeded) ||
             is_set(mSceneUpdates, IScene::UpdateFlags::GeometryChanged))
         {
@@ -927,7 +1102,20 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
         // takes the disocclusion path for one frame.
         const IScene::UpdateFlags hardInvalidation = mSceneUpdates & ~IScene::UpdateFlags::CameraMoved;
         if (hardInvalidation != IScene::UpdateFlags::None)
-            resetHistory();
+            resetHistory(HistoryResetReason::SceneChange);
+
+        // MeshSDF/GDF resources are scene-geometry scoped. Keeping the CPU scene, instance
+        // table, or composed clipmap across a geometry update can make a static camera continue
+        // tracing the old geometry. Rebuild lazily on the next GDF frame; material/light-only
+        // updates keep the distance field and only invalidate lighting/history domains.
+        const bool geometryChanged =
+            is_set(mSceneUpdates, IScene::UpdateFlags::GeometryChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::MeshesChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::GeometryMoved) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::SceneGraphChanged) ||
+            is_set(mSceneUpdates, IScene::UpdateFlags::RecompileNeeded);
+        if (geometryChanged && (mUseGDF || mTraceMode != TraceMode::HardwareRT))
+            invalidateMeshSDF();
         mSceneUpdates = IScene::UpdateFlags::None;
     }
 
@@ -939,8 +1127,61 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
     {
         const float3 camPos = mpScene->getCamera()->getPosition();
         if (length(camPos - mPrevCameraPosition) > mCameraCutDistance)
-            resetHistory(); // hard reset: clear the prev history/depth double buffer on the cut frame.
+            resetHistory(HistoryResetReason::CameraCut); // hard reset: clear the prev history/depth double buffer on the cut frame.
         mPrevCameraPosition = camPos;
+    }
+
+    // C10 preparation: keep the reusable CPU clipmap scheduler alive and feed it the
+    // snapped camera position. This is deliberately bookkeeping-only; it does not
+    // replace HWRT radiance or expose a fake radianceCache render output.
+    if (mUseRadianceCache && mpScene)
+    {
+        if (!mRadianceCache)
+            mRadianceCache = std::make_unique<LumenRadianceCache>();
+        if (mRadianceCacheResetPending || mHistoryResetThisFrame || sceneUpdates != IScene::UpdateFlags::None)
+        {
+            mRadianceCache->reset();
+            if (mRadianceCacheGpu.generation == std::numeric_limits<uint32_t>::max())
+                mRadianceCacheGpu.generation = 1u;
+            else
+                ++mRadianceCacheGpu.generation;
+            mRadianceCacheGpu.currIndex = 0u;
+            mRadianceCacheGpu.lastReadyFrame = 0u;
+            mRadianceCacheGpu.producedThisFrame = false;
+            mRadianceCacheGpu.queryAttempts = 0u;
+            mRadianceCacheGpu.queryHits = 0u;
+            mRadianceCacheGpu.queryMisses = 0u;
+            mRadianceCacheGpu.queryCountersSubmittedFrame = 0u;
+            mRadianceCacheGpu.queryCountersFrame = 0u;
+            mRadianceCacheGpu.queryCountersReadbackPending = false;
+            mRadianceCacheGpu.levelQueryCountersSubmittedFrame = 0u;
+            mRadianceCacheGpu.levelQueryCountersFrame = 0u;
+            mRadianceCacheGpu.levelQueryCountersReadbackPending = false;
+            mRadianceCacheGpu.levelQueryAttempts.fill(0u);
+            mRadianceCacheGpu.levelQueryHits.fill(0u);
+            mRadianceCacheGpu.levelQueryMisses.fill(0u);
+            mRadianceCacheGpu.levelSampleCount.fill(0u);
+            mRadianceCacheGpu.levelValidHitDistanceCount.fill(0u);
+            mRadianceCacheGpu.levelFallbackSampleCount.fill(0u);
+            mRadianceCacheGpu.levelProjectedProbeCount.fill(0u);
+            mRadianceCacheGpu.levelInBoundsProbeCount.fill(0u);
+            if (mRadianceCacheGpu.pQueryCounters)
+                pRenderContext->clearUAV(mRadianceCacheGpu.pQueryCounters->getUAV().get(), uint4(0u));
+            if (mRadianceCacheGpu.pLevelQueryCounters)
+                pRenderContext->clearUAV(mRadianceCacheGpu.pLevelQueryCounters->getUAV().get(), uint4(0u));
+            if (mRadianceCacheGpu.pProbeRadiance[0])
+                pRenderContext->clearUAV(mRadianceCacheGpu.pProbeRadiance[0]->getUAV().get(), float4(0.f));
+            if (mRadianceCacheGpu.pProbeRadiance[1])
+                pRenderContext->clearUAV(mRadianceCacheGpu.pProbeRadiance[1]->getUAV().get(), float4(0.f));
+            if (mRadianceCacheGpu.pProbeValidity[0])
+                pRenderContext->clearUAV(mRadianceCacheGpu.pProbeValidity[0]->getUAV().get(), uint4(0u));
+            if (mRadianceCacheGpu.pProbeValidity[1])
+                pRenderContext->clearUAV(mRadianceCacheGpu.pProbeValidity[1]->getUAV().get(), uint4(0u));
+            mRadianceCacheResetPending = false;
+        }
+        const float3 cacheCamera = mpScene->getCamera()->getPosition();
+        mRadianceCache->setCamera(LumenRadianceCache::float3(cacheCamera.x, cacheCamera.y, cacheCamera.z));
+        mRadianceCache->tick();
     }
 
     clearOutputs(pRenderContext, renderData);
@@ -1056,6 +1297,40 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
 
     // S2: Surface Cache / Cards capture. Pure additive work gated behind mUseSurfaceCache;
     // when disabled the pass behaves exactly like the S1 baseline.
+    // Consume the previous frame's validated GPU page-hit feedback before the scheduler runs,
+    // so touchPage() updates LRU/last-used ordering before this frame's request/capture budget
+    // is selected. This is intentionally outside runScreenProbeTrace(), which executes after
+    // capture and would be one phase too late for demand scheduling.
+    readbackScreenProbeCounters(pRenderContext);
+    // Requested pages carry a readyFrame fence in page metadata.  Count readiness
+    // only for pages that came from the deferred request set; initial resident pages
+    // must not make an unrelated request look like same-frame publication.
+    for (auto it = mSurfaceCachePendingReadyPages.begin(); it != mSurfaceCachePendingReadyPages.end();)
+    {
+        const uint32_t pageID = *it;
+        if (pageID < mPageMetadataData.size() && mPageMetadataData[pageID].x != 0u &&
+            mPageMetadataData[pageID].z <= mSurfaceCacheFrameIndex)
+        {
+            ++mSurfaceCachePageMetadataReadyThisFrame;
+            const uint32_t readyGeneration = mPageMetadataData[pageID].x;
+            for (auto eventIt = mSurfaceCacheRequestEvents.rbegin();
+                 eventIt != mSurfaceCacheRequestEvents.rend(); ++eventIt)
+            {
+                if (eventIt->sceneGeneration == mSurfaceCacheSceneGeneration &&
+                    eventIt->pageID == pageID && eventIt->generation == readyGeneration &&
+                    eventIt->captureFrame != 0u && eventIt->readyFrame == 0u &&
+                    eventIt->captureFrame < mSurfaceCacheFrameIndex)
+                {
+                    eventIt->readyFrame = mSurfaceCacheFrameIndex;
+                    eventIt->state = 3u;
+                    break;
+                }
+            }
+            it = mSurfaceCachePendingReadyPages.erase(it);
+        }
+        else
+            ++it;
+    }
     if (mUseSurfaceCache)
         runSurfaceCacheCapture(pRenderContext, sceneUpdates);
 
@@ -1065,7 +1340,35 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
     // trace neither writes nor reads it, so placement after the trace/capture is safe either way.
     // Requires useSurfaceCache (the atlases and card->page mirror only exist then).
     if (mUseCacheLighting && mUseSurfaceCache)
+    {
+        // Capture writes these atlas resources before cache lighting reads and, for the
+        // radiance atlas, writes them again.  They are pass-owned resources rather than
+        // graph edges, so make the producer/consumer UAV dependency explicit.  Without this
+        // barrier a second LumenGI instance can observe an incompletely published tile even
+        // when its host page/card tables are byte-identical to the first instance.
+        if (mCapture.pMaterialAtlas)
+            pRenderContext->uavBarrier(mCapture.pMaterialAtlas.get());
+        if (mCapture.pMetadataAtlas)
+            pRenderContext->uavBarrier(mCapture.pMetadataAtlas.get());
+        if (mCapture.pRadianceAtlas)
+            pRenderContext->uavBarrier(mCapture.pRadianceAtlas.get());
+        exportCacheCaptureRadiance(pRenderContext, renderData);
         runCacheLighting(pRenderContext);
+        // Cache lighting writes the radiance/visibility atlases through UAVs.  The direct
+        // diagnostic blit and the later ScreenProbe lookup consume those same resources as
+        // SRVs; publish the compute results before either consumer.  Without this edge the
+        // paired full-scan/grid passes can observe different subsets of the just-lit pages.
+        if (mCapture.pRadianceAtlas)
+            pRenderContext->uavBarrier(mCapture.pRadianceAtlas.get());
+        if (mCapture.pCaptureOrderAtlas)
+            pRenderContext->uavBarrier(mCapture.pCaptureOrderAtlas.get());
+        if (mCacheLighting.pVisibilityAtlas)
+            pRenderContext->uavBarrier(mCacheLighting.pVisibilityAtlas.get());
+    }
+    else
+    {
+        exportCacheCaptureRadiance(pRenderContext, renderData);
+    }
 
     // Scriptable S3 gate channel: copy the internal radiance atlas into the optional graph
     // output (atlas-sized) so tests/lumengi can read the cache-direct radiance directly.
@@ -1103,6 +1406,19 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
     // the optional "probeRadiance" grid. Runs after the screen trace every frame.
     if (mUseScreenProbes)
         runScreenProbeTrace(pRenderContext, renderData);
+
+    // C10 bounded source-backed cache producer. It publishes generation/ready-
+    // validated cache samples and exposes them to final resolve as a fallback;
+    // the persistent UE-style allocator/query lifecycle remains a follow-up wave.
+    if (mUseRadianceCache)
+        runRadianceCache(pRenderContext, renderData);
+
+    // E1 diagnostic endpoints stay separate from the diffuse resolve. They
+    // are no-ops unless a graph explicitly allocates the channels; their
+    // compile-time production switches remain disabled until the directional
+    // and medium-aware producers are integrated.
+    runRoughSpecularDiagnostic(pRenderContext, renderData);
+    runTransmissionDiagnostic(pRenderContext, renderData);
 
     // S5: temporal filter (S5-A1 history host + S5-B1 pass). Consumes the S4.3 interpolated GI
     // (probeInterpolated), the GBufferRT linearZ/motion and the S5-A1 prev history/depth double
@@ -1200,10 +1516,23 @@ void LumenGIPass::execute(RenderContext* pRenderContext, const RenderData& rende
 void LumenGIPass::renderUI(Gui::Widgets& widget)
 {
     bool dirty = false;
+    const QualityPreset previousPreset = mQualityPreset;
     dirty |= widget.checkbox("Enabled", mEnabled);
     dirty |= widget.dropdown("Trace mode", mTraceMode);
     dirty |= widget.dropdown("Quality preset", mQualityPreset);
     dirty |= widget.dropdown("Debug output", mDebugMode);
+
+    // The preset dropdown mutates the enum directly. Re-run the same derived-default
+    // transaction used by RenderGraph::updatePass() so UI hot-switches are real runtime
+    // changes rather than a label-only update. Explicit per-property edits remain intact
+    // because parseProperties() applies defaults before the property loop.
+    if (mQualityPreset != previousPreset)
+    {
+        Properties presetProps;
+        presetProps[kQualityPreset] = mQualityPreset;
+        parseProperties(presetProps, true);
+        dirty = true;
+    }
 
     if (auto group = widget.group("Features", true))
     {
@@ -1212,6 +1541,7 @@ void LumenGIPass::renderUI(Gui::Widgets& widget)
         dirty |= group.checkbox("Screen trace", mUseScreenTrace);
         dirty |= group.checkbox("Screen probes", mUseScreenProbes);
         dirty |= group.checkbox("Temporal filter", mUseTemporalFilter);
+        dirty |= group.checkbox("Screen-radiance moments", mUseScreenRadianceMoments);
         dirty |= group.checkbox("Spatial filter", mUseSpatialFilter);
         dirty |= group.checkbox("Radiance cache", mUseRadianceCache);
     }
@@ -1340,7 +1670,7 @@ void LumenGIPass::renderUI(Gui::Widgets& widget)
     if (dirty)
     {
         mOptionsChanged = true;
-        resetHistory();
+        resetHistory(HistoryResetReason::SceneChange);
     }
 }
 
@@ -1349,6 +1679,21 @@ void LumenGIPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pSce
     mUpdateFlagsConnection = {};
     mSceneUpdates = IScene::UpdateFlags::None;
     mpScene = pScene;
+    // The CPU Radiance Cache is scene-owned bookkeeping even before the GPU
+    // producer lands. Drop its clipmap slots and last-used state at the scene
+    // boundary so a later enable cannot query stale keys from the previous TLAS.
+    if (mRadianceCache)
+        mRadianceCache->reset();
+    mRadianceCacheResetPending = true;
+    // Keep the allocator's page generations scene-local (reset() clears them), but expose a
+    // monotonic scene epoch for stale-history/page-lifecycle validation and reload gates.
+    if (mSurfaceCacheSceneGeneration == std::numeric_limits<uint32_t>::max())
+        mSurfaceCacheSceneGeneration = 1u;
+    else
+        ++mSurfaceCacheSceneGeneration;
+    if (mSurfaceCacheResetCount != std::numeric_limits<uint32_t>::max())
+        ++mSurfaceCacheResetCount;
+    ++mLightingGeneration;
     mTracer.pProgram = nullptr;
     mTracer.pBindingTable = nullptr;
     mTracer.pVars = nullptr;
@@ -1383,7 +1728,7 @@ void LumenGIPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pSce
         if (mCacheLighting.pBounceCount)
             pRenderContext->clearUAV(mCacheLighting.pBounceCount->getUAV().get(), uint4(0));
     }
-    resetHistory();
+    resetHistory(HistoryResetReason::SetScene);
 
     // S2: rebuild the card scene and reset the CPU components. invalidateCaptureResources()
     // drops every GPU resource that references the old scene's mesh buffers (atlases persist:
@@ -1393,6 +1738,19 @@ void LumenGIPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pSce
     invalidateCaptureResources();
     mpCardScene = pScene ? std::make_unique<LumenCardScene>(pScene) : nullptr;
     mPageCache.reset();
+    mSurfaceCacheRequestedCards.clear();
+    mSurfaceCacheDeferredRequestCards.clear();
+    mSurfaceCacheDeferredRequestFrameByCard.clear();
+    mSurfaceCachePendingReadyPages.clear();
+    mSurfaceCacheRequestEvents.clear();
+    mSurfaceCacheRequestEventSequence = 0;
+    mSurfaceCacheRequestEventDropped = 0;
+    mSurfaceCacheDeferredRequestFrame = 0;
+    mSurfaceCacheFrameIndex = 0;
+    mScreenProbeCountersSubmittedFrame = 0;
+    mScreenProbes.cacheFeedbackReadbackPending = false;
+    mScreenProbes.cacheFeedbackSubmittedFrame = 0;
+    mScreenProbes.cacheRequestReadbackPending = false;
     mCaptureScheduler = LumenCaptureSchedulerForScene(
         mpCardScene.get(), &mPageCache, mCaptureMaxPagesPerFrame, kLumenCaptureDefaultInFlightTimeoutFrames
     );
@@ -1408,6 +1766,11 @@ void LumenGIPass::onHotReload(HotReloadFlags reloaded)
 {
     if (is_set(reloaded, HotReloadFlags::Program))
     {
+        // Shader reloads invalidate producer layouts and any future RC payload
+        // ABI. Keep the CPU scheduler deterministic until the next frame rebuild.
+        if (mRadianceCache)
+            mRadianceCache->reset();
+        mRadianceCacheResetPending = true;
         mpDebugPass = nullptr;
         mTracer.pProgram = nullptr;
         mTracer.pBindingTable = nullptr;
@@ -1423,15 +1786,32 @@ void LumenGIPass::onHotReload(HotReloadFlags reloaded)
         mTemporalFilter.pFilter = nullptr; // pure compute, no scene deps; recreated lazily.
         mSpatialFilter.pFilter = nullptr;  // pure compute, no scene deps; recreated lazily.
         mFinalResolve.pPass = nullptr;     // C9 pure compute pass; recreated lazily.
-    mSDF.pCompose = nullptr;           // S6: pure compute, no scene deps; recreated lazily.
-    mSDF.pTrace = nullptr;
-    resetHistory();
+        mSDF.pCompose = nullptr;           // S6: pure compute, no scene deps; recreated lazily.
+        mSDF.pComposeDiag = nullptr;       // C4 diagnostic pass; recreated lazily.
+        mSDF.pComposeDiagAll = nullptr;    // C4 diagnostic pass; recreated lazily.
+        mSDF.pComposeDiagBuffers = nullptr; // C4 E2a diagnostic pass.
+        mSDF.pComposeDiagAtlas = nullptr;   // C4 E2b diagnostic pass.
+        mSDF.pComposeDiagBuffersScalar = nullptr; // C4 E2c diagnostic pass.
+        mSDF.pComposeDiagCBScalar = nullptr; // C4 E2d diagnostic pass.
+        mSDF.pTrace = nullptr;
+        resetHistory(HistoryResetReason::HotReload);
     }
 }
 
-void LumenGIPass::resetHistory()
+void LumenGIPass::resetHistory(HistoryResetReason reason)
 {
     mFrameIndex = 0;
+    // Page-clear telemetry is epoch-scoped. A stale-texel proof from a previous
+    // scene/history epoch must not satisfy the current pressure gate.
+    mSurfaceCachePageClearCommandsTotal = 0u;
+    mSurfaceCachePageClearTexelsTotal = 0u;
+    if (!mHistoryResetThisFrame)
+    {
+        ++mHistoryGeneration;
+        ++mHistoryResetCount;
+        mLastHistoryResetReason = reason;
+        mHistoryResetThisFrame = true;
+    }
     // S5-A1: mark the prev history/depth double buffer for a hard clear (camera cut / resize /
     // scene change). The actual clear is emitted inside runTemporalFilter (it needs a
     // RenderContext, and setScene/onHotReload call this before the buffers exist). Clearing the
@@ -1574,6 +1954,57 @@ void LumenGIPass::readbackCounters(RenderContext* pRenderContext)
 std::map<std::string, double> LumenGIPass::getSurfaceCacheStats() const
 {
     std::map<std::string, double> stats;
+    // Deterministic page-publication fingerprints used by paired C5 diagnostics.
+    // These are host-table hashes only; they never participate in shader decisions.
+    auto hashWords = [](const auto& words, uint64_t seed)
+    {
+        uint64_t hash = seed;
+        for (const auto& word : words)
+        {
+            const uint32_t values[] = {word.x, word.y, word.z, word.w};
+            for (uint32_t value : values)
+            {
+                hash ^= uint64_t(value);
+                hash *= 1099511628211ull;
+            }
+        }
+        return hash;
+    };
+    auto hashScalars = [](const auto& words, uint64_t seed)
+    {
+        uint64_t hash = seed;
+        for (const auto& word : words)
+        {
+            hash ^= uint64_t(word);
+            hash *= 1099511628211ull;
+        }
+        return hash;
+    };
+    auto hashCards = [](const auto& cardScene, uint64_t seed)
+    {
+        if (!cardScene)
+            return seed;
+        uint64_t hash = seed;
+        for (uint32_t index = 0; index < cardScene->getCardCount(); ++index)
+        {
+            const auto card = cardScene->getCard(index);
+            const auto* bytes = reinterpret_cast<const uint8_t*>(&card);
+            for (size_t byte = 0; byte < sizeof(card); ++byte)
+            {
+                hash ^= uint64_t(bytes[byte]);
+                hash *= 1099511628211ull;
+            }
+        }
+        return hash;
+    };
+    const uint64_t pageMetadataHash = hashWords(mPageMetadataData, 1469598103934665603ull);
+    const uint64_t pageToCardHash = hashScalars(mPageToCardData, 1469598103934665603ull);
+    const uint64_t renderListHash = hashScalars(mRenderListData, 1469598103934665603ull);
+    const uint64_t cardBufferHash = hashCards(mpCardScene, 1469598103934665603ull);
+    stats["pageMetadataHash"] = static_cast<double>(pageMetadataHash);
+    stats["pageToCardHash"] = static_cast<double>(pageToCardHash);
+    stats["renderListHash"] = static_cast<double>(renderListHash);
+    stats["cardBufferHash"] = static_cast<double>(cardBufferHash);
     stats["frameIndex"] = (double)mFrameIndex;
     stats["useSurfaceCache"] = mUseSurfaceCache ? 1.0 : 0.0;
     stats["maxPagesPerFrame"] = (double)mCaptureMaxPagesPerFrame;
@@ -1590,15 +2021,74 @@ std::map<std::string, double> LumenGIPass::getSurfaceCacheStats() const
 
     const LumenSurfaceCacheStats cacheStats = mPageCache.getStats();
     stats["totalPages"] = (double)cacheStats.pageCount;
+    stats["surfaceCacheFrameIndex"] = (double)mSurfaceCacheFrameIndex;
+    stats["minResidencyFrames"] = (double)cacheStats.minResidencyFrames;
     stats["allocatedPages"] = (double)cacheStats.allocatedPageCount;
     stats["freePages"] = (double)cacheStats.freePageCount;
     stats["evictedPendingPages"] = (double)cacheStats.evictedPendingCount;
     stats["coverage"] = cacheStats.pageCount > 0 ? (double)cacheStats.allocatedPageCount / (double)cacheStats.pageCount : 0.0;
+    // Keep exact byte counters alongside the legacy MiB field.  The benchmark
+    // and release gates use these to distinguish Surface Cache residency from
+    // total process/GPU VRAM (which is reported separately by the profiler).
+    stats["residentBytes"] = (double)cacheStats.residentBytes;
+    stats["memoryBudgetBytes"] = (double)cacheStats.memoryBudgetBytes;
     stats["residentBytesMB"] = (double)(cacheStats.residentBytes >> 20);
+    stats["memoryBudgetMB"] = (double)(cacheStats.memoryBudgetBytes >> 20);
     stats["allocations"] = (double)cacheStats.allocationCount;
     stats["releases"] = (double)cacheStats.releaseCount;
     stats["evictions"] = (double)cacheStats.evictionCount;
+    stats["lastAllocatedPageID"] = (double)cacheStats.lastAllocatedPageID;
+    stats["lastAllocatedGeneration"] = (double)cacheStats.lastAllocatedGeneration;
+    stats["lastAllocatedFrame"] = (double)cacheStats.lastAllocatedFrame;
+    stats["lastEvictedPageID"] = (double)cacheStats.lastEvictedPageID;
+    stats["lastEvictedGeneration"] = (double)cacheStats.lastEvictedGeneration;
+    stats["lastEvictedFrame"] = (double)cacheStats.lastEvictedFrame;
+    stats["lastTouchedPageID"] = (double)cacheStats.lastTouchedPageID;
+    stats["lastTouchedFrame"] = (double)cacheStats.lastTouchedFrame;
     stats["invalidations"] = (double)cacheStats.invalidationCount;
+    uint32_t metadataAllocated = 0u;
+    uint32_t metadataTouched = 0u;
+    uint32_t metadataInvalid = 0u;
+    uint32_t maxPageGeneration = 0u;
+    for (size_t pageID = 1u; pageID < mPageMetadataData.size(); ++pageID)
+    {
+        maxPageGeneration = std::max(maxPageGeneration, mPageMetadataData[pageID].x);
+        switch (static_cast<LumenSurfaceCachePageState>(mPageMetadataData[pageID].y))
+        {
+        case LumenSurfaceCachePageState::Allocated: ++metadataAllocated; break;
+        case LumenSurfaceCachePageState::Touched: ++metadataTouched; break;
+        default: ++metadataInvalid; break;
+        }
+    }
+    stats["pageMetadataAllocated"] = (double)metadataAllocated;
+    stats["pageMetadataTouched"] = (double)metadataTouched;
+    stats["pageMetadataInvalid"] = (double)metadataInvalid;
+    uint32_t metadataPending = 0u;
+    for (size_t pageID = 1u; pageID < mPageMetadataData.size(); ++pageID)
+    {
+        if (mPageMetadataData[pageID].x != 0u && mPageMetadataData[pageID].z > mSurfaceCacheFrameIndex)
+            ++metadataPending;
+    }
+    stats["pageMetadataPending"] = (double)metadataPending;
+    stats["pageMetadataReady"] = (double)(metadataAllocated + metadataTouched - metadataPending);
+    stats["surfaceCacheSceneGeneration"] = (double)mSurfaceCacheSceneGeneration;
+    stats["surfaceCacheResetCount"] = (double)mSurfaceCacheResetCount;
+    stats["cacheFeedbackStatsFrame"] = (double)mScreenProbes.cacheFeedbackSubmittedFrame;
+    stats["generationRejects"] = (double)mSurfaceCacheGenerationRejects;
+    // C6 page-lifecycle telemetry. These are host-authoritative counters; no image-derived
+    // inference is used by the runtime gate. pageGeneration is the highest resident allocator
+    // generation currently published to the GPU page metadata buffer.
+    stats["pageGeneration"] = (double)maxPageGeneration;
+    stats["generationMismatchRejects"] = (double)mSurfaceCacheGenerationRejects;
+    stats["stateMismatchRejects"] = (double)mSurfaceCacheStateRejects;
+    stats["staleOwnerRejects"] = (double)mSurfaceCacheStaleOwnerRejects;
+    stats["cardGridDim"] = (double)LumenScreenProbe::kCacheCardGridDim;
+    stats["cardGridMaxCandidates"] = (double)LumenScreenProbe::kCacheCardGridMaxCandidates;
+    stats["cardGridCandidateCount"] = (double)mCardGridCandidateCount;
+    stats["cardGridOverflowCells"] = (double)mCardGridOverflowCells;
+    stats["cardGridCardsIndexed"] = (double)mCardGridCardsIndexed;
+    stats["cardGridMissingCards"] = mpCardScene ?
+        (double)std::max<int64_t>(0, int64_t(mpCardScene->getCardCount()) - int64_t(mCardGridCardsIndexed)) : 0.0;
 
     const LumenCaptureSchedulerStats schedulerStats = mCaptureScheduler.getStats();
     stats["schedulerFrameIndex"] = (double)schedulerStats.frameIndex;
@@ -1610,12 +2100,69 @@ std::map<std::string, double> LumenGIPass::getSurfaceCacheStats() const
     stats["schedReleases"] = (double)schedulerStats.totalReleases;
     stats["schedLostPages"] = (double)schedulerStats.totalLostPages;
     stats["schedTouches"] = (double)schedulerStats.totalTouches;
+    // C6.1 GPU demand feedback is reported separately from scheduler worklist deduplication.
+    // These counters are monotonically accumulated only after host-side scene/generation/state
+    // validation, so they are safe evidence of actual cache demand rather than image inference.
+    stats["surfaceCacheFeedbackHits"] = (double)mSurfaceCacheFeedbackHits;
+    stats["surfaceCacheFeedbackPages"] = (double)mSurfaceCacheFeedbackPages;
+    stats["surfaceCacheFeedbackDedup"] = (double)mSurfaceCacheFeedbackDedup;
+    stats["surfaceCacheFeedbackStaleRejects"] = (double)mSurfaceCacheFeedbackStaleRejects;
+    stats["surfaceCacheRequestRaw"] = (double)mSurfaceCacheRequestRaw;
+    stats["surfaceCacheRequestCards"] = (double)mSurfaceCacheRequestCards;
+    stats["surfaceCacheRequestDedup"] = (double)mSurfaceCacheRequestDedup;
+    stats["surfaceCacheRequestStaleRejects"] = (double)mSurfaceCacheRequestStaleRejects;
+    stats["surfaceCacheRequestCaptureCompleted"] = (double)mSurfaceCacheRequestCaptureCompleted;
+    // Per-host-frame event telemetry. These values are intentionally not cumulative;
+    // they are the only counters consumed by the strict C6 N->N+1 validator.
+    stats["requestRawThisFrame"] = (double)mSurfaceCacheRequestRawThisFrame;
+    stats["requestCardsThisFrame"] = (double)mSurfaceCacheRequestCardsThisFrame;
+    stats["requestCaptureCompletedThisFrame"] = (double)mSurfaceCacheRequestCaptureCompletedThisFrame;
+    stats["pageMetadataPendingThisFrame"] = (double)mSurfaceCachePageMetadataPendingThisFrame;
+    stats["pageMetadataReadyThisFrame"] = (double)mSurfaceCachePageMetadataReadyThisFrame;
+    stats["requestObservedFrame"] = (double)mSurfaceCacheRequestObservedFrame;
+    stats["requestCaptureFrame"] = (double)mSurfaceCacheRequestCaptureFrame;
+    stats["surfaceCacheRequestReasonUnmapped"] = (double)mSurfaceCacheRequestUnmapped;
+    stats["surfaceCacheRequestReasonStaleOwner"] = (double)mSurfaceCacheRequestStaleOwner;
+    stats["surfaceCacheRequestReasonMetadataInvalid"] = (double)mSurfaceCacheRequestMetadataInvalid;
+    stats["surfaceCacheRequestReasonVisibilityInvalid"] = (double)mSurfaceCacheRequestVisibilityInvalid;
+    stats["surfaceCacheEventCount"] = (double)mSurfaceCacheRequestEvents.size();
+    stats["surfaceCacheEventDropped"] = (double)mSurfaceCacheRequestEventDropped;
+    // Mirror the one-frame-lagged probe lookup counters into surfaceCacheStats so the C6
+    // activity gate can prove that resident-page cache hits have corresponding GPU feedback
+    // without joining two unrelated graph outputs in the test harness.
+    stats["cacheLookupHits"] = (double)mScreenProbeStats.cacheLookupHits;
+    stats["cacheLookupAttempts"] = (double)mScreenProbeStats.cacheLookupAttempts;
+    stats["cachePageRejects"] = (double)mScreenProbeStats.cachePageRejects;
+    stats["cacheCoverageRejects"] = (double)mScreenProbeStats.cacheCoverageRejects;
+    stats["cacheMetadataRejects"] = (double)mScreenProbeStats.cacheMetadataRejects;
+    stats["cacheVisibilityRejects"] = (double)mScreenProbeStats.cacheVisibilityRejects;
+    stats["cacheDepthRejects"] = (double)mScreenProbeStats.cacheDepthRejects;
+    stats["cacheAxisRejects"] = (double)mScreenProbeStats.cacheAxisRejects;
+    stats["cacheFacingRejects"] = (double)mScreenProbeStats.cacheFacingRejects;
+    stats["cacheOwnerValid"] = (double)mScreenProbeStats.cacheOwnerValid;
+    stats["cacheLookupHitsThisFrame"] = (double)mScreenProbeStats.cacheLookupHits;
+    stats["cacheLookupAttemptsThisFrame"] = (double)mScreenProbeStats.cacheLookupAttempts;
+    stats["cacheLookupStatsFrame"] = (double)mScreenProbeStatsFrame;
+    stats["surfaceCacheHits"] = (double)mScreenProbeStats.cacheLookupHits;
+    stats["schedulerRequestDedup"] = (double)schedulerStats.totalRequestDeduplications;
+    stats["requestDedup"] = (double)(schedulerStats.totalRequestDeduplications + mSurfaceCacheFeedbackDedup);
+    stats["lastUsed"] = (double)(schedulerStats.totalTouches + mSurfaceCacheFeedbackPages);
     stats["schedCompletedCaptures"] = (double)schedulerStats.completedCaptures;
     stats["avgQueuedFrames"] = schedulerStats.averageQueuedFrames;
     stats["maxQueuedFrames"] = (double)schedulerStats.maxQueuedFrames;
     stats["pendingQueueDepth"] = (double)schedulerStats.pendingQueueDepth;
     stats["maxPendingDepth"] = (double)schedulerStats.maxPendingDepth;
     stats["schedStructuralRebuilds"] = (double)schedulerStats.structuralRebuildCount;
+    // C6 identity telemetry: the last emitted command identifies the actual card/page pair
+    // selected by the scheduler. Invalid IDs are exported as uint32 sentinels so the runner
+    // can distinguish "no command" from a valid card/page zero.
+    stats["lastCommandCardID"] = (double)schedulerStats.lastCommandCardID;
+    stats["lastCommandPageID"] = (double)schedulerStats.lastCommandPageID;
+    stats["lastCommandGeneration"] = (double)schedulerStats.lastCommandGeneration;
+    stats["lastRequestedCardID"] = (double)schedulerStats.lastCommandCardID;
+    stats["lastCapturedCardID"] = (double)schedulerStats.lastCommandCardID;
+    stats["lastCardID"] = (double)schedulerStats.lastCommandCardID;
+    stats["cardID"] = (double)schedulerStats.lastCommandCardID;
 
     const LumenCaptureFrameStats& last = mLastCaptureFrameStats;
     stats["lastRequestedCards"] = (double)last.requestedCards;
@@ -1630,10 +2177,24 @@ std::map<std::string, double> LumenGIPass::getSurfaceCacheStats() const
     stats["lastReleasedPages"] = (double)last.releasedPages;
     stats["lastLostPages"] = (double)last.lostPages;
     stats["lastTouchCalls"] = (double)last.touchCalls;
+    stats["lastFrameCommandCardID"] = (double)last.lastCommandCardID;
+    stats["lastFrameCommandPageID"] = (double)last.lastCommandPageID;
+    stats["lastFrameCommandGeneration"] = (double)last.lastCommandGeneration;
+    stats["pageClearCommands"] = (double)mSurfaceCachePageClearCommands;
+    stats["pageClearTexels"] = (double)mSurfaceCachePageClearTexels;
+    stats["pageClearCommandsTotal"] = (double)mSurfaceCachePageClearCommandsTotal;
+    stats["pageClearTexelsTotal"] = (double)mSurfaceCachePageClearTexelsTotal;
+    // The page-local clear is the stale-texel fence: every capture command clears a complete
+    // 16x16 tile before raster writes. Export a typed sentinel only when the command/texel
+    // invariant is true; the C6 runner treats this as a clear-fence proof, not image inference.
+    stats["staleTexelSentinel"] =
+        (mSurfaceCachePageClearCommandsTotal > 0u &&
+         mSurfaceCachePageClearTexelsTotal == mSurfaceCachePageClearCommandsTotal * 16u * 16u) ? 1.0 : 0.0;
 
     // S3: Surface Cache lighting state and counters. cacheLightingPagesLit is the dispatch
     // size of the last run; the counters are the last completed dispatch's readback.
     stats["useCacheLighting"] = mUseCacheLighting ? 1.0 : 0.0;
+    stats["useCacheCardGrid"] = mUseCacheCardGrid ? 1.0 : 0.0;
     stats["cacheLightingActive"] = (mUseCacheLighting && mUseSurfaceCache) ? 1.0 : 0.0;
     stats["cacheLightingPagesLit"] = (double)mLastCacheLightingPageCount;
     stats["cacheLightingSamplesPerTexel"] = (double)cacheLightingSamplesPerTexel();
@@ -1641,8 +2202,75 @@ std::map<std::string, double> LumenGIPass::getSurfaceCacheStats() const
     stats["cacheLightingCounterFirefly"] = (double)mCacheLightingCounters.fireflySamples;
     stats["cacheLightingCounterNegative"] = (double)mCacheLightingCounters.negativeSamples;
     stats["cacheLightingCounterTraced"] = (double)mCacheLightingCounters.tracedSamples;
+    // C5 producer provenance.  These are read-only host-side inputs to the cache-lighting
+    // dispatch, exported so paired runs can prove that seed/frame/TLAS/variant state matches
+    // before attributing an atlas delta to the producer.  They never participate in shading.
+    constexpr uint32_t kCacheLightingSeedTelemetry = 0x51B8DC0Du;
+    const bool cacheLightingTlasPresent = mpScene && mpScene->getSceneStats().tlasCount > 0u;
+    const bool cacheLightingShadowsOff = []()
+    {
+        const char* value = std::getenv("LUMEN_C5_DISABLE_CACHE_SHADOWS");
+        return value && (std::string(value) == "1" || std::string(value) == "true");
+    }();
+    stats["cacheLightingSeed"] = (double)kCacheLightingSeedTelemetry;
+    stats["cacheLightingFrameIndex"] = (double)mFrameIndex;
+    stats["cacheLightingSurfaceCacheFrameIndex"] = (double)mSurfaceCacheFrameIndex;
+    stats["cacheLightingRayTypeCount"] = 1.0;
+    stats["cacheLightingTlasPresent"] = cacheLightingTlasPresent ? 1.0 : 0.0;
+    stats["cacheLightingUseEnvLight"] = mpScene && mpScene->useEnvLight() ? 1.0 : 0.0;
+    stats["cacheLightingUseAnalyticLights"] = mpScene && mpScene->useAnalyticLights() ? 1.0 : 0.0;
+    stats["cacheLightingUseEmissiveLights"] = mpScene && mpScene->useEmissiveLights() ? 1.0 : 0.0;
+    stats["cacheLightingEnvSampler"] = mpEnvMapSampler ? 1.0 : 0.0;
+    stats["cacheLightingEmissiveSampler"] = mpEmissiveLightSampler ? 1.0 : 0.0;
+    stats["cacheLightingShadowsEnabled"] = cacheLightingShadowsOff ? 0.0 : 1.0;
+    stats["cacheLightingFeedbackEnabled"] =
+        (mCacheLightingFeedbackEnabled && mUseCacheLighting && mUseSurfaceCache) ? 1.0 : 0.0;
+    // A compact variant fingerprint makes paired diagnostics robust to flag ordering and
+    // provides one scalar to compare in scripts without exposing a production shader hash.
+    uint64_t cacheLightingVariant = 1469598103934665603ull;
+    const uint32_t variantFlags[] = {
+        (uint32_t)(mpScene && mpScene->useEnvLight()),
+        (uint32_t)(mpScene && mpScene->useAnalyticLights()),
+        (uint32_t)(mpScene && mpScene->useEmissiveLights()),
+        (uint32_t)(mpEnvMapSampler != nullptr),
+        (uint32_t)(mpEmissiveLightSampler != nullptr),
+        (uint32_t)!cacheLightingShadowsOff,
+        (uint32_t)(mCacheLightingFeedbackEnabled && mUseCacheLighting && mUseSurfaceCache),
+        1u, // canonical one-ray-type TLAS binding
+    };
+    for (const uint32_t flag : variantFlags)
+    {
+        cacheLightingVariant ^= (uint64_t)flag;
+        cacheLightingVariant *= 1099511628211ull;
+    }
+    stats["cacheLightingVariantFingerprint"] = (double)cacheLightingVariant;
 
     return stats;
+}
+
+std::vector<std::map<std::string, double>> LumenGIPass::getSurfaceCacheEvents() const
+{
+    std::vector<std::map<std::string, double>> result;
+    result.reserve(mSurfaceCacheRequestEvents.size());
+    for (const auto& event : mSurfaceCacheRequestEvents)
+    {
+        std::map<std::string, double> record;
+        record["sequence"] = (double)event.sequence;
+        record["sceneGeneration"] = (double)event.sceneGeneration;
+        record["cardID"] = (double)event.cardIndex;
+        record["pageID"] = (double)event.pageID;
+        record["generation"] = (double)event.generation;
+        record["requestFrame"] = (double)event.requestFrame;
+        record["captureFrame"] = (double)event.captureFrame;
+        record["readyFrame"] = (double)event.readyFrame;
+        record["firstHitFrame"] = (double)event.firstHitFrame;
+        record["reasonBits"] = (double)event.reasonBits;
+        record["requestCount"] = (double)event.requestCount;
+        record["lookupHits"] = (double)event.lookupHits;
+        record["state"] = (double)event.state;
+        result.emplace_back(std::move(record));
+    }
+    return result;
 }
 
 void LumenGIPass::invalidateCaptureResources()
@@ -1657,14 +2285,33 @@ void LumenGIPass::invalidateCaptureResources()
     mCapture.pInstanceIDs = nullptr;
     mCapture.pCards = nullptr;
     mCapture.pPageTable = nullptr;
+    mCapture.pPageGeneration = nullptr;
     mCapture.pDrawArgs = nullptr;
     mCardPageTable.clear();
     mCardPageGeneration.clear();
+    mPageMetadataData.clear();
+    mSurfaceCacheRequestedCards.clear();
+    mSurfaceCacheDeferredRequestCards.clear();
+    mSurfaceCacheDeferredRequestFrameByCard.clear();
+    mSurfaceCachePendingReadyPages.clear();
+    mSurfaceCacheRequestEvents.clear();
+    mSurfaceCacheRequestEventSequence = 0;
+    mCardGridData.clear();
+    mCardGridMin = float3(0.f);
+    mCardGridInvCellSize = float3(1.f);
+    mCardGridOverflowCells = 0u;
+    mCardGridCandidateCount = 0u;
+    mCardGridCardsIndexed = 0u;
     // S3: the cache lighting program carries the scene defines/type conformances and must be
     // recreated on scene/geometry rebuilds. The pageToCard/renderList buffers and the visibility
     // atlas are atlas-lifetime (fixed size) and are deliberately kept; their contents are rebuilt
     // every frame.
     mCacheLighting.pPass = nullptr;
+    mCacheLighting.envSamplerVariant = false;
+    // The C10 producer embeds scene modules/type conformances in its program;
+    // rebuild it whenever the scene-scoped capture programs are invalidated.
+    mRadianceCacheGpu.pBuild = nullptr;
+    mRadianceCacheGpu.pInterpolate = nullptr;
 }
 
 void LumenGIPass::ensureCaptureResources(RenderContext* pRenderContext)
@@ -1702,6 +2349,15 @@ void LumenGIPass::ensureCaptureResources(RenderContext* pRenderContext)
         mCapture.pMetadataAtlas->setName("LumenGIPass::Capture::MetadataAtlas"); // RGBA16F, 8 B/texel, atlas lifetime.
         pRenderContext->clearUAV(mCapture.pMetadataAtlas->getUAV().get(), float4(0.f));
     }
+    if (!mCapture.pCaptureOrderAtlas)
+    {
+        mCapture.pCaptureOrderAtlas = mpDevice->createTexture2D(
+            mAtlasSizeTexels, mAtlasSizeTexels, ResourceFormat::R32Uint, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mCapture.pCaptureOrderAtlas->setName("LumenGIPass::Capture::OrderAtlas");
+        pRenderContext->clearUAV(mCapture.pCaptureOrderAtlas->getUAV().get(), uint4(0xffffffffu));
+    }
 
     const uint32_t cardCount = mpCardScene->getCardCount();
 
@@ -1716,6 +2372,8 @@ void LumenGIPass::ensureCaptureResources(RenderContext* pRenderContext)
         mCardPageGeneration.assign(cardCount, 0u);
         mCapture.pPageTable = mpDevice->createStructuredBuffer(sizeof(uint32_t), cardCount, ResourceBindFlags::ShaderResource);
         mCapture.pPageTable->setName("LumenGIPass::Capture::PageTable"); // cardIndex -> pageID, uint32, scene-scoped.
+        mCapture.pPageGeneration = mpDevice->createStructuredBuffer(sizeof(uint32_t), cardCount, ResourceBindFlags::ShaderResource);
+        mCapture.pPageGeneration->setName("LumenGIPass::Capture::PageGeneration"); // cardIndex -> capture generation.
     }
 
     // Indirect draw argument blob: one 20-byte argument per command. Capacity = the per-frame
@@ -1728,6 +2386,19 @@ void LumenGIPass::ensureCaptureResources(RenderContext* pRenderContext)
             (size_t)maxCommands * kCaptureDrawArgBytes, ResourceBindFlags::IndirectArg, MemoryType::DeviceLocal, nullptr
         );
         mCapture.pDrawArgs->setName("LumenGIPass::Capture::DrawArgs"); // DrawIndexedArguments/DrawArguments blob, scene-scoped.
+    }
+
+    // Page-local clear resources are atlas-lifetime and independent of the scene program.
+    // The page-ID list is resized with the capture budget; the shader clears exactly one
+    // unique 16x16 page per Z slice before raster capture.
+    if (!mCapture.pPageClear)
+        mCapture.pPageClear = ComputePass::create(mpDevice, kPageClearShaderFile, "main");
+    if (!mCapture.pPageIDs || mCapture.pPageIDs->getElementCount() < maxCommands)
+    {
+        mCapture.pPageIDs = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), maxCommands, ResourceBindFlags::ShaderResource
+        );
+        mCapture.pPageIDs->setName("LumenGIPass::Capture::PageClearIDs");
     }
 
     if (!mCapture.pProgram)
@@ -1761,8 +2432,219 @@ void LumenGIPass::runSurfaceCacheCapture(RenderContext* pRenderContext, IScene::
     if (!mCapture.pProgram)
         return;
 
+    const uint32_t pageCount = mPageCache.getPageCount();
+    if (mPageMetadataData.size() != pageCount + 1u)
+        mPageMetadataData.assign(pageCount + 1u, uint4(0u));
+
+    // Promote miss requests observed at the start of this host frame only now,
+    // immediately before scheduling capture.  This one-frame handoff is the
+    // explicit C6 N->N+1 publication fence; readback itself never enqueues a
+    // capture on the request-observation frame.
+    if (!mSurfaceCacheDeferredRequestCards.empty())
+    {
+        std::vector<uint32_t> readyRequests;
+        readyRequests.reserve(mSurfaceCacheDeferredRequestCards.size());
+        for (const uint32_t cardIndex : mSurfaceCacheDeferredRequestCards)
+        {
+            const auto frameIt = mSurfaceCacheDeferredRequestFrameByCard.find(cardIndex);
+            if (frameIt != mSurfaceCacheDeferredRequestFrameByCard.end() && frameIt->second < mSurfaceCacheFrameIndex)
+                readyRequests.push_back(cardIndex);
+        }
+        for (const uint32_t cardIndex : readyRequests)
+        {
+            if (mCaptureScheduler.enqueueFeedbackRequest(cardIndex))
+                mSurfaceCacheRequestedCards.insert(cardIndex);
+            else
+            {
+                // The scheduler can reject a deferred request after the allocator has become
+                // saturated.  Close its ledger event explicitly instead of leaving a permanent
+                // state=1 request that can never reach capture/ready.
+                for (auto eventIt = mSurfaceCacheRequestEvents.rbegin();
+                     eventIt != mSurfaceCacheRequestEvents.rend(); ++eventIt)
+                {
+                    if (eventIt->sceneGeneration == mSurfaceCacheSceneGeneration &&
+                        eventIt->cardIndex == cardIndex && eventIt->state >= 1u && eventIt->state < 3u)
+                    {
+                        eventIt->reasonBits |= 2u;
+                        eventIt->state = 5u;
+                        break;
+                    }
+                }
+            }
+            mSurfaceCacheDeferredRequestCards.erase(cardIndex);
+            mSurfaceCacheDeferredRequestFrameByCard.erase(cardIndex);
+        }
+    }
+
     const LumenCaptureFrame frame = mCaptureScheduler.scheduleFrame(updateFlags);
+    // scheduleFrame() is the authoritative monotonic Surface Cache clock. It
+    // is intentionally independent of mFrameIndex/history resets.
+    const uint64_t schedulerFrame = mCaptureScheduler.getFrameIndex();
+    mSurfaceCacheFrameIndex = static_cast<uint32_t>(schedulerFrame > 0u ? schedulerFrame - 1u : 0u);
     mLastCaptureFrameStats = frame.stats;
+    mSurfaceCachePageClearCommands = 0u;
+    mSurfaceCachePageClearTexels = 0u;
+
+    // Requests that remain unassigned for a bounded scheduler interval are explicit drops,
+    // rather than immortal state=1 records.  This is especially important under a tiny atlas:
+    // the allocator can legitimately reject work for many frames while it protects residency.
+    // Marking the timeout as a terminal stale outcome preserves the identity/latency evidence
+    // without pretending that a capture happened.
+    for (auto& event : mSurfaceCacheRequestEvents)
+    {
+        if (event.sceneGeneration != mSurfaceCacheSceneGeneration || event.state != 1u ||
+            event.requestFrame + kLumenMinResidencyFrames >= mSurfaceCacheFrameIndex ||
+            event.pageID != kInvalidPageID && event.generation != 0u)
+        {
+            continue;
+        }
+        event.reasonBits |= 2u;
+        event.state = 5u;
+        ++mSurfaceCacheRequestStaleRejects;
+    }
+
+    // Record an explicit terminal stale-owner event whenever a scheduler command reuses a
+    // page at a new generation.  Aggregate allocator stats expose only the most recent victim,
+    // while the strict pressure gate needs the old pageID/generation pair to prove reuse.  Keep
+    // this helper local so the event ring remains bounded and no production page state is changed.
+    auto recordStaleOwnerEvent = [&](uint32_t cardIndex, uint32_t pageID, uint32_t generation)
+    {
+        if (pageID == kInvalidPageID || generation == 0u)
+            return;
+        const bool alreadyRecorded = std::any_of(
+            mSurfaceCacheRequestEvents.begin(), mSurfaceCacheRequestEvents.end(),
+            [&](const SurfaceCacheRequestEvent& event)
+            {
+                return event.sceneGeneration == mSurfaceCacheSceneGeneration &&
+                    event.pageID == pageID && event.generation == generation && event.state == 5u;
+            }
+        );
+        if (alreadyRecorded)
+            return;
+        // Keep enough identity records for a bounded tiny-atlas pressure window.  This is
+        // telemetry capacity only; the strict gate still rejects unresolved events and never
+        // treats a larger ring as proof of capture/ready completion.
+        if (mSurfaceCacheRequestEvents.size() >= kMaxSurfaceCacheRequestEvents)
+        {
+            mSurfaceCacheRequestEvents.erase(mSurfaceCacheRequestEvents.begin());
+            ++mSurfaceCacheRequestEventDropped;
+        }
+        SurfaceCacheRequestEvent staleEvent;
+        staleEvent.sequence = ++mSurfaceCacheRequestEventSequence;
+        staleEvent.sceneGeneration = mSurfaceCacheSceneGeneration;
+        staleEvent.cardIndex = cardIndex;
+        staleEvent.pageID = pageID;
+        staleEvent.generation = generation;
+        staleEvent.requestFrame = mSurfaceCacheFrameIndex;
+        staleEvent.reasonBits = 2u; // stale-owner terminal outcome.
+        staleEvent.requestCount = 1u;
+        staleEvent.state = 5u;
+        mSurfaceCacheRequestEvents.push_back(staleEvent);
+    };
+
+    // Preserve the allocator's victim identity in the same per-card event
+    // ledger consumed by the strict C6 pressure gate.  Without this terminal
+    // record, the page generation transition is visible only in aggregate
+    // stats and an old owner can remain an unresolved request forever.  The
+    // event is deliberately state=5 with no publication fields: it records a
+    // stale-owner rejection, not a successful capture/ready transition.
+    const auto cacheStatsAtSchedule = mPageCache.getStats();
+    if (cacheStatsAtSchedule.lastEvictedPageID != kInvalidPageID &&
+        cacheStatsAtSchedule.lastEvictedGeneration != 0u &&
+        cacheStatsAtSchedule.lastEvictedFrame == mSurfaceCacheFrameIndex)
+    {
+        const uint32_t victimPage = cacheStatsAtSchedule.lastEvictedPageID;
+        const uint32_t victimGeneration = cacheStatsAtSchedule.lastEvictedGeneration;
+        const uint32_t victimCard = victimPage < mPageToCardData.size()
+            ? mPageToCardData[victimPage]
+            : kLumenCardInvalidID;
+        recordStaleOwnerEvent(victimCard, victimPage, victimGeneration);
+    }
+    std::vector<LumenCaptureCommand> requestCaptureCommands;
+    requestCaptureCommands.reserve(frame.commands.size());
+    for (const LumenCaptureCommand& command : frame.commands)
+    {
+        // Before overwriting the host card->page mirror, retain the previous owner/generation
+        // for this page.  A page reused by a different card (or by the same card after an
+        // allocator generation bump) must leave an identity-bearing stale event for the old
+        // generation; otherwise the strict gate cannot distinguish reuse from a fresh page.
+        const uint32_t previousPageForCard = command.cardIndex < mCardPageTable.size()
+            ? mCardPageTable[command.cardIndex]
+            : kInvalidPageID;
+        const uint32_t previousGenerationForCard = command.cardIndex < mCardPageGeneration.size()
+            ? mCardPageGeneration[command.cardIndex]
+            : 0u;
+        const uint32_t previousOwner = command.pageID < mPageToCardData.size()
+            ? mPageToCardData[command.pageID]
+            : kLumenCardInvalidID;
+        const uint32_t previousOwnerGeneration = previousOwner < mCardPageGeneration.size()
+            ? mCardPageGeneration[previousOwner]
+            : 0u;
+        // mPageMetadataData is the last published page-cache snapshot.  It remains the
+        // authoritative old generation even when the previous owner was already filtered from
+        // mPageToCardData by a stale generation check, so use it as the fallback identity source.
+        const uint32_t previousPageGeneration = command.pageID < mPageMetadataData.size()
+            ? mPageMetadataData[command.pageID].x
+            : 0u;
+        // A request event may already carry the old page identity even when the allocator's
+        // current snapshot has advanced past it.  Close that event as stale before publishing
+        // the new generation; otherwise a pending old request remains unresolved forever and the
+        // strict ledger cannot observe a same-page generation transition.
+        for (auto& event : mSurfaceCacheRequestEvents)
+        {
+            if (event.sceneGeneration == mSurfaceCacheSceneGeneration &&
+                event.pageID == command.pageID && event.generation != 0u &&
+                event.generation != command.generation && event.state >= 1u && event.state < 3u)
+            {
+                event.reasonBits |= 2u;
+                event.state = 5u;
+            }
+        }
+        if (previousPageForCard == command.pageID && previousGenerationForCard != 0u &&
+            previousGenerationForCard != command.generation)
+        {
+            recordStaleOwnerEvent(command.cardIndex, command.pageID, previousGenerationForCard);
+        }
+        if (previousOwner != kLumenCardInvalidID && previousOwner != command.cardIndex &&
+            previousOwnerGeneration != 0u && previousOwnerGeneration != command.generation)
+        {
+            recordStaleOwnerEvent(previousOwner, command.pageID, previousOwnerGeneration);
+        }
+        if (previousPageGeneration != 0u && previousPageGeneration != command.generation &&
+            previousPageGeneration != previousGenerationForCard &&
+            previousPageGeneration != previousOwnerGeneration)
+        {
+            const uint32_t staleCard = previousOwner != kLumenCardInvalidID ? previousOwner : command.cardIndex;
+            recordStaleOwnerEvent(staleCard, command.pageID, previousPageGeneration);
+        }
+
+        const bool requestedCard = mSurfaceCacheRequestedCards.find(command.cardIndex) != mSurfaceCacheRequestedCards.end();
+        if (requestedCard)
+            requestCaptureCommands.push_back(command);
+
+        // A newly allocated/reused page is not visible to ScreenProbe lookup until the
+        // following frame.  Cache lighting may populate it in this frame, but the producer
+        // contract keeps page ownership and lighting publication on separate frame boundaries.
+        // Keep the previous ready frame for same-generation recaptures so dirty relighting does
+        // not unnecessarily force a miss.
+        if (command.pageID < mPageMetadataData.size())
+        {
+            const uint32_t previousGeneration = mPageMetadataData[command.pageID].x;
+            if (requestedCard)
+            {
+                // A demand request must cross a publication fence even when the
+                // scheduler recaptures the same generation.  Mark the page pending
+                // now and expose it as ready only from the next host frame.
+                mPageMetadataData[command.pageID].z = mSurfaceCacheFrameIndex + 1u;
+                if (mSurfaceCachePendingReadyPages.insert(command.pageID).second)
+                    ++mSurfaceCachePageMetadataPendingThisFrame;
+            }
+            else if (previousGeneration != command.generation)
+            {
+                mPageMetadataData[command.pageID].z = mSurfaceCacheFrameIndex + 1u;
+            }
+        }
+    }
 
     // Full cards upload: the capture shader indexes gCards by gCardIndex, so every card must
     // be current. (A dirty-range upload is future work; 96 B x card count is small.)
@@ -1799,11 +2681,108 @@ void LumenGIPass::runSurfaceCacheCapture(RenderContext* pRenderContext, IScene::
     {
         mCapture.pPageTable->setBlob(mCardPageTable.data(), 0, mCardPageTable.size() * sizeof(uint32_t));
     }
+    if (mCapture.pPageGeneration && !mCardPageGeneration.empty())
+    {
+        mCapture.pPageGeneration->setBlob(
+            mCardPageGeneration.data(), 0, mCardPageGeneration.size() * sizeof(uint32_t)
+        );
+    }
+
+    if (!frame.commands.empty() && mCapture.pPageClear && mCapture.pPageIDs)
+    {
+        std::vector<uint32_t> clearPageIDs;
+        clearPageIDs.reserve(frame.commands.size());
+        for (const LumenCaptureCommand& command : frame.commands)
+        {
+            if (command.pageID == kInvalidPageID)
+                continue;
+            if (std::find(clearPageIDs.begin(), clearPageIDs.end(), command.pageID) == clearPageIDs.end())
+                clearPageIDs.push_back(command.pageID);
+        }
+        if (!clearPageIDs.empty())
+        {
+            mCapture.pPageIDs->setBlob(clearPageIDs.data(), 0, clearPageIDs.size() * sizeof(uint32_t));
+            ShaderVar clearVar = mCapture.pPageClear->getRootVar();
+            clearVar["gPageIDs"] = mCapture.pPageIDs;
+            clearVar["gMaterialAtlas"] = mCapture.pMaterialAtlas;
+            clearVar["gRadianceAtlas"] = mCapture.pRadianceAtlas;
+            clearVar["gMetadataAtlas"] = mCapture.pMetadataAtlas;
+            clearVar["gCaptureOrderAtlas"] = mCapture.pCaptureOrderAtlas;
+            ShaderVar clearCB = clearVar["LumenSurfaceCachePageClearCB"];
+            clearCB["gPageCount"] = (uint32_t)clearPageIDs.size();
+            clearCB["gPagesPerSide"] = mCapturePagesPerSide;
+            clearCB["gAtlasSize"] = uint2(mAtlasSizeTexels, mAtlasSizeTexels);
+            mCapture.pPageClear->execute(pRenderContext, kLumenSurfaceCacheTileSize, kLumenSurfaceCacheTileSize,
+                                         (uint32_t)clearPageIDs.size());
+            // Page clear is a compute UAV producer and the following capture pass writes the
+            // same atlas resources through raster targets.  Publish the cleared tiles before
+            // switching pass/resource classes; otherwise sparse stale texels can survive on
+            // one of two otherwise identical cache-lighting variants.
+            if (mCapture.pMaterialAtlas)
+                pRenderContext->uavBarrier(mCapture.pMaterialAtlas.get());
+            if (mCapture.pMetadataAtlas)
+                pRenderContext->uavBarrier(mCapture.pMetadataAtlas.get());
+            if (mCapture.pRadianceAtlas)
+                pRenderContext->uavBarrier(mCapture.pRadianceAtlas.get());
+            if (mCapture.pCaptureOrderAtlas)
+                pRenderContext->uavBarrier(mCapture.pCaptureOrderAtlas.get());
+            mSurfaceCachePageClearCommands = (uint32_t)clearPageIDs.size();
+            mSurfaceCachePageClearTexels =
+                (uint64_t)clearPageIDs.size() * kLumenSurfaceCacheTileSize * kLumenSurfaceCacheTileSize;
+            mSurfaceCachePageClearCommandsTotal += clearPageIDs.size();
+            mSurfaceCachePageClearTexelsTotal +=
+                (uint64_t)clearPageIDs.size() * kLumenSurfaceCacheTileSize * kLumenSurfaceCacheTileSize;
+        }
+    }
 
     if (!frame.commands.empty())
         runCapturePass(pRenderContext, frame);
 
     mCaptureScheduler.completeCaptures(frame.commands);
+    // Count request completions only after the capture pass and scheduler state transition.
+    // The previous placement counted command emission, which could over-report a request
+    // even when the raster capture was not completed.
+    for (const LumenCaptureCommand& command : requestCaptureCommands)
+    {
+        if (!mCaptureScheduler.isCaptureComplete(command))
+            continue;
+        const uint32_t cardIndex = command.cardIndex;
+        if (mSurfaceCacheRequestedCards.erase(cardIndex) != 0u)
+        {
+            ++mSurfaceCacheRequestCaptureCompleted;
+            ++mSurfaceCacheRequestCaptureCompletedThisFrame;
+            mSurfaceCacheRequestCaptureFrame = mSurfaceCacheFrameIndex;
+            for (auto it = mSurfaceCacheRequestEvents.rbegin();
+                 it != mSurfaceCacheRequestEvents.rend(); ++it)
+            {
+                if (it->sceneGeneration == mSurfaceCacheSceneGeneration &&
+                    it->cardIndex == cardIndex && it->requestFrame < mSurfaceCacheFrameIndex &&
+                    it->captureFrame == 0u && it->state >= 1u && it->state < 3u)
+                {
+                    it->pageID = command.pageID;
+                    it->generation = command.generation;
+                    it->captureFrame = mSurfaceCacheFrameIndex;
+                    it->state = 2u;
+                    break;
+                }
+            }
+        }
+    }
+
+    // A request accepted by the deferred queue but not emitted by the very next scheduler
+    // frame has no valid N->N+1 publication path under the current pressure budget.  Close it as
+    // an explicit stale/rejected outcome so the per-card ledger does not retain an immortal
+    // state=1 record.  Requests that did emit a command above have already advanced to state=2.
+    for (auto& event : mSurfaceCacheRequestEvents)
+    {
+        if (event.sceneGeneration == mSurfaceCacheSceneGeneration && event.state == 1u &&
+            event.requestFrame < mSurfaceCacheFrameIndex)
+        {
+            event.reasonBits |= 2u;
+            event.state = 5u;
+            ++mSurfaceCacheRequestStaleRejects;
+        }
+    }
 }
 
 void LumenGIPass::runCapturePass(RenderContext* pRenderContext, const LumenCaptureFrame& frame)
@@ -1839,6 +2818,7 @@ void LumenGIPass::runCapturePass(RenderContext* pRenderContext, const LumenCaptu
     var["gMaterialAtlas"] = mCapture.pMaterialAtlas;
     var["gRadianceAtlas"] = mCapture.pRadianceAtlas;
     var["gMetadataAtlas"] = mCapture.pMetadataAtlas;
+    var["gCaptureOrderAtlas"] = mCapture.pCaptureOrderAtlas;
 
     for (uint32_t i = 0; i < commandCount; ++i)
     {
@@ -1895,6 +2875,7 @@ void LumenGIPass::createCaptureProgram()
     // gMetadataAtlas are required and default to enabled). The params/debug atlases are not
     // created in the MVP.
     mCapture.pProgram->addDefine("is_valid_gRadianceAtlas", "1");
+    mCapture.pProgram->addDefine("is_valid_gCaptureOrderAtlas", "1");
     mCapture.pProgram->addDefine("is_valid_gMaterialParamsAtlas", "0");
     mCapture.pProgram->addDefine("is_valid_gDebugTexture", "0");
 
@@ -2001,9 +2982,25 @@ uint32_t LumenGIPass::buildCacheLightingRenderData()
     const uint32_t pageCount = mPageCache.getPageCount();
     if (mPageToCardData.size() != pageCount + 1)
         mPageToCardData.assign(pageCount + 1, kLumenCardInvalidID);
+    if (mPageMetadataData.size() != pageCount + 1)
+        mPageMetadataData.assign(pageCount + 1, uint4(0u));
     std::fill(mPageToCardData.begin(), mPageToCardData.end(), kLumenCardInvalidID);
+    for (uint32_t pageID = 1u; pageID <= pageCount; ++pageID)
+    {
+        const bool allocated = mPageCache.isPageAllocated(pageID);
+        const uint32_t previousReadyFrame = mPageMetadataData[pageID].z;
+        mPageMetadataData[pageID] = uint4(
+            allocated ? mPageCache.getGeneration(pageID) : 0u,
+            allocated ? static_cast<uint32_t>(mPageCache.getPageState(pageID)) : 0u,
+            allocated ? previousReadyFrame : 0u,
+            0u
+        );
+    }
 
     const uint32_t cardCount = mpCardScene ? mpCardScene->getCardCount() : 0u;
+    mSurfaceCacheGenerationRejects = 0u;
+    mSurfaceCacheStateRejects = 0u;
+    mSurfaceCacheStaleOwnerRejects = 0u;
     if (mCardPageTable.size() != cardCount || mCardPageGeneration.size() != cardCount)
         return 0u; // capture resources not initialized yet (no cards captured this frame).
 
@@ -2014,8 +3011,19 @@ uint32_t LumenGIPass::buildCacheLightingRenderData()
             continue;
         if (!mPageCache.isPageAllocated(pageID))
             continue;
-        if (mCardPageGeneration[card] != mPageCache.getGeneration(pageID))
+        const auto pageState = mPageCache.getPageState(pageID);
+        if (pageState != LumenSurfaceCachePageState::Allocated &&
+            pageState != LumenSurfaceCachePageState::Touched)
+        {
+            ++mSurfaceCacheStateRejects;
             continue;
+        }
+        if (mCardPageGeneration[card] != mPageCache.getGeneration(pageID))
+        {
+            ++mSurfaceCacheGenerationRejects;
+            ++mSurfaceCacheStaleOwnerRejects;
+            continue;
+        }
         mPageToCardData[pageID] = card;
     }
 
@@ -2034,6 +3042,122 @@ uint32_t LumenGIPass::buildCacheLightingRenderData()
     {
         logWarning("LumenGI: cache lighting render list clamped from {} to {} pages.", mRenderListData.size(), kMaxDispatchX);
         mRenderListData.resize(kMaxDispatchX);
+    }
+
+    // Build a bounded world-space card candidate grid for probe cache lookup. The
+    // page/card generation checks remain authoritative in the shader; this index
+    // only narrows the candidate set. A per-cell overflow bit preserves a full
+    // scan fallback for pathological giant/overlapping cards.
+    constexpr uint32_t kGridDim = LumenScreenProbe::kCacheCardGridDim;
+    constexpr uint32_t kMaxCandidates = LumenScreenProbe::kCacheCardGridMaxCandidates;
+    constexpr uint32_t kCellStride = LumenScreenProbe::kCacheCardGridCellStride;
+    const size_t gridCellCount = size_t(kGridDim) * size_t(kGridDim) * size_t(kGridDim);
+    mCardGridData.assign(gridCellCount * kCellStride, 0u);
+    mCardGridOverflowCells = 0u;
+    mCardGridCandidateCount = 0u;
+    mCardGridCardsIndexed = 0u;
+
+    const float inf = std::numeric_limits<float>::max();
+    float3 gridMin(inf);
+    float3 gridMax(-inf);
+    auto cacheGridBounds = [](const LumenCard& card, float3& outMin, float3& outMax)
+    {
+        // Keep the CPU broadphase conservative with the shader's fixed lookup
+        // epsilon (LumenScreenProbeIntegrate.cs.slang). Without this pad a
+        // probe on a cell boundary can be present in the full-card scan but
+        // absent from the grid candidate list, changing winner/request order.
+        constexpr float kLookupCandidateEpsilon = 0.04f;
+        outMin = float3(card.boundsMin.x, card.boundsMin.y, card.boundsMin.z);
+        outMax = float3(card.boundsMax.x, card.boundsMax.y, card.boundsMax.z);
+        // The lookup slab intentionally accepts up to one card extent behind the
+        // capture face. Expand only that face axis so the candidate index remains
+        // bounded without dropping valid slab hits outside the raw AABB.
+        const uint32_t axis = std::min<uint32_t>(card.faceIndex >> 1u, 2u);
+        const float pad = (&card.extent.x)[axis];
+        (&outMin.x)[axis] -= pad;
+        (&outMax.x)[axis] += pad;
+        outMin -= float3(kLookupCandidateEpsilon);
+        outMax += float3(kLookupCandidateEpsilon);
+    };
+    // Index every active card, not only cards that currently own a resident
+    // page.  Non-resident cards are exactly the candidates that must survive
+    // grid lookup so the shader can emit a C6.2 capture request; page state,
+    // generation and metadata remain strict shader-side validity fences.
+    std::vector<uint32_t> indexedCards;
+    indexedCards.reserve(cardCount);
+    for (uint32_t cardIndex = 0u; cardIndex < cardCount; ++cardIndex)
+    {
+        const LumenCard& card = mpCardScene->getCard(cardIndex);
+        if (card.faceIndex == kLumenCardInvalidID)
+            continue;
+        if (!std::isfinite(card.boundsMin.x) || !std::isfinite(card.boundsMin.y) ||
+            !std::isfinite(card.boundsMin.z) || !std::isfinite(card.boundsMax.x) ||
+            !std::isfinite(card.boundsMax.y) || !std::isfinite(card.boundsMax.z))
+            continue;
+        float3 cardMin, cardMax;
+        cacheGridBounds(card, cardMin, cardMax);
+        gridMin = min(gridMin, cardMin);
+        gridMax = max(gridMax, cardMax);
+        indexedCards.push_back(cardIndex);
+    }
+    mCardGridCardsIndexed = (uint32_t)indexedCards.size();
+    if (indexedCards.empty())
+    {
+        gridMin = float3(-1.f);
+        gridMax = float3(1.f);
+    }
+    const float3 gridExtent = max(gridMax - gridMin, float3(1e-3f));
+    mCardGridMin = gridMin;
+    mCardGridInvCellSize = float3(
+        float(kGridDim) / gridExtent.x,
+        float(kGridDim) / gridExtent.y,
+        float(kGridDim) / gridExtent.z
+    );
+
+    auto clampCell = [&](const float3& p) -> uint3
+    {
+        const float3 f = (p - mCardGridMin) * mCardGridInvCellSize;
+        return uint3(
+            uint32_t(std::clamp(int(std::floor(f.x)), 0, int(kGridDim - 1u))),
+            uint32_t(std::clamp(int(std::floor(f.y)), 0, int(kGridDim - 1u))),
+            uint32_t(std::clamp(int(std::floor(f.z)), 0, int(kGridDim - 1u)))
+        );
+    };
+    auto cellBase = [&](const uint3& cell) -> size_t
+    {
+        return (size_t(cell.z) * kGridDim * kGridDim + size_t(cell.y) * kGridDim + cell.x) * kCellStride;
+    };
+    for (uint32_t cardIndex : indexedCards)
+    {
+        const LumenCard& card = mpCardScene->getCard(cardIndex);
+        float3 cardMin, cardMax;
+        cacheGridBounds(card, cardMin, cardMax);
+        const uint3 minCell = clampCell(cardMin);
+        const uint3 maxCell = clampCell(cardMax);
+        for (uint32_t z = minCell.z; z <= maxCell.z; ++z)
+        {
+            for (uint32_t y = minCell.y; y <= maxCell.y; ++y)
+            {
+                for (uint32_t x = minCell.x; x <= maxCell.x; ++x)
+                {
+                    const size_t base = cellBase(uint3(x, y, z));
+                    uint32_t& packedCount = mCardGridData[base];
+                    const bool overflow = (packedCount & 0x80000000u) != 0u;
+                    const uint32_t count = packedCount & 0x7fffffffu;
+                    if (overflow)
+                        continue;
+                    if (count >= kMaxCandidates)
+                    {
+                        packedCount |= 0x80000000u;
+                        ++mCardGridOverflowCells;
+                        continue;
+                    }
+                    mCardGridData[base + 1u + count] = cardIndex;
+                    packedCount = count + 1u;
+                    ++mCardGridCandidateCount;
+                }
+            }
+        }
     }
     return (uint32_t)mRenderListData.size();
 }
@@ -2060,6 +3184,13 @@ void LumenGIPass::createCacheLightingProgram()
     defines.add("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
     defines.add("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
     defines.add("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
+    // Diagnostic-only switch for isolating inline shadow-ray variance. Production
+    // keeps shadows enabled; C5 may set this environment variable to 1 for a
+    // bounded control without changing the frozen lighting contract.
+    const char* disableCacheLightingShadows = std::getenv("LUMEN_C5_DISABLE_CACHE_SHADOWS");
+    const bool cacheLightingShadowsOff = disableCacheLightingShadows &&
+        (std::string(disableCacheLightingShadows) == "1" || std::string(disableCacheLightingShadows) == "true");
+    defines.add("LUMEN_GI_CACHE_LIGHTING_SHADOWS", cacheLightingShadowsOff ? "0" : "1");
     defines.add(
         "LUMEN_GI_HAS_ENVIRONMENT_SAMPLER",
         (kUseCacheLightingEnvImportanceSampler && mpEnvMapSampler) ? "1" : "0"
@@ -2103,6 +3234,23 @@ void LumenGIPass::ensureCacheLightingResources(RenderContext* pRenderContext)
             sizeof(uint32_t), pageCount + 1, ResourceBindFlags::ShaderResource
         );
         mCacheLighting.pPageToCard->setName("LumenGIPass::CacheLighting::PageToCard"); // gLumenPageToCard, uint32, atlas lifetime.
+    }
+    if (!mCacheLighting.pPageMetadata || mCacheLighting.pPageMetadata->getElementCount() != pageCount + 1)
+    {
+        mCacheLighting.pPageMetadata = mpDevice->createStructuredBuffer(
+            sizeof(uint4), pageCount + 1, ResourceBindFlags::ShaderResource
+        );
+        mCacheLighting.pPageMetadata->setName("LumenGIPass::CacheLighting::PageMetadata"); // pageID -> {generation,state,readyFrame,reserved}.
+    }
+    const size_t cardGridElementCount = size_t(LumenScreenProbe::kCacheCardGridDim) *
+        size_t(LumenScreenProbe::kCacheCardGridDim) * size_t(LumenScreenProbe::kCacheCardGridDim) *
+        size_t(LumenScreenProbe::kCacheCardGridCellStride);
+    if (!mCacheLighting.pCardGrid || mCacheLighting.pCardGrid->getElementCount() != cardGridElementCount)
+    {
+        mCacheLighting.pCardGrid = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), cardGridElementCount, ResourceBindFlags::ShaderResource
+        );
+        mCacheLighting.pCardGrid->setName("LumenGIPass::CacheLighting::CardGrid"); // cell -> bounded card IDs.
     }
     if (!mCacheLighting.pRenderList || mCacheLighting.pRenderList->getElementCount() != pageCount)
     {
@@ -2165,6 +3313,12 @@ void LumenGIPass::ensureCacheLightingResources(RenderContext* pRenderContext)
 
 void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
 {
+    // Lookup eligibility is published only after a successful render-list
+    // rebuild/dispatch below. Clear the publication token first so any early
+    // return (missing resources, variant rebuild, empty list) cannot leave the
+    // previous frame's grid/page metadata eligible for ScreenProbe lookup.
+    mLastCacheLightingPageCount = 0u;
+
     // Read back the previous dispatch's counters (one-frame lag, same as the trace path).
     if (mCacheLightingCounterReadbackPending && mpCacheLightingCountersReadback)
     {
@@ -2192,6 +3346,15 @@ void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
         mpEnvMapSampler = nullptr;
     }
 
+    const bool envSamplerVariant = kUseCacheLightingEnvImportanceSampler && mpEnvMapSampler != nullptr;
+    if (mCacheLighting.pPass && mCacheLighting.envSamplerVariant != envSamplerVariant)
+    {
+        // HAS_ENVIRONMENT_SAMPLER changes the reflected root-object shape. Do
+        // not mutate that define on an existing ProgramVars instance.
+        mCacheLighting.pPass = nullptr;
+    }
+    mCacheLighting.envSamplerVariant = envSamplerVariant;
+
     if (!mpCardScene || !mCapture.pCards || !mCapture.pMaterialAtlas || !mCapture.pRadianceAtlas ||
         !mCapture.pMetadataAtlas)
     {
@@ -2200,7 +3363,7 @@ void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
 
     ensureCacheLightingResources(pRenderContext);
     if (!mCacheLighting.pPass || !mCacheLighting.pVisibilityAtlas || !mCacheLighting.pPageToCard ||
-        !mCacheLighting.pRenderList)
+        !mCacheLighting.pPageMetadata || !mCacheLighting.pRenderList)
     {
         return;
     }
@@ -2209,11 +3372,23 @@ void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
     if (renderPageCount == 0)
     {
         mLastCacheLightingPageCount = 0;
+        // Do not let a previous frame's candidate grid/page metadata remain
+        // eligible when the allocator has no published pages this frame.
+        // The shader's page fences are authoritative, but the host gate must
+        // also disable lookup so a zero-resident frame cannot consume stale
+        // candidates or emit requests from an old publication.
+        mCardGridData.clear();
+        mPageMetadataData.clear();
         return;
     }
 
     // Upload the two tables. The render list is re-uploaded in full every frame (small).
     mCacheLighting.pPageToCard->setBlob(mPageToCardData.data(), 0, mPageToCardData.size() * sizeof(uint32_t));
+    mCacheLighting.pPageMetadata->setBlob(
+        mPageMetadataData.data(), 0, mPageMetadataData.size() * sizeof(uint4)
+    );
+    if (mCacheLighting.pCardGrid && !mCardGridData.empty())
+        mCacheLighting.pCardGrid->setBlob(mCardGridData.data(), 0, mCardGridData.size() * sizeof(uint32_t));
     mCacheLighting.pRenderList->setBlob(mRenderListData.data(), 0, renderPageCount * sizeof(uint32_t));
 
     // Per-frame program specialization. Program::addDefine returns true only when a value
@@ -2223,6 +3398,10 @@ void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
     programChanged |= pProgram->addDefine("USE_ENV_LIGHT", mpScene->useEnvLight() ? "1" : "0");
     programChanged |= pProgram->addDefine("USE_ANALYTIC_LIGHTS", mpScene->useAnalyticLights() ? "1" : "0");
     programChanged |= pProgram->addDefine("USE_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
+    const char* disableCacheLightingShadows = std::getenv("LUMEN_C5_DISABLE_CACHE_SHADOWS");
+    const bool cacheLightingShadowsOff = disableCacheLightingShadows &&
+        (std::string(disableCacheLightingShadows) == "1" || std::string(disableCacheLightingShadows) == "true");
+    programChanged |= pProgram->addDefine("LUMEN_GI_CACHE_LIGHTING_SHADOWS", cacheLightingShadowsOff ? "0" : "1");
     programChanged |= pProgram->addDefine(
         "LUMEN_GI_HAS_ENVIRONMENT_SAMPLER",
         (kUseCacheLightingEnvImportanceSampler && mpEnvMapSampler) ? "1" : "0"
@@ -2254,7 +3433,12 @@ void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
     // self-healing and the TLAS is rebuilt lazily only when the scene requires it.
     ShaderVar cacheVar = mCacheLighting.pPass->getRootVar();
     mpScene->bindShaderData(cacheVar["gScene"]);
-    mpScene->bindShaderDataForRaytracing(pRenderContext, cacheVar["gScene"], 0u);
+    // Inline visibility queries do not use a shader table or per-ray-type hit
+    // records.  Request the canonical one-ray-type TLAS explicitly instead of
+    // inheriting the last RT-pipeline ray count from another pass in the graph.
+    // This keeps two LumenGI instances in a paired graph on the same TLAS cache
+    // entry and avoids cross-pass ray-query state selection.
+    mpScene->bindShaderDataForRaytracing(pRenderContext, cacheVar["gScene"], 1u);
 
     cacheVar["gCards"] = mCapture.pCards;
     cacheVar["gMaterialAtlas"] = mCapture.pMaterialAtlas;
@@ -2262,6 +3446,7 @@ void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
     cacheVar["gRadianceAtlas"] = mCapture.pRadianceAtlas;
     cacheVar["gLumenVisibilityAtlas"] = mCacheLighting.pVisibilityAtlas;
     cacheVar["gLumenPageToCard"] = mCacheLighting.pPageToCard;
+    cacheVar["gLumenPageMetadata"] = mCacheLighting.pPageMetadata;
     cacheVar["gLumenRenderList"] = mCacheLighting.pRenderList;
     cacheVar["gLumenGICounters"] = mpCacheLightingCounters;
     // S3-B2 feedback double buffer. When the feedback is off, gIndirectPrev is left unbound
@@ -2289,6 +3474,12 @@ void LumenGIPass::runCacheLighting(RenderContext* pRenderContext)
     cb["gCacheLightingFeedbackEnabled"] = feedbackOn ? 1u : 0u;
     cb["gCacheLightingFeedbackStrength"] = mCacheLightingFeedbackStrength;
     cb["gCacheLightingFeedbackMaxBounces"] = std::max<uint32_t>(1u, mCacheLightingFeedbackMaxBounces);
+
+    // The visibility atlas is a per-dispatch output. Clear it before lighting so
+    // fallback/unsupported texels from a previous page owner cannot survive a
+    // recapture and feed the probe lookup on the next pass.
+    if (mCacheLighting.pVisibilityAtlas)
+        pRenderContext->clearUAV(mCacheLighting.pVisibilityAtlas->getUAV().get(), float4(0.f));
 
     // The counters must be cleared before each dispatch; copied to the readback buffer after.
     if (mpCacheLightingCounters)
@@ -2357,6 +3548,17 @@ void LumenGIPass::exportCacheDirectRadiance(RenderContext* pRenderContext, const
         // No atlas (surface cache off): keep the channel well-defined (zero) instead of stale.
         pRenderContext->clearRtv(pCacheDirect->getRTV().get(), float4(0.f));
     }
+}
+
+void LumenGIPass::exportCacheCaptureRadiance(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    const ref<Texture> pCacheCapture = renderData.getTexture(kCacheCaptureRadiance);
+    if (!pCacheCapture)
+        return;
+    if (mCapture.pRadianceAtlas)
+        pRenderContext->blit(mCapture.pRadianceAtlas->getSRV(), pCacheCapture->getRTV());
+    else
+        pRenderContext->clearRtv(pCacheCapture->getRTV().get(), float4(0.f));
 }
 
 // ------------------------------------------------------------------------------------------
@@ -2531,6 +3733,9 @@ void LumenGIPass::createScreenProbePrograms()
     mScreenProbes.pUpdate = createPass("updateMain");
     mScreenProbes.pTrace = createPass("traceMain");
     mScreenProbes.pFinalize = createPass("finalizeMain");
+    mScreenProbes.pScreenRadianceHistoryPass = ComputePass::create(
+        mpDevice, kScreenRadianceHistoryShaderFile, "main"
+    );
 
     // S4.3 integrate + interpolate: pure compute over the frozen data contract
     // (LumenScreenProbeData.slang). They import no scene modules and trace no rays, so they
@@ -2555,8 +3760,9 @@ void LumenGIPass::ensureScreenProbeResources(RenderContext* pRenderContext)
         return;
 
     const uint32_t probeCount = LumenScreenProbe::probeCount(mFrameDim);
+    const uint32_t requestCardCount = mpCardScene ? std::max<uint32_t>(1u, mpCardScene->getCardCount()) : 1u;
     if (!mScreenProbes.pTrace || !mScreenProbes.pUpdate || !mScreenProbes.pFinalize ||
-        !mScreenProbes.pIntegrate || !mScreenProbes.pInterpolate)
+        !mScreenProbes.pScreenRadianceHistoryPass || !mScreenProbes.pIntegrate || !mScreenProbes.pInterpolate)
         createScreenProbePrograms();
     if (!mScreenProbes.pTrace)
         return; // scene not ready.
@@ -2567,7 +3773,10 @@ void LumenGIPass::ensureScreenProbeResources(RenderContext* pRenderContext)
     // cardinality or the backing frame dimensions change, otherwise the old
     // metadata/HZB/radiance dimensions are reused with a new dispatch shape.
     if (!mScreenProbes.pMetadata || !mScreenProbes.pHitRecords || mScreenProbes.probeCount != probeCount ||
-        any(mScreenProbes.resourceDim != mFrameDim))
+        any(mScreenProbes.resourceDim != mFrameDim) || !mScreenProbes.pCacheFeedback ||
+        mScreenProbes.pCacheFeedback->getElementCount() != mPageCache.getPageCount() + 1u ||
+        !mScreenProbes.pCacheRequests || mScreenProbes.pCacheRequests->getElementCount() != requestCardCount ||
+        !mScreenProbes.pScreenRadianceValidity[0] || !mScreenProbes.pScreenRadianceValidity[1])
     {
         // gProbeMeta: LumenScreenProbe::Meta (64 B) per probe. gProbeHitRecords:
         // LumenScreenProbe::Hit (32 B) per (probe, direction), fixed stride
@@ -2592,6 +3801,29 @@ void LumenGIPass::ensureScreenProbeResources(RenderContext* pRenderContext)
             sizeof(LumenScreenProbe::Counters), 1u, ResourceBindFlags::None, MemoryType::ReadBack
         );
         mScreenProbes.pCountersReadback->setName("LumenGIPass::ScreenProbe::CountersReadback");
+        // C6.1 demand feedback: one uint2 per page (hit count, observed page generation).
+        // The UAV is cleared before each probe dispatch and copied to a readback buffer after
+        // integrate.  Host validation against the current scene/page generation prevents stale
+        // feedback from touching a reused page.
+        const uint32_t feedbackPageCount = mPageCache.getPageCount() + 1u;
+        mScreenProbes.pCacheFeedback = mpDevice->createStructuredBuffer(
+            sizeof(uint2), feedbackPageCount, ResourceBindFlags::UnorderedAccess
+        );
+        mScreenProbes.pCacheFeedback->setName("LumenGIPass::ScreenProbe::CacheFeedback");
+        mScreenProbes.pCacheFeedbackReadback = mpDevice->createStructuredBuffer(
+            sizeof(uint2), feedbackPageCount, ResourceBindFlags::None, MemoryType::ReadBack
+        );
+        mScreenProbes.pCacheFeedbackReadback->setName("LumenGIPass::ScreenProbe::CacheFeedbackReadback");
+        mScreenProbes.cacheFeedbackPageCount = feedbackPageCount;
+        mScreenProbes.pCacheRequests = mpDevice->createStructuredBuffer(
+            sizeof(uint2), requestCardCount, ResourceBindFlags::UnorderedAccess
+        );
+        mScreenProbes.pCacheRequests->setName("LumenGIPass::ScreenProbe::CacheRequests");
+        mScreenProbes.pCacheRequestsReadback = mpDevice->createStructuredBuffer(
+            sizeof(uint2), requestCardCount, ResourceBindFlags::None, MemoryType::ReadBack
+        );
+        mScreenProbes.pCacheRequestsReadback->setName("LumenGIPass::ScreenProbe::CacheRequestsReadback");
+        mScreenProbes.cacheRequestCardCount = requestCardCount;
 
         // Native floor-halved R32F mip chain for the probe march (gHZBMips): a real D3D12 mip
         // chain is floor-sized, and the probe shader indexes it with explicit mip levels
@@ -2623,6 +3855,66 @@ void LumenGIPass::ensureScreenProbeResources(RenderContext* pRenderContext)
         );
         mScreenProbes.pRadianceHistory->setName("LumenGIPass::ScreenProbe::RadianceHistory"); // RGB mean, A sample count.
 
+        for (uint32_t i = 0; i < 2u; ++i)
+        {
+            mScreenProbes.pScreenRadianceHistory[i] = mpDevice->createTexture2D(
+                mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+            mScreenProbes.pScreenRadianceHistory[i]->setName(
+                i == 0u ? "LumenGIPass::ScreenProbe::ScreenRadianceHistory0"
+                        : "LumenGIPass::ScreenProbe::ScreenRadianceHistory1"
+            );
+            mScreenProbes.pScreenRadianceDepthHistory[i] = mpDevice->createTexture2D(
+                mFrameDim.x, mFrameDim.y, ResourceFormat::RG32Float, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+            mScreenProbes.pScreenRadianceDepthHistory[i]->setName(
+                i == 0u ? "LumenGIPass::ScreenProbe::ScreenRadianceDepthHistory0"
+                        : "LumenGIPass::ScreenProbe::ScreenRadianceDepthHistory1"
+            );
+            mScreenProbes.pScreenRadianceGuideHistory[i] = mpDevice->createTexture2D(
+                mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+            mScreenProbes.pScreenRadianceGuideHistory[i]->setName(
+                i == 0u ? "LumenGIPass::ScreenProbe::ScreenRadianceGuideHistory0"
+                        : "LumenGIPass::ScreenProbe::ScreenRadianceGuideHistory1"
+            );
+            mScreenProbes.pScreenRadianceMoments[i] = mpDevice->createTexture2D(
+                mFrameDim.x, mFrameDim.y, ResourceFormat::RG32Float, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+            mScreenProbes.pScreenRadianceMoments[i]->setName(
+                i == 0u ? "LumenGIPass::ScreenProbe::ScreenRadianceMoments0"
+                        : "LumenGIPass::ScreenProbe::ScreenRadianceMoments1"
+            );
+            mScreenProbes.pScreenRadianceLightingGeneration[i] = mpDevice->createTexture2D(
+                mFrameDim.x, mFrameDim.y, ResourceFormat::R32Uint, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+            mScreenProbes.pScreenRadianceLightingGeneration[i]->setName(
+                i == 0u ? "LumenGIPass::ScreenProbe::ScreenRadianceLightingGeneration0"
+                        : "LumenGIPass::ScreenProbe::ScreenRadianceLightingGeneration1"
+            );
+            mScreenProbes.pScreenRadianceAge[i] = mpDevice->createTexture2D(
+                mFrameDim.x, mFrameDim.y, ResourceFormat::R32Uint, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+            mScreenProbes.pScreenRadianceAge[i]->setName(
+                i == 0u ? "LumenGIPass::ScreenProbe::ScreenRadianceAge0"
+                        : "LumenGIPass::ScreenProbe::ScreenRadianceAge1"
+            );
+            mScreenProbes.pScreenRadianceValidity[i] = mpDevice->createTexture2D(
+                mFrameDim.x, mFrameDim.y, ResourceFormat::R32Uint, 1, 1, nullptr,
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            );
+            mScreenProbes.pScreenRadianceValidity[i]->setName(
+                i == 0u ? "LumenGIPass::ScreenProbe::ScreenRadianceValidity0"
+                        : "LumenGIPass::ScreenProbe::ScreenRadianceValidity1"
+            );
+        }
+
         // Prefill the static probe positions (tile centers). Everything else is zero
         // (the update pass resamples active/depth/normal/worldPos every frame).
         std::vector<LumenScreenProbe::Meta> metas(probeCount);
@@ -2630,45 +3922,284 @@ void LumenGIPass::ensureScreenProbeResources(RenderContext* pRenderContext)
         for (uint32_t i = 0; i < probeCount; ++i)
         {
             const uint2 gridPos = uint2(i % gridDims.x, i / gridDims.x);
-            metas[i].screenPos = LumenScreenProbe::probeScreenPos(gridPos);
+            const float2 unclamped = LumenScreenProbe::probeScreenPos(gridPos);
+            const float2 frameMax = float2(
+                std::max(0.5f, float(mFrameDim.x) - 0.5f),
+                std::max(0.5f, float(mFrameDim.y) - 0.5f)
+            );
+            metas[i].screenPos = clamp(unclamped, float2(0.5f), frameMax);
+            metas[i].dirty = 1u; // first update must not reuse any prior history.
         }
         mScreenProbes.pMetadata->setBlob(metas.data(), 0, metas.size() * sizeof(LumenScreenProbe::Meta));
         pRenderContext->clearUAV(mScreenProbes.pHitRecords->getUAV().get(), uint4(0));
         pRenderContext->clearUAV(mScreenProbes.pCounters->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mScreenProbes.pCacheFeedback->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mScreenProbes.pCacheRequests->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mScreenProbes.pRadiance->getUAV().get(), float4(0.f));
         pRenderContext->clearUAV(mScreenProbes.pRadianceHistory->getUAV().get(), float4(0.f));
         pRenderContext->clearUAV(mScreenProbes.pInterpolated->getUAV().get(), float4(0.f));
+        for (uint32_t i = 0; i < 2u; ++i)
+        {
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceHistory[i]->getUAV().get(), float4(0.f));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceDepthHistory[i]->getUAV().get(), float4(0.f));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceGuideHistory[i]->getUAV().get(), float4(0.f));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceMoments[i]->getUAV().get(), float4(0.f));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceLightingGeneration[i]->getUAV().get(), uint4(0));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceAge[i]->getUAV().get(), uint4(0));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceValidity[i]->getUAV().get(), uint4(0));
+        }
 
         mScreenProbes.probeCount = probeCount;
         mScreenProbes.resourceDim = mFrameDim;
+        mScreenProbes.screenRadianceHistoryCurrIndex = 0u;
+        if (mScreenProbes.pCacheFeedback)
+            pRenderContext->clearUAV(mScreenProbes.pCacheFeedback->getUAV().get(), uint4(0));
+        if (mScreenProbes.pCacheRequests)
+            pRenderContext->clearUAV(mScreenProbes.pCacheRequests->getUAV().get(), uint4(0));
+        mScreenProbes.cacheFeedbackReadbackPending = false;
+        mScreenProbes.cacheFeedbackSubmittedFrame = 0;
+        mScreenProbes.cacheRequestReadbackPending = false;
         mScreenProbes.historyResetPending = true;
     }
 }
 
 void LumenGIPass::readbackScreenProbeCounters(RenderContext* pRenderContext)
 {
-    if (!mScreenProbes.counterReadbackPending || !mScreenProbes.pCountersReadback)
+    const bool haveCounters = mScreenProbes.counterReadbackPending && mScreenProbes.pCountersReadback;
+    const bool haveFeedback = mScreenProbes.cacheFeedbackReadbackPending && mScreenProbes.pCacheFeedbackReadback;
+    const bool haveRequests = mScreenProbes.cacheRequestReadbackPending && mScreenProbes.pCacheRequestsReadback;
+    if (!haveCounters && !haveFeedback && !haveRequests)
         return;
-    const LumenScreenProbe::Counters* pCounters =
-        static_cast<const LumenScreenProbe::Counters*>(mScreenProbes.pCountersReadback->map());
-    if (pCounters)
+    auto recordRejectedRequestEvent = [&](uint32_t cardIndex, uint32_t requestReason, uint32_t requestCount)
     {
-        mScreenProbeStats.probeCount = mScreenProbes.probeCount;
-        mScreenProbeStats.directionsPerProbe = mProbeDirectionsPerProbe;
-        const uint32_t interval = LumenScreenProbe::updateInterval(mScreenProbes.probeCount, mProbeMaxProbesPerFrame);
-        mScreenProbeStats.updateInterval = interval;
-        mScreenProbeStats.expectedProbesPerFrame =
-            LumenScreenProbe::expectedProbesPerFrame(mScreenProbes.probeCount, interval);
-        mScreenProbeStats.screenHits = pCounters->screenHits;
-        mScreenProbeStats.fallbackAttempts = pCounters->fallbackAttempts;
-        mScreenProbeStats.fallbackHits = pCounters->fallbackHits;
-        mScreenProbeStats.fallbackMisses = pCounters->fallbackMisses;
-        mScreenProbeStats.fallbackUnavailable = pCounters->fallbackUnavailable;
-        mScreenProbeStats.inactiveProbes = pCounters->inactiveProbes;
-        mScreenProbeStats.budgetSkipped = pCounters->budgetSkipped;
-        mScreenProbeStats.directionsTraced = pCounters->directionsTraced;
-        mScreenProbes.pCountersReadback->unmap();
+        if (requestCount == 0u)
+            return;
+        const bool alreadyTerminal = std::any_of(
+            mSurfaceCacheRequestEvents.begin(), mSurfaceCacheRequestEvents.end(),
+            [&](const SurfaceCacheRequestEvent& event)
+            {
+                return event.sceneGeneration == mSurfaceCacheSceneGeneration &&
+                    event.cardIndex == cardIndex && event.state == 5u &&
+                    event.requestFrame == mSurfaceCacheFrameIndex;
+            }
+        );
+        if (alreadyTerminal)
+            return;
+        if (mSurfaceCacheRequestEvents.size() >= kMaxSurfaceCacheRequestEvents)
+        {
+            mSurfaceCacheRequestEvents.erase(mSurfaceCacheRequestEvents.begin());
+            ++mSurfaceCacheRequestEventDropped;
+        }
+        SurfaceCacheRequestEvent rejected;
+        rejected.sequence = ++mSurfaceCacheRequestEventSequence;
+        rejected.sceneGeneration = mSurfaceCacheSceneGeneration;
+        rejected.cardIndex = cardIndex;
+        rejected.requestFrame = mSurfaceCacheFrameIndex;
+        rejected.reasonBits = requestReason | 2u; // explicit terminal stale/rejected outcome.
+        rejected.requestCount = requestCount;
+        rejected.state = 5u;
+        mSurfaceCacheRequestEvents.push_back(rejected);
+    };
+    if (haveCounters)
+    {
+        const LumenScreenProbe::Counters* pCounters =
+            static_cast<const LumenScreenProbe::Counters*>(mScreenProbes.pCountersReadback->map());
+        if (pCounters)
+        {
+            mScreenProbeStats.probeCount = mScreenProbes.probeCount;
+            mScreenProbeStats.directionsPerProbe = mProbeDirectionsPerProbe;
+            const uint32_t interval = LumenScreenProbe::updateInterval(mScreenProbes.probeCount, mProbeMaxProbesPerFrame);
+            mScreenProbeStats.updateInterval = interval;
+            mScreenProbeStats.expectedProbesPerFrame =
+                LumenScreenProbe::expectedProbesPerFrame(mScreenProbes.probeCount, interval);
+            mScreenProbeStats.screenHits = pCounters->screenHits;
+            mScreenProbeStats.fallbackAttempts = pCounters->fallbackAttempts;
+            mScreenProbeStats.fallbackHits = pCounters->fallbackHits;
+            mScreenProbeStats.fallbackMisses = pCounters->fallbackMisses;
+            mScreenProbeStats.fallbackUnavailable = pCounters->fallbackUnavailable;
+            mScreenProbeStats.inactiveProbes = pCounters->inactiveProbes;
+            mScreenProbeStats.budgetSkipped = pCounters->budgetSkipped;
+            mScreenProbeStats.directionsTraced = pCounters->directionsTraced;
+            mScreenProbeStats.gdfHits = pCounters->gdfHits;
+            mScreenProbeStats.gdfMisses = pCounters->gdfMisses;
+            mScreenProbeStats.cacheLookupHits = pCounters->cacheLookupHits;
+            mScreenProbeStats.cacheLookupAttempts = pCounters->cacheLookupAttempts;
+            mScreenProbeStats.cachePageRejects = pCounters->cachePageRejects;
+            mScreenProbeStats.cacheCoverageRejects = pCounters->cacheCoverageRejects;
+            mScreenProbeStats.cacheMetadataRejects = pCounters->cacheMetadataRejects;
+            mScreenProbeStats.cacheVisibilityRejects = pCounters->cacheVisibilityRejects;
+            mScreenProbeStats.historyAccepted = pCounters->historyAccepted;
+            mScreenProbeStats.historyRejectDepth = pCounters->historyRejectDepth;
+            mScreenProbeStats.historyRejectGuide = pCounters->historyRejectGuide;
+            mScreenProbeStats.historyRejectMotion = pCounters->historyRejectMotion;
+            mScreenProbeStats.historyRejectLighting = pCounters->historyRejectLighting;
+            mScreenProbeStats.historyRejectCurrentInvalid = pCounters->historyRejectCurrentInvalid;
+            mScreenProbeStats.historyRejectPreviousInvalid = pCounters->historyRejectPreviousInvalid;
+            mScreenProbeStats.historyReset = pCounters->historyReset;
+            mScreenProbeStats.cacheDepthRejects = pCounters->cacheDepthRejects;
+            mScreenProbeStats.cacheAxisRejects = pCounters->cacheAxisRejects;
+            mScreenProbeStats.cacheFacingRejects = pCounters->cacheFacingRejects;
+            mScreenProbeStats.cacheOwnerValid = pCounters->cacheOwnerValid;
+            mScreenProbeStatsFrame = mScreenProbeCountersSubmittedFrame;
+            mScreenProbes.pCountersReadback->unmap();
+        }
+        mScreenProbes.counterReadbackPending = false;
     }
-    mScreenProbes.counterReadbackPending = false;
+
+    if (haveFeedback)
+    {
+        const uint2* pFeedback = static_cast<const uint2*>(mScreenProbes.pCacheFeedbackReadback->map());
+        if (pFeedback)
+        {
+            // Feedback is copied after integrate and consumed at the next
+            // execute entry. Preserve the dispatch-domain frame for event
+            // provenance instead of shifting firstHitFrame by one.
+            const uint32_t feedbackFrame = mScreenProbes.cacheFeedbackSubmittedFrame;
+            const uint32_t currentPageCount = mPageCache.getPageCount() + 1u;
+            const uint32_t pageCount = std::min(mScreenProbes.cacheFeedbackPageCount, currentPageCount);
+            const bool sameScene = mScreenProbes.cacheFeedbackSceneGeneration == mSurfaceCacheSceneGeneration;
+            for (uint32_t pageID = 1u; pageID < pageCount; ++pageID)
+            {
+                const uint32_t hitCount = pFeedback[pageID].x;
+                const uint32_t generation = pFeedback[pageID].y;
+                if (hitCount == 0u)
+                    continue;
+
+                mSurfaceCacheFeedbackHits += hitCount;
+                const bool validState = mPageCache.isPageAllocated(pageID) &&
+                    (mPageCache.getPageState(pageID) == LumenSurfaceCachePageState::Allocated ||
+                     mPageCache.getPageState(pageID) == LumenSurfaceCachePageState::Touched);
+                if (!sameScene || generation == 0u || !validState || mPageCache.getGeneration(pageID) != generation)
+                {
+                    ++mSurfaceCacheFeedbackStaleRejects;
+                    continue;
+                }
+                if (mPageCache.touchPage(pageID))
+                {
+                    ++mSurfaceCacheFeedbackPages;
+                    if (hitCount > 1u)
+                        mSurfaceCacheFeedbackDedup += hitCount - 1u;
+                    const uint32_t cardIndex = pageID < mPageToCardData.size() ? mPageToCardData[pageID] : kLumenCardInvalidID;
+                    for (auto it = mSurfaceCacheRequestEvents.rbegin();
+                         it != mSurfaceCacheRequestEvents.rend(); ++it)
+                    {
+                        if (it->sceneGeneration == mSurfaceCacheSceneGeneration &&
+                            it->pageID == pageID && it->generation == generation &&
+                            (it->cardIndex == cardIndex || cardIndex == kLumenCardInvalidID) &&
+                            it->readyFrame != 0u && it->firstHitFrame == 0u)
+                        {
+                            if (feedbackFrame >= it->readyFrame && feedbackFrame >= it->requestFrame)
+                            {
+                                it->firstHitFrame = feedbackFrame;
+                                it->lookupHits = hitCount;
+                                it->state = 4u;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            mScreenProbes.pCacheFeedbackReadback->unmap();
+        }
+        mScreenProbes.cacheFeedbackReadbackPending = false;
+        mScreenProbes.cacheFeedbackSubmittedFrame = 0;
+    }
+
+    if (haveRequests)
+    {
+        const uint2* pRequests = static_cast<const uint2*>(mScreenProbes.pCacheRequestsReadback->map());
+        if (pRequests)
+        {
+            const uint32_t currentCardCount = mpCardScene ? mpCardScene->getCardCount() : 0u;
+            const uint32_t cardCount = std::min(mScreenProbes.cacheRequestCardCount, currentCardCount);
+            const bool sameScene = mScreenProbes.cacheRequestSceneGeneration == mSurfaceCacheSceneGeneration;
+            for (uint32_t cardIndex = 0u; cardIndex < cardCount; ++cardIndex)
+            {
+                const uint32_t requestCount = pRequests[cardIndex].x;
+                if (requestCount == 0u)
+                    continue;
+                // The shader stores an OR of reason bits alongside the raw
+                // count. Preserve those bits as typed telemetry instead of
+                // discarding the only evidence needed to prioritize miss
+                // requests (unmapped, stale owner, metadata, visibility).
+                const uint32_t requestReason = pRequests[cardIndex].y;
+                if ((requestReason & 1u) != 0u)
+                    mSurfaceCacheRequestUnmapped += requestCount;
+                if ((requestReason & 2u) != 0u)
+                    mSurfaceCacheRequestStaleOwner += requestCount;
+                if ((requestReason & 4u) != 0u)
+                    mSurfaceCacheRequestMetadataInvalid += requestCount;
+                if ((requestReason & 8u) != 0u)
+                    mSurfaceCacheRequestVisibilityInvalid += requestCount;
+                mSurfaceCacheRequestRaw += requestCount;
+                mSurfaceCacheRequestRawThisFrame += requestCount;
+                mSurfaceCacheRequestObservedFrame = mSurfaceCacheFrameIndex;
+                if (requestCount > 1u)
+                    mSurfaceCacheRequestDedup += requestCount - 1u;
+                if (!sameScene || !mpCardScene || cardIndex >= mpCardScene->getCardCount())
+                {
+                    ++mSurfaceCacheRequestStaleRejects;
+                    recordRejectedRequestEvent(cardIndex, requestReason, requestCount);
+                    continue;
+                }
+                // Defer scheduler insertion until the next host frame.  The
+                // request was produced by the previous GPU dispatch, so this
+                // preserves an explicit N -> N+1 capture/publication fence.
+                const bool alreadyRequested =
+                    mSurfaceCacheRequestedCards.find(cardIndex) != mSurfaceCacheRequestedCards.end() ||
+                    mSurfaceCacheDeferredRequestCards.find(cardIndex) != mSurfaceCacheDeferredRequestCards.end();
+                const bool canQueue = mCaptureScheduler.canAcceptFeedbackRequest(cardIndex);
+                if (!alreadyRequested && canQueue && mSurfaceCacheDeferredRequestCards.insert(cardIndex).second)
+                {
+                    mSurfaceCacheDeferredRequestFrame = mSurfaceCacheFrameIndex;
+                    mSurfaceCacheDeferredRequestFrameByCard[cardIndex] = mSurfaceCacheFrameIndex;
+                    ++mSurfaceCacheRequestCards;
+                    ++mSurfaceCacheRequestCardsThisFrame;
+                    // Record only requests accepted by the deferred scheduler. Raw GPU misses
+                    // rejected by canAcceptFeedbackRequest are not lifecycle events.
+                    if (mSurfaceCacheRequestEvents.size() >= kMaxSurfaceCacheRequestEvents)
+                    {
+                        mSurfaceCacheRequestEvents.erase(mSurfaceCacheRequestEvents.begin());
+                        ++mSurfaceCacheRequestEventDropped;
+                    }
+                    SurfaceCacheRequestEvent newEvent;
+                    newEvent.sequence = ++mSurfaceCacheRequestEventSequence;
+                    newEvent.sceneGeneration = mSurfaceCacheSceneGeneration;
+                    newEvent.cardIndex = cardIndex;
+                    newEvent.requestFrame = mSurfaceCacheFrameIndex;
+                    newEvent.reasonBits = requestReason;
+                    newEvent.requestCount = requestCount;
+                    newEvent.state = 1u;
+                    mSurfaceCacheRequestEvents.push_back(newEvent);
+                }
+                else
+                {
+                    if (!alreadyRequested && !canQueue)
+                    {
+                        ++mSurfaceCacheRequestStaleRejects;
+                        recordRejectedRequestEvent(cardIndex, requestReason, requestCount);
+                        continue;
+                    }
+                    ++mSurfaceCacheRequestDedup;
+                    // Coalesce repeated misses into the outstanding card event, preserving its
+                    // original request frame and card/page identity.
+                    for (auto eventIt = mSurfaceCacheRequestEvents.rbegin();
+                         eventIt != mSurfaceCacheRequestEvents.rend(); ++eventIt)
+                    {
+                        if (eventIt->sceneGeneration == mSurfaceCacheSceneGeneration &&
+                            eventIt->cardIndex == cardIndex && eventIt->state < 3u)
+                        {
+                            eventIt->reasonBits |= requestReason;
+                            eventIt->requestCount += requestCount;
+                            break;
+                        }
+                    }
+                }
+            }
+            mScreenProbes.pCacheRequestsReadback->unmap();
+        }
+        mScreenProbes.cacheRequestReadbackPending = false;
+    }
 }
 
 void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const RenderData& renderData)
@@ -2688,14 +4219,19 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
     if (!mScreenTrace.pHZBBuild)
         createHZBBuildProgram();
 
-    // Read back the previous dispatch's counters (one-frame lag, same as the other paths).
-    readbackScreenProbeCounters(pRenderContext);
-
     ensureScreenProbeResources(pRenderContext);
     if (!mScreenProbes.pUpdate || !mScreenProbes.pTrace || !mScreenProbes.pFinalize ||
+        !mScreenProbes.pScreenRadianceHistoryPass ||
         !mScreenProbes.pIntegrate || !mScreenProbes.pInterpolate ||
         !mScreenProbes.pMetadata || !mScreenProbes.pHitRecords || !mScreenProbes.pRadiance ||
         !mScreenProbes.pRadianceHistory || !mScreenProbes.pInterpolated ||
+        !mScreenProbes.pScreenRadianceHistory[0] || !mScreenProbes.pScreenRadianceHistory[1] ||
+        !mScreenProbes.pScreenRadianceDepthHistory[0] || !mScreenProbes.pScreenRadianceDepthHistory[1] ||
+        !mScreenProbes.pScreenRadianceGuideHistory[0] || !mScreenProbes.pScreenRadianceGuideHistory[1] ||
+        !mScreenProbes.pScreenRadianceMoments[0] || !mScreenProbes.pScreenRadianceMoments[1] ||
+        !mScreenProbes.pScreenRadianceLightingGeneration[0] || !mScreenProbes.pScreenRadianceLightingGeneration[1] ||
+        !mScreenProbes.pScreenRadianceAge[0] || !mScreenProbes.pScreenRadianceAge[1] ||
+        !mScreenProbes.pScreenRadianceValidity[0] || !mScreenProbes.pScreenRadianceValidity[1] ||
         mScreenProbes.probeCount == 0)
     {
         return;
@@ -2718,12 +4254,23 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
     // rest are always present).
     const bool hasScreenTrace = renderData.getTexture("screenTrace") != nullptr;
     const bool hasProbeRadiance = renderData.getTexture("probeRadiance") != nullptr;
+    const ref<Buffer> pProbeValidity = dynamic_ref_cast<Buffer>(renderData.getResource("probeValidity"));
+    const bool hasProbeValidity = pProbeValidity != nullptr;
     const bool hasProbeInterpolated = renderData.getTexture("probeInterpolated") != nullptr;
     const bool hasProbeHistory = renderData.getTexture(kProbeHistory) != nullptr;
+    const ref<Texture> pScreenRadianceLightingGenerationOutput = renderData.getTexture("screenRadianceLightingGeneration");
+    const ref<Texture> pScreenRadianceHistoryAgeOutput = renderData.getTexture("screenRadianceHistoryAge");
+    const ref<Texture> pScreenRadianceHistoryValidityOutput = renderData.getTexture("screenRadianceHistoryValidity");
     const bool hasNormal = renderData.getTexture("normWRoughnessMaterialID") != nullptr;
     const bool hasDiffuseRadiance = renderData.getTexture("diffuseRadianceHitDist") != nullptr;
     const bool hasSurfaceCacheLookup = mUseSurfaceCache && mUseCacheLighting && mCapture.pCards &&
-        mCapture.pPageTable && mCapture.pRadianceAtlas && mCacheLighting.pVisibilityAtlas;
+        mCapture.pPageTable && mCapture.pPageGeneration && mCapture.pMetadataAtlas &&
+        mCapture.pRadianceAtlas && mCacheLighting.pVisibilityAtlas && mCacheLighting.pPageMetadata &&
+        mCacheLighting.pCardGrid && !mCardGridData.empty() && mLastCacheLightingPageCount > 0u;
+    // C4 production router: screen miss -> composed GDF -> HWRT.  The GDF is only
+    // eligible after compose resources exist; a missing level table keeps the legacy
+    // screen -> HWRT path intact for the first setup frame.
+    const bool hasGDFRoute = mUseGDF && mSDF.gdf && mSDF.pLevelTable && !mSDF.levels.empty();
 
     // Per-frame program specialization (all three trace passes share the same shader + defines).
     bool programChanged = false;
@@ -2736,7 +4283,20 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         programChanged |= pProgram->addDefine("is_valid_gDiffuseRadianceHitDist", hasDiffuseRadiance ? "1" : "0");
         programChanged |= pProgram->addDefine("is_valid_gNormalRoughnessMaterialID", hasNormal ? "1" : "0");
         programChanged |= pProgram->addDefine("is_valid_gProbeRadiance", hasProbeRadiance ? "1" : "0");
+        programChanged |= pProgram->addDefine("is_valid_gProbeValidity", hasProbeValidity ? "1" : "0");
+        programChanged |= pProgram->addDefine("LUMEN_GI_PROBE_GDF_ROUTE", hasGDFRoute ? "1" : "0");
+        programChanged |= pProgram->addDefine(
+            "is_valid_gScreenRadianceHistory", (hasDiffuseRadiance && mScreenProbes.pScreenRadianceHistory[0]) ? "1" : "0"
+        );
+        programChanged |= pProgram->addDefine(
+            "is_valid_gScreenRadianceHistoryValidity",
+            (hasDiffuseRadiance && mScreenProbes.pScreenRadianceValidity[0]) ? "1" : "0"
+        );
     }
+    programChanged |= mScreenProbes.pTrace->getProgram()->addDefine(
+        "is_valid_gScreenRadianceMoments",
+        (mUseScreenRadianceMoments && hasDiffuseRadiance && mScreenProbes.pScreenRadianceMoments[0]) ? "1" : "0"
+    );
 
     // S4.3 integrate/interpolate passes: all inputs are internal + always bound, so their
     // is_valid defines are pinned to 1 (gProbeRadiance here is the INTERNAL pRadiance texture,
@@ -2760,12 +4320,21 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         programChanged |= mScreenProbes.pIntegrate->getProgram()->addDefine(
             "LUMEN_GI_PROBE_CACHE_LOOKUP", hasSurfaceCacheLookup ? "1" : "0"
         );
+        programChanged |= mScreenProbes.pIntegrate->getProgram()->addDefine(
+            "is_valid_gProbeCacheFeedback",
+            (hasSurfaceCacheLookup && mScreenProbes.pCacheFeedback) ? "1" : "0"
+        );
+        programChanged |= mScreenProbes.pIntegrate->getProgram()->addDefine(
+            "is_valid_gProbeCacheRequests",
+            (hasSurfaceCacheLookup && mScreenProbes.pCacheRequests) ? "1" : "0"
+        );
     }
     if (programChanged)
     {
         mScreenProbes.pUpdate->setVars(nullptr);
         mScreenProbes.pTrace->setVars(nullptr);
         mScreenProbes.pFinalize->setVars(nullptr);
+        mScreenProbes.pScreenRadianceHistoryPass->setVars(nullptr);
         mScreenProbes.pIntegrate->setVars(nullptr);
         mScreenProbes.pInterpolate->setVars(nullptr);
     }
@@ -2841,6 +4410,29 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         cb["gDebugMode"] = static_cast<uint32_t>(mDebugMode);
         cb["gProbeCount"] = probeCount;
         cb["gWeightMode"] = mProbeIntegrateWeightMode; // S4.3 integrate weight mode (0 = cosine hemisphere).
+        cb["gHistoryGeneration"] = (uint32_t)mHistoryGeneration;
+        cb["gLightingGeneration"] = (uint32_t)mLightingGeneration;
+        cb["gResetReason"] = static_cast<uint32_t>(mLastHistoryResetReason);
+        cb["gValidityStride"] = LumenScreenProbe::kMaxDirectionsPerProbe;
+        cb["gSurfaceCacheFrameIndex"] = mSurfaceCacheFrameIndex;
+        if (hasGDFRoute)
+        {
+            auto gdfClip = cb["gGDFClipmap"];
+            const auto center = mSDF.gdf->getCameraCenter();
+            const auto scroll = mSDF.gdf->scrollFromCameraMove();
+            gdfClip["cameraCenter"] = float3(center.x, center.y, center.z);
+            gdfClip["emptyDistance"] = 0.f;
+            gdfClip["levelCount"] = mSDF.gdf->getLevelCount();
+            gdfClip["dynamicLevelCount"] = LumenGI::GlobalDistanceField::kDynamicLevels;
+            gdfClip["resolution"] = mSDF.gdf->getResolution();
+            gdfClip["instanceCount"] = 0u;
+            gdfClip["dirtyRegionCount"] = 0u;
+            gdfClip["frameIndex"] = mFrameIndex;
+            gdfClip["scroll"] = int3(scroll.x, scroll.y, scroll.z);
+            cb["gGDFTraceMaxDistance"] = mGDFTraceMaxDistance;
+            cb["gGDFMaxSteps"] = mGDFTraceMaxSteps;
+            cb["gGDFRouteEnabled"] = 1u;
+        }
 
         // Resources (shared by all three entry points).
         var["gLinearZ"] = pLinearZ;
@@ -2850,13 +4442,39 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
             var["gNormalRoughnessMaterialID"] = renderData.getTexture("normWRoughnessMaterialID");
         if (hasDiffuseRadiance)
             var["gDiffuseRadianceHitDist"] = renderData.getTexture("diffuseRadianceHitDist");
+        if (hasDiffuseRadiance && mScreenProbes.pScreenRadianceHistory[0])
+        {
+            const uint32_t readIndex = 1u - mScreenProbes.screenRadianceHistoryCurrIndex;
+            var["gScreenRadianceHistory"] = mScreenProbes.pScreenRadianceHistory[readIndex];
+            var["gScreenRadianceHistoryValidity"] = mScreenProbes.pScreenRadianceValidity[readIndex];
+            if (pPass.get() == mScreenProbes.pScreenRadianceHistoryPass.get())
+                var["gPreviousAge"] = mScreenProbes.pScreenRadianceAge[readIndex];
+            if (pPass.get() == mScreenProbes.pTrace.get() && mUseScreenRadianceMoments && mScreenProbes.pScreenRadianceMoments[0])
+                var["gScreenRadianceMoments"] = mScreenProbes.pScreenRadianceMoments[readIndex];
+            if (pPass.get() == mScreenProbes.pScreenRadianceHistoryPass.get())
+            {
+                var["gPreviousValidity"] = mScreenProbes.pScreenRadianceValidity[readIndex];
+                var["gOutputValidity"].setUav(
+                    mScreenProbes.pScreenRadianceValidity[mScreenProbes.screenRadianceHistoryCurrIndex]->getUAV()
+                );
+            }
+        }
         if (hasScreenTrace)
             var["gScreenTraceResult"] = renderData.getTexture("screenTrace");
+        if (hasGDFRoute)
+        {
+            var["gGDFLevelTable"] = mSDF.pLevelTable;
+            const uint32_t levelCount = mSDF.gdf->getLevelCount();
+            for (uint32_t level = 0; level < kLumenGDFMaxLevelsHost; ++level)
+                var["gGDFLevels"][level] = mSDF.levels[std::min<uint32_t>(level, levelCount - 1u)];
+        }
         var["gProbeMeta"] = mScreenProbes.pMetadata;
         var["gProbeHitRecords"] = mScreenProbes.pHitRecords;
         var["gProbeCounters"] = mScreenProbes.pCounters;
         if (hasProbeRadiance)
             var["gProbeRadiance"] = renderData.getTexture("probeRadiance");
+        if (hasProbeValidity)
+            var["gProbeValidity"].setUav(pProbeValidity->getUAV());
 
         // Scene block + raytracing data for the scene-mode fallback (cache-lighting pattern).
         mpScene->bindShaderData(var["gScene"]);
@@ -2869,6 +4487,106 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
     // Counters cleared before the dispatch; copied to the readback buffer after.
     if (mScreenProbes.pCounters)
         pRenderContext->clearUAV(mScreenProbes.pCounters->getUAV().get(), uint4(0));
+
+    // The C7 validity sidecar is an optional diagnostic buffer.  Clear it before
+    // each probe dispatch so budget-skipped/inactive directions cannot expose
+    // pooled-resource contents from an older graph execution as a backend code.
+    // Production GI never allocates or reads this buffer.
+    if (hasProbeValidity)
+        pRenderContext->clearUAV(pProbeValidity->getUAV().get(), uint4(0));
+
+    // Hard invalidation must happen before metadata update/trace/finalize.  In
+    // particular, budget-skipped probes must not retain old-scene radiance or
+    // hit records while the new frame is rebuilding its identity.
+    if (mScreenProbes.historyResetPending)
+    {
+        pRenderContext->clearUAV(mScreenProbes.pHitRecords->getUAV().get(), uint4(0));
+        pRenderContext->clearUAV(mScreenProbes.pRadiance->getUAV().get(), float4(0.f));
+        pRenderContext->clearUAV(mScreenProbes.pRadianceHistory->getUAV().get(), float4(0.f));
+        pRenderContext->clearUAV(mScreenProbes.pInterpolated->getUAV().get(), float4(0.f));
+        for (uint32_t i = 0; i < 2u; ++i)
+        {
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceHistory[i]->getUAV().get(), float4(0.f));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceDepthHistory[i]->getUAV().get(), float4(0.f));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceGuideHistory[i]->getUAV().get(), float4(0.f));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceMoments[i]->getUAV().get(), float4(0.f));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceLightingGeneration[i]->getUAV().get(), uint4(0));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceAge[i]->getUAV().get(), uint4(0));
+            pRenderContext->clearUAV(mScreenProbes.pScreenRadianceValidity[i]->getUAV().get(), uint4(0));
+        }
+        mScreenProbes.screenRadianceHistoryCurrIndex = 0u;
+        mScreenProbes.historyResetPending = false;
+    }
+
+    // Build the next full-resolution screen-radiance history before the probe
+    // trace.  The trace reads the opposite slot, so the current raw HWRT
+    // result never feeds back into the same frame.  This is the key temporal
+    // distinction from the probe irradiance history below.
+    if (hasDiffuseRadiance && mScreenProbes.pScreenRadianceHistoryPass)
+    {
+        const uint32_t writeIndex = mScreenProbes.screenRadianceHistoryCurrIndex;
+        const uint32_t readIndex = 1u - writeIndex;
+        ref<Program> pHistoryProgram = mScreenProbes.pScreenRadianceHistoryPass->getProgram();
+        bool historyProgramChanged = false;
+        historyProgramChanged |= pHistoryProgram->addDefine(
+            "is_valid_gMotionVector", renderData.getTexture("mvec") ? "1" : "0"
+        );
+        historyProgramChanged |= pHistoryProgram->addDefine(
+            "is_valid_gNormalRoughnessMaterialID", renderData.getTexture("normWRoughnessMaterialID") ? "1" : "0"
+        );
+        if (historyProgramChanged)
+            mScreenProbes.pScreenRadianceHistoryPass->setVars(nullptr);
+
+        ShaderVar historyVar = mScreenProbes.pScreenRadianceHistoryPass->getRootVar();
+        ShaderVar historyCB = historyVar["LumenScreenRadianceHistoryCB"];
+        historyCB["gFrameDim"] = mFrameDim;
+        historyCB["gHistoryValid"] = mFrameIndex > 0u ? 1u : 0u;
+        historyCB["gHistoryGeneration"] = (uint32_t)mHistoryGeneration;
+        historyCB["gLightingGeneration"] = (uint32_t)mLightingGeneration;
+        historyCB["gResetReason"] = (uint32_t)mLastHistoryResetReason;
+        historyCB["gResetActive"] = mHistoryResetThisFrame || mScreenProbes.historyResetPending ? 1u : 0u;
+        historyVar["gCurrentRadiance"] = renderData.getTexture("diffuseRadianceHitDist");
+        historyVar["gPreviousRadiance"] = mScreenProbes.pScreenRadianceHistory[readIndex];
+        historyVar["gCurrentLinearZ"] = pLinearZ;
+        historyVar["gPreviousLinearZ"] = mScreenProbes.pScreenRadianceDepthHistory[readIndex];
+        historyVar["gPreviousGuide"] = mScreenProbes.pScreenRadianceGuideHistory[readIndex];
+        historyVar["gPreviousMoments"] = mScreenProbes.pScreenRadianceMoments[readIndex];
+        historyVar["gPreviousLightingGeneration"] = mScreenProbes.pScreenRadianceLightingGeneration[readIndex];
+        historyVar["gPreviousAge"] = mScreenProbes.pScreenRadianceAge[readIndex];
+        historyVar["gPreviousValidity"] = mScreenProbes.pScreenRadianceValidity[readIndex];
+        // Reuse the screen-probe counter UAV for typed A2 history rejection
+        // telemetry. The buffer is cleared before this pass and copied after
+        // the complete probe chain, so history and trace counters share one
+        // frame-scoped readback without an alias.
+        historyVar["gProbeCounters"] = mScreenProbes.pCounters;
+        if (const ref<Texture> pMotion = renderData.getTexture("mvec"))
+            historyVar["gMotionVector"] = pMotion;
+        if (const ref<Texture> pGuide = renderData.getTexture("normWRoughnessMaterialID"))
+            historyVar["gCurrentGuide"] = pGuide;
+        historyVar["gOutputRadiance"].setUav(mScreenProbes.pScreenRadianceHistory[writeIndex]->getUAV());
+        historyVar["gOutputLinearZ"].setUav(mScreenProbes.pScreenRadianceDepthHistory[writeIndex]->getUAV());
+        historyVar["gOutputGuide"].setUav(mScreenProbes.pScreenRadianceGuideHistory[writeIndex]->getUAV());
+        historyVar["gOutputMoments"].setUav(mScreenProbes.pScreenRadianceMoments[writeIndex]->getUAV());
+        historyVar["gOutputLightingGeneration"].setUav(mScreenProbes.pScreenRadianceLightingGeneration[writeIndex]->getUAV());
+        historyVar["gOutputAge"].setUav(mScreenProbes.pScreenRadianceAge[writeIndex]->getUAV());
+        historyVar["gOutputValidity"].setUav(mScreenProbes.pScreenRadianceValidity[writeIndex]->getUAV());
+        mScreenProbes.pScreenRadianceHistoryPass->execute(
+            pRenderContext, ((mFrameDim.x + 7u) / 8u) * 8u, ((mFrameDim.y + 7u) / 8u) * 8u, 1
+        );
+        if (pScreenRadianceLightingGenerationOutput)
+            pRenderContext->copyResource(
+                pScreenRadianceLightingGenerationOutput.get(),
+                mScreenProbes.pScreenRadianceLightingGeneration[writeIndex].get()
+            );
+        if (pScreenRadianceHistoryAgeOutput)
+            pRenderContext->copyResource(
+                pScreenRadianceHistoryAgeOutput.get(), mScreenProbes.pScreenRadianceAge[writeIndex].get()
+            );
+        if (pScreenRadianceHistoryValidityOutput)
+            pRenderContext->copyResource(
+                pScreenRadianceHistoryValidityOutput.get(), mScreenProbes.pScreenRadianceValidity[writeIndex].get()
+            );
+    }
 
     // Dispatch order: update (metadata) -> trace (directions) -> finalize (probe radiance).
     // 64-thread groups; the thread counts are multiples of 64 (probeCount and
@@ -2898,6 +4616,7 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
             ShaderVar cb = var["LumenScreenProbeCB"];
             cb["gFrameDim"] = mFrameDim;
             cb["gFrameIndex"] = mFrameIndex;
+            cb["gSurfaceCacheFrameIndex"] = mSurfaceCacheFrameIndex;
             cb["gDirectionsPerProbe"] = directionsPerProbe;
             cb["gProbeGridDims"] = uint2(gridX, (probeCount + gridX - 1u) / gridX);
             cb["gMaxHitRecordStride"] = LumenScreenProbe::kMaxDirectionsPerProbe;
@@ -2918,6 +4637,7 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
             var["gProbeMeta"] = mScreenProbes.pMetadata;
             var["gProbeHitRecords"] = mScreenProbes.pHitRecords;
             var["gProbeRadiance"] = mScreenProbes.pRadiance;
+            var["gProbeCounters"] = mScreenProbes.pCounters;
             if (pPass.get() == mScreenProbes.pIntegrate.get())
             {
                 var["gProbeRadianceHistory"] = mScreenProbes.pRadianceHistory;
@@ -2926,20 +4646,38 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
                     var["LumenProbeCacheCB"]["gProbeCacheCardCount"] = mpCardScene->getCardCount();
                     var["LumenProbeCacheCB"]["gProbeCachePagesPerSide"] = mCapturePagesPerSide;
                     var["LumenProbeCacheCB"]["gProbeCacheAtlasSize"] = uint2(mAtlasSizeTexels, mAtlasSizeTexels);
+                    var["LumenProbeCacheCB"]["gProbeCacheGridDim"] = uint3(
+                        LumenScreenProbe::kCacheCardGridDim,
+                        LumenScreenProbe::kCacheCardGridDim,
+                        LumenScreenProbe::kCacheCardGridDim
+                    );
+                    var["LumenProbeCacheCB"]["gProbeCacheGridMaxCandidates"] =
+                        LumenScreenProbe::kCacheCardGridMaxCandidates;
+                    var["LumenProbeCacheCB"]["gProbeCacheGridMin"] = mCardGridMin;
+                    var["LumenProbeCacheCB"]["gProbeCacheGridInvCellSize"] = mCardGridInvCellSize;
+                    var["LumenProbeCacheCB"]["gProbeCacheGridCellStride"] =
+                        LumenScreenProbe::kCacheCardGridCellStride;
+                    var["LumenProbeCacheCB"]["gProbeCacheUseCardGrid"] = mUseCacheCardGrid ? 1u : 0u;
                     var["gProbeCards"] = mCapture.pCards;
                     var["gProbeCardPageTable"] = mCapture.pPageTable;
+                    var["gProbeCardPageGeneration"] = mCapture.pPageGeneration;
+                    var["gProbePageMetadata"] = mCacheLighting.pPageMetadata;
+                    var["gProbeCardGrid"] = mCacheLighting.pCardGrid;
                     var["gProbeRadianceAtlas"] = mCapture.pRadianceAtlas;
+                    var["gProbeMetadataAtlas"] = mCapture.pMetadataAtlas;
                     var["gProbeVisibilityAtlas"] = mCacheLighting.pVisibilityAtlas;
+                    if (mScreenProbes.pCacheFeedback)
+                        var["gProbeCacheFeedback"] = mScreenProbes.pCacheFeedback;
+                    if (mScreenProbes.pCacheRequests)
+                        var["gProbeCacheRequests"] = mScreenProbes.pCacheRequests;
                 }
             }
         };
 
-        if (mScreenProbes.historyResetPending)
-        {
-            pRenderContext->clearUAV(mScreenProbes.pRadianceHistory->getUAV().get(), float4(0.f));
-            mScreenProbes.historyResetPending = false;
-        }
-
+        if (hasSurfaceCacheLookup && mScreenProbes.pCacheFeedback)
+            pRenderContext->clearUAV(mScreenProbes.pCacheFeedback->getUAV().get(), uint4(0));
+        if (hasSurfaceCacheLookup && mScreenProbes.pCacheRequests)
+            pRenderContext->clearUAV(mScreenProbes.pCacheRequests->getUAV().get(), uint4(0));
         bindProbeCompute(mScreenProbes.pIntegrate);
         mScreenProbes.pIntegrate->execute(pRenderContext, updateThreads, 1, 1);
 
@@ -2970,10 +4708,34 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
             pRenderContext->copyResource(renderData.getTexture(kProbeHistory).get(), mScreenProbes.pRadianceHistory.get());
     }
 
+    // The history pass wrote the slot selected above; make it the read slot
+    // for the next frame only after this frame's probe consumers are done.
+    if (hasDiffuseRadiance && mScreenProbes.pScreenRadianceHistoryPass)
+        mScreenProbes.screenRadianceHistoryCurrIndex = 1u - mScreenProbes.screenRadianceHistoryCurrIndex;
+
     if (mScreenProbes.pCounters && mScreenProbes.pCountersReadback)
     {
         pRenderContext->copyResource(mScreenProbes.pCountersReadback.get(), mScreenProbes.pCounters.get());
+        // Counter readback is consumed at the start of the next execute. Stamp
+        // the scheduler domain used by Surface Cache ready fences, not the
+        // resettable GI history frame.
+        mScreenProbeCountersSubmittedFrame = mSurfaceCacheFrameIndex;
         mScreenProbes.counterReadbackPending = true;
+    }
+    if (hasSurfaceCacheLookup && mScreenProbes.pCacheFeedback && mScreenProbes.pCacheFeedbackReadback)
+    {
+        // Consume on the next frame before Surface Cache scheduling. The submitted epoch is
+        // carried alongside the GPU generation and checked in readbackScreenProbeCounters().
+        pRenderContext->copyResource(mScreenProbes.pCacheFeedbackReadback.get(), mScreenProbes.pCacheFeedback.get());
+        mScreenProbes.cacheFeedbackReadbackPending = true;
+        mScreenProbes.cacheFeedbackSceneGeneration = mSurfaceCacheSceneGeneration;
+        mScreenProbes.cacheFeedbackSubmittedFrame = mSurfaceCacheFrameIndex;
+    }
+    if (hasSurfaceCacheLookup && mScreenProbes.pCacheRequests && mScreenProbes.pCacheRequestsReadback)
+    {
+        pRenderContext->copyResource(mScreenProbes.pCacheRequestsReadback.get(), mScreenProbes.pCacheRequests.get());
+        mScreenProbes.cacheRequestReadbackPending = true;
+        mScreenProbes.cacheRequestSceneGeneration = mSurfaceCacheSceneGeneration;
     }
 }
 
@@ -2986,12 +4748,9 @@ void LumenGIPass::createTemporalFilterProgram()
     // S5-B1 temporal filter (LumenTemporalFilter.cs.slang, entry "main"). The REQUIRED inputs are
     // always bound every dispatch (gLinearZ / gCurrent / gMotionVector / gPrevDepth / gPrevGI /
     // gTemporalOutput), so their is_valid defines are pinned to 1. The OPTIONAL UAVs
-    // (gTemporalAlpha / gTemporalConfidence) are pinned to 0 here and specialized per-frame in
-    // runTemporalFilter based on graph allocation. The optional VALIDATION inputs (normal +
-    // material, hit distance, separate history length / prev confidence) stay unbound in the MVP:
-    // the S4.3 interpolate pass already weight-validates against depth/normal/material, and the
-    // confidence is carried in gCurrent.a / gPrevGI.a, so the filter's core validations (depth,
-    // motion, confidence) are active without them.
+    // (gTemporalAlpha / gTemporalConfidence) and GBuffer normal validation are specialized per
+    // frame in runTemporalFilter based on graph allocation. Hit-distance and previous-confidence
+    // inputs remain unbound until their producer-generation ABI is frozen.
     DefineList defines;
     defines.add("is_valid_gLinearZ", "1");
     defines.add("is_valid_gCurrent", "1");
@@ -2999,6 +4758,11 @@ void LumenGIPass::createTemporalFilterProgram()
     defines.add("is_valid_gPrevDepth", "1");
     defines.add("is_valid_gPrevGI", "1");
     defines.add("is_valid_gTemporalOutput", "1");
+    defines.add("is_valid_gNormalRoughnessMaterialID", "0");
+    defines.add("is_valid_gPrevNormalRoughnessMaterialID", "0");
+    defines.add("is_valid_gHitDistance", "0");
+    defines.add("is_valid_gPrevHitDistance", "0");
+    defines.add("is_valid_gPrevConfidence", "0");
     defines.add("is_valid_gTemporalAlpha", "0");
     defines.add("is_valid_gTemporalConfidence", "0");
     defines.add("is_valid_gMoments", "1");
@@ -3015,7 +4779,7 @@ void LumenGIPass::ensureTemporalFilterResources(RenderContext* pRenderContext)
 
     const bool sizeChanged = any(mTemporalFilter.resourceDim != mFrameDim);
     if (!mTemporalFilter.pHistory[0] || !mTemporalFilter.pHistory[1] || !mTemporalFilter.pPrevDepth ||
-        !mTemporalFilter.pMoments || sizeChanged)
+        !mTemporalFilter.pMoments || !mTemporalFilter.pPrevNormal || sizeChanged)
     {
         // S5-A1 history ping-pong: RGBA16F (RGB = smoothed irradiance, A = history length),
         // full-res, SRV + UAV (the filter reads the previous slot and writes the current slot).
@@ -3041,6 +4805,16 @@ void LumenGIPass::ensureTemporalFilterResources(RenderContext* pRenderContext)
         mTemporalFilter.pPrevDepth->setName("LumenGIPass::TemporalFilter::PrevDepth"); // R32F, frame-scoped.
         pRenderContext->clearUAV(mTemporalFilter.pPrevDepth->getUAV().get(), float4(0.f));
 
+        // Previous-frame packed normal/material.  The current GBuffer is RGB10A2, while this
+        // history is RGBA16F so it can be updated through a normalized blit and sampled by the
+        // temporal validator without aliasing the graph input.
+        mTemporalFilter.pPrevNormal = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess | ResourceBindFlags::RenderTarget
+        );
+        mTemporalFilter.pPrevNormal->setName("LumenGIPass::TemporalFilter::PrevNormal");
+        pRenderContext->clearUAV(mTemporalFilter.pPrevNormal->getUAV().get(), float4(0.f));
+
         mTemporalFilter.pMoments = mpDevice->createTexture2D(
             mFrameDim.x, mFrameDim.y, ResourceFormat::RG32Float, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
@@ -3063,6 +4837,11 @@ void LumenGIPass::runTemporalFilter(RenderContext* pRenderContext, const RenderD
     // The internal probe interpolation is the producer consumed by the filter
     // chain. The graph channel is only a diagnostic mirror and may be allocated
     // but unwritten when the caller does not markOutput() it.
+    // A non-null internal texture is not evidence that this frame produced a new sample. Do not
+    // feed a stale interpolation into temporal history when Screen Probes are disabled or an
+    // earlier probe stage returned before dispatching.
+    if (!mScreenProbes.producedThisFrame)
+        return;
     const ref<Texture> pCurrent = mScreenProbes.pInterpolated
         ? mScreenProbes.pInterpolated
         : renderData.getTexture(kProbeInterpolated);
@@ -3077,7 +4856,7 @@ void LumenGIPass::runTemporalFilter(RenderContext* pRenderContext, const RenderD
 
     ensureTemporalFilterResources(pRenderContext);
     if (!mTemporalFilter.pFilter || !mTemporalFilter.pHistory[0] || !mTemporalFilter.pHistory[1] ||
-        !mTemporalFilter.pPrevDepth || !mTemporalFilter.pMoments)
+        !mTemporalFilter.pPrevDepth || !mTemporalFilter.pPrevNormal || !mTemporalFilter.pMoments)
     {
         return;
     }
@@ -3097,11 +4876,14 @@ void LumenGIPass::runTemporalFilter(RenderContext* pRenderContext, const RenderD
 
     const bool hasAlpha = renderData.getTexture(kTemporalAlpha) != nullptr;
     const bool hasConfidence = renderData.getTexture(kTemporalConfidence) != nullptr;
+    const bool hasNormal = renderData.getTexture("normWRoughnessMaterialID") != nullptr;
 
     // Per-frame program specialization for the optional UAVs (graph allocation is fixed per graph,
     // so this changes only once per graph build).
     ref<Program> pProgram = mTemporalFilter.pFilter->getProgram();
     bool programChanged = false;
+    programChanged |= pProgram->addDefine("is_valid_gNormalRoughnessMaterialID", hasNormal ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gPrevNormalRoughnessMaterialID", hasNormal ? "1" : "0");
     programChanged |= pProgram->addDefine("is_valid_gTemporalAlpha", hasAlpha ? "1" : "0");
     programChanged |= pProgram->addDefine("is_valid_gTemporalConfidence", hasConfidence ? "1" : "0");
     if (programChanged)
@@ -3143,6 +4925,11 @@ void LumenGIPass::runTemporalFilter(RenderContext* pRenderContext, const RenderD
     var["gPrevGI"] = mTemporalFilter.pHistory[1 - mTemporalFilter.historyCurrIndex];
     var["gTemporalOutput"] = mTemporalFilter.pHistory[mTemporalFilter.historyCurrIndex];
     var["gMoments"] = mTemporalFilter.pMoments;
+    if (hasNormal)
+    {
+        var["gNormalRoughnessMaterialID"] = renderData.getTexture("normWRoughnessMaterialID");
+        var["gPrevNormalRoughnessMaterialID"] = mTemporalFilter.pPrevNormal;
+    }
     if (hasAlpha)
         var["gTemporalAlpha"] = renderData.getTexture(kTemporalAlpha);
     if (hasConfidence)
@@ -3167,6 +4954,8 @@ void LumenGIPass::runTemporalFilter(RenderContext* pRenderContext, const RenderD
     if (const ref<Texture> pMomentsOutput = renderData.getTexture(kTemporalMoments))
         pRenderContext->copyResource(pMomentsOutput.get(), mTemporalFilter.pMoments.get());
     pRenderContext->blit(pLinearZ->getSRV(), mTemporalFilter.pPrevDepth->getRTV());
+    if (hasNormal)
+        pRenderContext->blit(renderData.getTexture("normWRoughnessMaterialID")->getSRV(), mTemporalFilter.pPrevNormal->getRTV());
     mTemporalFilter.historyCurrIndex ^= 1u;
 }
 
@@ -3201,7 +4990,7 @@ void LumenGIPass::ensureSpatialFilterResources(RenderContext* pRenderContext)
 {
     if (!mSpatialFilter.pFilter)
         createSpatialFilterProgram();
-    if (any(mSpatialFilter.resourceDim != mFrameDim) || !mSpatialFilter.pOutput || !mSpatialFilter.pVariance)
+    if (any(mSpatialFilter.resourceDim != mFrameDim) || !mSpatialFilter.pOutput || !mSpatialFilter.pScratch || !mSpatialFilter.pVariance)
     {
         mSpatialFilter.pOutput = mpDevice->createTexture2D(
             mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
@@ -3209,6 +4998,12 @@ void LumenGIPass::ensureSpatialFilterResources(RenderContext* pRenderContext)
         );
         mSpatialFilter.pOutput->setName("LumenGIPass::SpatialFilter::OutputInternal");
         pRenderContext->clearUAV(mSpatialFilter.pOutput->getUAV().get(), float4(0.f));
+        mSpatialFilter.pScratch = mpDevice->createTexture2D(
+            mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mSpatialFilter.pScratch->setName("LumenGIPass::SpatialFilter::ScratchInternal");
+        pRenderContext->clearUAV(mSpatialFilter.pScratch->getUAV().get(), float4(0.f));
         mSpatialFilter.pVariance = mpDevice->createTexture2D(
             mFrameDim.x, mFrameDim.y, ResourceFormat::R32Float, 1, 1, nullptr,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
@@ -3239,7 +5034,7 @@ void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderDa
         return;
 
     ensureSpatialFilterResources(pRenderContext);
-    if (!mSpatialFilter.pFilter || !mSpatialFilter.pOutput)
+    if (!mSpatialFilter.pFilter || !mSpatialFilter.pOutput || !mSpatialFilter.pScratch)
         return;
     // Always write the internal output. The graph output is an optional mirror
     // and must not become the producer merely because it is allocated.
@@ -3277,13 +5072,13 @@ void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderDa
     LumenReconstruction::SpatialFilterConstantBuffer cb = LumenReconstruction::makeSpatialFilterCB(dims);
     cb.filterEnabled = 1u;
     cb.fireflyClamp = mSpatialFireflyClamp ? 1u : 0u;
-    cb.fireflyMaxRadiance = 10000.f;   // LUMEN_GI_MAX_RADIANCE default (frozen, matches the shader).
+    cb.fireflyMaxRadiance = 10.f;     // UE Lumen-style max ray intensity guard.
     cb.fireflyStdDevFactor = 4.0f;     // Frozen with LumenSpatialFilterData.slang.
     cb.varianceThresholdLow = mSpatialVarianceThresholdLow;
     cb.varianceThresholdHigh = mSpatialVarianceThresholdHigh;
     cb.radiusMin = mSpatialRadiusMin;
     cb.radiusMax = mSpatialRadiusMax;
-    cb.spatialSigmaScale = 0.5f;       // Frozen with LumenSpatialFilterData.slang (sigma = r/2).
+    cb.spatialSigmaScale = 0.75f;      // UE-style bilateral footprint; covers the 8px probe grid over 3 passes.
     cb.depthThreshold = mSpatialDepthThreshold;
     cb.depthSigmaInv = mSpatialDepthSigmaInv;
     cb.normalExponent = mSpatialNormalExponent;
@@ -3322,7 +5117,6 @@ void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderDa
     // = the spatialFiltered graph channel (direct UAV binding, same pattern as the S4.3 interpolate
     // writing probeInterpolated). No host-owned buffers: the pass reads the previous stage and
     // writes the graph output in one dispatch, so no ping-pong or copy is needed.
-    var["gGIInput"] = pInput;
     if (hasConfidence)
         var["gConfidenceInput"] = renderData.getTexture(kTemporalConfidence);
     if (hasMoments)
@@ -3330,17 +5124,36 @@ void LumenGIPass::runSpatialFilter(RenderContext* pRenderContext, const RenderDa
     var["gLinearZ"] = pLinearZ;
     if (hasNormal)
         var["gNormalRoughnessMaterialID"] = renderData.getTexture("normWRoughnessMaterialID");
-    var["gFilteredOutput"] = pOutput;
-    var["gFilteredVariance"] = pGraphVariance ? pGraphVariance : mSpatialFilter.pVariance;
+    // Always produce the internal variance first. The graph channel is an optional mirror; binding
+    // it as the UAV and then copying the still-unwritten internal texture back would erase the
+    // diagnostic result and make export topology affect the spatial filter's observable state.
+    var["gFilteredVariance"] = mSpatialFilter.pVariance;
 
-    // Dispatch ceil(gFrameDim / 8) x ceil(gFrameDim / 8) threads (8x8 thread groups per the frozen
-    // LumenSpatialFilterData.slang contract). The pass self-guards out-of-frame threads.
-    mSpatialFilter.pFilter->execute(
-        pRenderContext,
-        ((mFrameDim.x + 7u) / 8u) * 8u,
-        ((mFrameDim.y + 7u) / 8u) * 8u,
-        1
-    );
+    // UE5.8 uses multiple small bilateral passes (three by default) after temporal accumulation.
+    // Keep the same pass shader and ping-pong two RGBA16F targets; this removes residual tile
+    // structure without introducing a new ABI or a large-radius single blur.
+    // UE's production path uses multiple small bilateral passes instead of one
+    // wide blur. Five passes are needed here because probe interpolation is
+    // currently an 8px grid and the adaptive radius is capped at four pixels.
+    constexpr uint32_t kSpatialFilterPasses = 5u;
+    ref<Texture> passInput = pInput;
+    for (uint32_t pass = 0; pass < kSpatialFilterPasses; ++pass)
+    {
+        // Alternate the two internal targets for every pass. The previous
+        // implementation special-cased pass 1, which was safe for exactly
+        // three passes but created an in-place UAV read/write alias as soon
+        // as the filter budget was raised to five passes.
+        ref<Texture> passOutput = (pass % 2u == 0u) ? pOutput : mSpatialFilter.pScratch;
+        var["gGIInput"] = passInput;
+        var["gFilteredOutput"] = passOutput;
+        mSpatialFilter.pFilter->execute(
+            pRenderContext,
+            ((mFrameDim.x + 7u) / 8u) * 8u,
+            ((mFrameDim.y + 7u) / 8u) * 8u,
+            1
+        );
+        passInput = passOutput;
+    }
     if (pGraphOutput && pGraphOutput != pOutput)
         pRenderContext->copyResource(pGraphOutput.get(), pOutput.get());
     if (pGraphVariance && pGraphVariance != mSpatialFilter.pVariance)
@@ -3393,6 +5206,9 @@ void LumenGIPass::runFinalResolve(RenderContext* pRenderContext, const RenderDat
         DefineList defines;
         defines.add("LUMEN_GI_RESOLVE_INCIDENT", "0");
         defines.add("is_valid_gDiffuseOpacity", "0");
+        defines.add("is_valid_gFallbackGI", "0");
+        defines.add("is_valid_gLinearZ", "0");
+        defines.add("is_valid_gRadianceCache", "0");
         mFinalResolve.pPass = ComputePass::create(mpDevice, kFinalResolveShaderFile, "main", defines);
     }
 
@@ -3401,6 +5217,11 @@ void LumenGIPass::runFinalResolve(RenderContext* pRenderContext, const RenderDat
     bool programChanged = false;
     programChanged |= pProgram->addDefine("LUMEN_GI_RESOLVE_INCIDENT", sourceIsIncident ? "1" : "0");
     programChanged |= pProgram->addDefine("is_valid_gDiffuseOpacity", hasDiffuseOpacity ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gFallbackGI", pDiffuseGI ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gLinearZ", renderData.getTexture("linearZ") ? "1" : "0");
+    const bool hasRadianceCache = mUseRadianceCache && mRadianceCacheGpu.producedThisFrame &&
+        mRadianceCacheGpu.pOutput && mRadianceCacheGpu.pValidityOutput;
+    programChanged |= pProgram->addDefine("is_valid_gRadianceCache", hasRadianceCache ? "1" : "0");
     if (programChanged)
         mFinalResolve.pPass->setVars(nullptr);
 
@@ -3418,8 +5239,16 @@ void LumenGIPass::runFinalResolve(RenderContext* pRenderContext, const RenderDat
     ShaderVar var = mFinalResolve.pPass->getRootVar();
     var["CB"]["gFrameDim"] = mFrameDim;
     var["gSourceGI"] = pSource;
+    var["gFallbackGI"] = pDiffuseGI;
+    if (renderData.getTexture("linearZ"))
+        var["gLinearZ"] = renderData.getTexture("linearZ");
     if (hasDiffuseOpacity)
         var["gDiffuseOpacity"] = renderData.getTexture("diffuseOpacity");
+    if (hasRadianceCache)
+    {
+        var["gRadianceCacheGI"] = mRadianceCacheGpu.pOutput;
+        var["gRadianceCacheValidity"] = mRadianceCacheGpu.pValidityOutput;
+    }
     var["gResolvedGI"] = mFinalResolve.pResolved;
     mFinalResolve.pPass->execute(
         pRenderContext,
@@ -3433,6 +5262,562 @@ void LumenGIPass::runFinalResolve(RenderContext* pRenderContext, const RenderDat
     pRenderContext->copyResource(pDiffuseGI.get(), mFinalResolve.pResolved.get());
     if (const ref<Texture> pResolvedOutput = renderData.getTexture("resolvedDiffuseGI"))
         pRenderContext->copyResource(pResolvedOutput.get(), mFinalResolve.pResolved.get());
+}
+
+// =====================================================================================
+// C10: bounded GPU Radiance Cache seed/interpolate path
+// =====================================================================================
+
+void LumenGIPass::createRadianceCachePrograms()
+{
+    if (!mRadianceCacheGpu.pBuild)
+    {
+        // The producer is scene-backed: unlike the diagnostic screen-projection
+        // seed, it needs the scene shader modules, type conformances and TLAS
+        // bindings so every cache probe can issue a real inline ray query.
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addShaderLibrary(kRadianceCacheTraceShaderFile).csEntry("buildMain");
+        desc.addTypeConformances(mpScene->getTypeConformances());
+        DefineList defines;
+        defines.add(mpScene->getSceneDefines());
+        // Keep the cache probe producer on the same sampling ABI as the HWRT
+        // secondary-hit path.  The C10 pass currently binds no emissive-light
+        // sampler, so its bounded NEE contribution is analytic lights plus
+        // material emission; a later wave may add the sampler as a matching
+        // root-layout variant.
+        defines.add(mpSampleGenerator->getDefines());
+        defines.add("USE_ANALYTIC_LIGHTS", "1");
+        defines.add("USE_EMISSIVE_LIGHTS", "1");
+        defines.add("LUMEN_GI_HAS_EMISSIVE_SAMPLER", mpEmissiveLightSampler ? "1" : "0");
+        if (mpEmissiveLightSampler)
+            defines.add(mpEmissiveLightSampler->getDefines());
+        else
+            defines.add("_EMISSIVE_LIGHT_SAMPLER_TYPE", "255");
+        mRadianceCacheGpu.pBuild = ComputePass::create(mpDevice, desc, defines, /*createVars=*/true);
+    }
+    if (!mRadianceCacheGpu.pInterpolate)
+        mRadianceCacheGpu.pInterpolate = ComputePass::create(mpDevice, kRadianceCacheShaderFile, "main");
+}
+
+void LumenGIPass::ensureRadianceCacheResources(RenderContext* pRenderContext)
+{
+    if (!mUseRadianceCache || !mRadianceCache || any(mFrameDim == uint2(0u, 0u)))
+        return;
+
+    createRadianceCachePrograms();
+    const uint32_t capacity = mRadianceCache->getMaxSlots() + 1u;
+    const uint32_t levelCounterCount = mRadianceCache->getLevelCount() * kLumenRadianceCacheLevelStride;
+    if (mRadianceCacheGpu.pProbeMeta[0] && mRadianceCacheGpu.slotCapacity == capacity &&
+        mRadianceCacheGpu.pOutput && mRadianceCacheGpu.pHitDistOutput &&
+        mRadianceCacheGpu.pQueryCounters && mRadianceCacheGpu.pQueryCountersReadback &&
+        mRadianceCacheGpu.pLevelQueryCounters && mRadianceCacheGpu.pLevelQueryCountersReadback &&
+        mRadianceCacheGpu.levelCounterCount == levelCounterCount &&
+        mRadianceCacheGpu.pValidityOutput)
+        return;
+
+    for (uint32_t i = 0; i < 2u; ++i)
+    {
+        mRadianceCacheGpu.pProbeMeta[i] = mpDevice->createStructuredBuffer(
+            sizeof(uint4), capacity, ResourceBindFlags::ShaderResource
+        );
+        mRadianceCacheGpu.pProbeMeta[i]->setName(
+            "LumenGI::RadianceCache::ProbeMeta" + std::to_string(i)
+        );
+    }
+    mRadianceCacheGpu.pProbeWorldPos = mpDevice->createStructuredBuffer(
+        sizeof(float4), capacity, ResourceBindFlags::ShaderResource
+    );
+    mRadianceCacheGpu.pProbeWorldPos->setName("LumenGI::RadianceCache::ProbeWorldPos");
+    mRadianceCacheGpu.pProbeScreenPos = mpDevice->createStructuredBuffer(
+        sizeof(float4), capacity, ResourceBindFlags::ShaderResource
+    );
+    mRadianceCacheGpu.pProbeScreenPos->setName("LumenGI::RadianceCache::ProbeScreenPos");
+    for (uint32_t i = 0; i < 2u; ++i)
+    {
+        mRadianceCacheGpu.pProbeRadiance[i] = mpDevice->createStructuredBuffer(
+            sizeof(float4), capacity, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mRadianceCacheGpu.pProbeRadiance[i]->setName(
+            "LumenGI::RadianceCache::ProbeRadiance" + std::to_string(i)
+        );
+        pRenderContext->clearUAV(mRadianceCacheGpu.pProbeRadiance[i]->getUAV().get(), float4(0.f));
+        mRadianceCacheGpu.pProbeValidity[i] = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), capacity, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        );
+        mRadianceCacheGpu.pProbeValidity[i]->setName(
+            "LumenGI::RadianceCache::ProbeValidity" + std::to_string(i)
+        );
+        pRenderContext->clearUAV(mRadianceCacheGpu.pProbeValidity[i]->getUAV().get(), uint4(0u));
+    }
+    mRadianceCacheGpu.pQueryCounters = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t), 4u, ResourceBindFlags::UnorderedAccess
+    );
+    mRadianceCacheGpu.pQueryCounters->setName("LumenGI::RadianceCache::QueryCounters");
+    mRadianceCacheGpu.pQueryCountersReadback = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t), 4u, ResourceBindFlags::None, MemoryType::ReadBack
+    );
+    mRadianceCacheGpu.pQueryCountersReadback->setName("LumenGI::RadianceCache::QueryCountersReadback");
+    pRenderContext->clearUAV(mRadianceCacheGpu.pQueryCounters->getUAV().get(), uint4(0u));
+    mRadianceCacheGpu.queryCountersSubmittedFrame = 0u;
+    mRadianceCacheGpu.queryCountersFrame = 0u;
+    mRadianceCacheGpu.queryCountersReadbackPending = false;
+    mRadianceCacheGpu.pLevelQueryCounters = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t), levelCounterCount, ResourceBindFlags::UnorderedAccess
+    );
+    mRadianceCacheGpu.pLevelQueryCounters->setName("LumenGI::RadianceCache::LevelQueryCounters");
+    mRadianceCacheGpu.pLevelQueryCountersReadback = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t), levelCounterCount, ResourceBindFlags::None, MemoryType::ReadBack
+    );
+    mRadianceCacheGpu.pLevelQueryCountersReadback->setName("LumenGI::RadianceCache::LevelQueryCountersReadback");
+    pRenderContext->clearUAV(mRadianceCacheGpu.pLevelQueryCounters->getUAV().get(), uint4(0u));
+    mRadianceCacheGpu.levelQueryCountersSubmittedFrame = 0u;
+    mRadianceCacheGpu.levelCounterCount = levelCounterCount;
+    mRadianceCacheGpu.levelQueryCountersFrame = 0u;
+    mRadianceCacheGpu.levelQueryCountersReadbackPending = false;
+
+    const uint32_t resolution = mRadianceCache->getResolution();
+    const uint32_t levels = mRadianceCache->getLevelCount();
+    mRadianceCacheGpu.pIndirection = mpDevice->createTexture3D(
+        resolution * levels, resolution, resolution, ResourceFormat::R32Uint, 1, nullptr,
+        ResourceBindFlags::ShaderResource
+    );
+    mRadianceCacheGpu.pIndirection->setName("LumenGI::RadianceCache::Indirection");
+    mRadianceCacheGpu.pOutput = mpDevice->createTexture2D(
+        mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+    );
+    mRadianceCacheGpu.pOutput->setName("LumenGI::RadianceCache::Output");
+    mRadianceCacheGpu.pHitDistOutput = mpDevice->createTexture2D(
+        mFrameDim.x, mFrameDim.y, ResourceFormat::RGBA16Float, 1, 1, nullptr,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+    );
+    mRadianceCacheGpu.pHitDistOutput->setName("LumenGI::RadianceCache::HitDistOutput");
+    mRadianceCacheGpu.pValidityOutput = mpDevice->createTexture2D(
+        mFrameDim.x, mFrameDim.y, ResourceFormat::R32Uint, 1, 1, nullptr,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+    );
+    mRadianceCacheGpu.pValidityOutput->setName("LumenGI::RadianceCache::ValidityOutput");
+    mRadianceCacheGpu.slotCapacity = capacity;
+    mRadianceCacheGpu.currIndex = 0u;
+    mRadianceCacheGpu.lastReadyFrame = 0u;
+    mRadianceCacheGpu.producedThisFrame = false;
+}
+
+void LumenGIPass::runRadianceCache(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    if (!mUseRadianceCache || !mpScene || !mRadianceCache)
+        return;
+    ensureRadianceCacheResources(pRenderContext);
+    if (!mRadianceCacheGpu.pBuild || !mRadianceCacheGpu.pInterpolate)
+        return;
+
+    // Consume the previous interpolation dispatch before submitting the next
+    // one.  Unlike the old host-side frameDim estimate, these counters are
+    // produced by the exact shader validity path and therefore reconcile
+    // attempts, valid cache hits, and misses.
+    if (mRadianceCacheGpu.queryCountersReadbackPending && mRadianceCacheGpu.pQueryCountersReadback)
+    {
+        const uint32_t* pCounters = static_cast<const uint32_t*>(mRadianceCacheGpu.pQueryCountersReadback->map());
+        if (pCounters)
+        {
+            mRadianceCacheGpu.queryAttempts += pCounters[0];
+            mRadianceCacheGpu.queryHits += pCounters[1];
+            mRadianceCacheGpu.queryMisses += pCounters[2];
+            // Radiance Cache has its own CPU clipmap clock. Surface Cache may be
+            // disabled in this graph, and its scheduler clock is therefore not
+            // a valid provenance source for query readback frames.
+            // Use the frame captured when this exact dispatch was submitted. The
+            // CPU clipmap advances before the next run, so deriving provenance from
+            // the current cache frame is ambiguous after reset/scene transitions.
+            mRadianceCacheGpu.queryCountersFrame = mRadianceCacheGpu.queryCountersSubmittedFrame;
+            mRadianceCacheGpu.pQueryCountersReadback->unmap();
+        }
+        mRadianceCacheGpu.queryCountersReadbackPending = false;
+    }
+    if (mRadianceCacheGpu.levelQueryCountersReadbackPending && mRadianceCacheGpu.pLevelQueryCountersReadback)
+    {
+        const uint32_t* pCounters = static_cast<const uint32_t*>(mRadianceCacheGpu.pLevelQueryCountersReadback->map());
+        if (pCounters)
+        {
+            const uint32_t levelCount = std::min<uint32_t>(mRadianceCache->getLevelCount(), 8u);
+            for (uint32_t level = 0u; level < levelCount; ++level)
+            {
+                const uint32_t base = level * kLumenRadianceCacheLevelStride;
+                mRadianceCacheGpu.levelQueryAttempts[level] += pCounters[base + 0u];
+                mRadianceCacheGpu.levelQueryHits[level] += pCounters[base + 1u];
+                mRadianceCacheGpu.levelQueryMisses[level] += pCounters[base + 2u];
+                mRadianceCacheGpu.levelSampleCount[level] += pCounters[base + 3u];
+                mRadianceCacheGpu.levelValidHitDistanceCount[level] += pCounters[base + 4u];
+                mRadianceCacheGpu.levelFallbackSampleCount[level] += pCounters[base + 5u];
+            }
+            mRadianceCacheGpu.levelQueryCountersFrame = mRadianceCacheGpu.levelQueryCountersSubmittedFrame;
+            mRadianceCacheGpu.pLevelQueryCountersReadback->unmap();
+        }
+        mRadianceCacheGpu.levelQueryCountersReadbackPending = false;
+    }
+
+    const uint32_t capacity = mRadianceCacheGpu.slotCapacity;
+    std::vector<uint4> meta(capacity, uint4(0u));
+    std::vector<float4> worldPos(capacity, float4(0.f));
+    std::vector<float4> screenPos(capacity, float4(-1.f));
+    const uint32_t cacheResolution = mRadianceCache->getResolution();
+    const uint32_t cacheLevels = mRadianceCache->getLevelCount();
+    const uint32_t cacheWidth = cacheResolution * cacheLevels;
+    std::vector<uint32_t> indirection(
+        size_t(cacheWidth) * size_t(cacheResolution) * size_t(cacheResolution), 0u
+    );
+    uint64_t activeProbeCount = 0u;
+    const ref<Camera>& pCamera = mpScene->getCamera();
+    const float3 cameraPos = pCamera->getPosition();
+    const float3 cameraForward = normalize(cameraPos - pCamera->getTarget());
+    const float3 cameraRight = normalize(cross(pCamera->getUpVector(), cameraForward));
+    const float3 cameraUp = cross(cameraForward, cameraRight);
+    const float focalLengthPx = pCamera->getFocalLength() * (float)mFrameDim.y / pCamera->getFrameHeight();
+    const float2 principalPoint = float2(0.5f * (float)mFrameDim.x, 0.5f * (float)mFrameDim.y);
+    const uint32_t readyFrame = mFrameIndex > 0u ? mFrameIndex : 1u;
+    mRadianceCacheGpu.projectedProbeCount = 0;
+    mRadianceCacheGpu.inBoundsProbeCount = 0;
+    for (uint32_t slotID = 1u; slotID < capacity; ++slotID)
+    {
+        const auto& slot = mRadianceCache->getSlot(slotID);
+        if (!slot.allocated)
+            continue;
+        ++activeProbeCount;
+        const auto p = mRadianceCache->probeWorldPosition(slot.level, slot.cell);
+        worldPos[slotID] = float4(p.x, p.y, p.z, 1.f);
+        const float3 rel = float3(p.x, p.y, p.z) - cameraPos;
+        const float3 viewPos = float3(
+            dot(rel, cameraRight), -dot(rel, cameraUp), -dot(rel, cameraForward)
+        );
+        if (viewPos.z > 1e-4f)
+        {
+            ++mRadianceCacheGpu.projectedProbeCount;
+            if (slot.level < 8u)
+                ++mRadianceCacheGpu.levelProjectedProbeCount[slot.level];
+            screenPos[slotID] = float4(
+                viewPos.x / viewPos.z * focalLengthPx + principalPoint.x,
+                viewPos.y / viewPos.z * focalLengthPx + principalPoint.y,
+                viewPos.z, 1.f
+            );
+            if (screenPos[slotID].x >= 0.f && screenPos[slotID].x < float(mFrameDim.x) &&
+                screenPos[slotID].y >= 0.f && screenPos[slotID].y < float(mFrameDim.y))
+            {
+                ++mRadianceCacheGpu.inBoundsProbeCount;
+                if (slot.level < 8u)
+                    ++mRadianceCacheGpu.levelInBoundsProbeCount[slot.level];
+            }
+        }
+        // Existing slots become visible one frame after their first GPU build. The
+        // payload itself is ping-ponged; this metadata fence prevents a same-frame
+        // read when a slot is first allocated.
+        // The GPU metadata uses one epoch domain.  CPU slot generations are
+        // allocator-local and are reset with the clipmap; mixing them with the
+        // pass-wide epoch would reject every fresh slot after a scene reset.
+        // Payload written into `writeIndex` becomes visible on the following
+        // frame, independently of CPU lastUpdateFrame (the GPU producer owns
+        // that timestamp in this Wave).
+        const uint32_t visible = mFrameIndex == 0u ? 1u : mFrameIndex;
+        meta[slotID] = uint4(slotID, mRadianceCacheGpu.generation, visible, 1u);
+        if (slot.level < cacheLevels && slot.cell.x >= 0 && slot.cell.y >= 0 && slot.cell.z >= 0 &&
+            slot.cell.x < int32_t(cacheResolution) && slot.cell.y < int32_t(cacheResolution) &&
+            slot.cell.z < int32_t(cacheResolution))
+        {
+            const uint32_t x = slot.level * cacheResolution + uint32_t(slot.cell.x);
+            const size_t index = size_t(x) + size_t(cacheWidth) *
+                (size_t(uint32_t(slot.cell.y)) + size_t(cacheResolution) * size_t(uint32_t(slot.cell.z)));
+            indirection[index] = slotID;
+        }
+    }
+    const uint32_t writeIndex = mRadianceCacheGpu.currIndex;
+    mRadianceCacheGpu.pProbeMeta[writeIndex]->setBlob(meta.data(), 0, meta.size() * sizeof(uint4));
+    mRadianceCacheGpu.pProbeWorldPos->setBlob(worldPos.data(), 0, worldPos.size() * sizeof(float4));
+    mRadianceCacheGpu.pProbeScreenPos->setBlob(screenPos.data(), 0, screenPos.size() * sizeof(float4));
+
+    // Upload the CPU clipmap ownership map as an SRV snapshot for this frame.
+    // This is intentionally a bounded Wave-1 bridge: later C10 work will replace
+    // the recreate-with-data path with a persistent GPU indirection update pass.
+    mRadianceCacheGpu.pIndirection = mpDevice->createTexture3D(
+        cacheWidth, cacheResolution, cacheResolution, ResourceFormat::R32Uint, 1,
+        indirection.data(), ResourceBindFlags::ShaderResource
+    );
+    mRadianceCacheGpu.pIndirection->setName("LumenGI::RadianceCache::IndirectionFrame");
+
+    const ref<Texture> pSource = renderData.getTexture("diffuseRadianceHitDist");
+    const ref<Texture> pViewW = renderData.getTexture("viewW");
+    const ref<Texture> pLinearZ = renderData.getTexture("linearZ");
+    if (!pSource || !pViewW || !pLinearZ)
+        return;
+
+    const auto cacheCenter = mRadianceCache->getCameraCenter();
+    const float4 cacheCenterExtent = float4(cacheCenter.x, cacheCenter.y, cacheCenter.z, mRadianceCache->getBaseExtent());
+    const float4 cameraPos4 = float4(cameraPos, 1.f);
+    const float4 cameraRight4 = float4(cameraRight, 0.f);
+    const float4 cameraUp4 = float4(cameraUp, 0.f);
+    const float4 cameraForward4 = float4(cameraForward, 0.f);
+    const float4 cameraFocalPrincipal = float4(focalLengthPx, principalPoint.x, principalPoint.y, 0.f);
+
+    auto bindCommon = [&](const ref<ComputePass>& pass, const ref<Buffer>& radiance, bool writePayload)
+    {
+        auto var = pass->getRootVar();
+        var["LumenRadianceCacheCB"]["gFrameDim"] = mFrameDim;
+        var["LumenRadianceCacheCB"]["gSourceDim"] = uint2(pSource->getWidth(), pSource->getHeight());
+        var["LumenRadianceCacheCB"]["gCurrentFrame"] = mFrameIndex;
+        var["LumenRadianceCacheCB"]["gGeneration"] = mRadianceCacheGpu.generation;
+        var["LumenRadianceCacheCB"]["gViewProj"] = pCamera->getViewProjMatrixNoJitter();
+        var["LumenRadianceCacheCB"]["gCacheCameraCenterBaseExtent"] = cacheCenterExtent;
+        var["LumenRadianceCacheCB"]["gCameraPosW"] = cameraPos4;
+        var["LumenRadianceCacheCB"]["gCameraRightW"] = cameraRight4;
+        var["LumenRadianceCacheCB"]["gCameraUpW"] = cameraUp4;
+        var["LumenRadianceCacheCB"]["gCameraForwardW"] = cameraForward4;
+        var["LumenRadianceCacheCB"]["gCameraFocalPrincipal"] = cameraFocalPrincipal;
+        var["gViewW"] = pViewW;
+        var["gLinearZ"] = pLinearZ;
+        var["gDiffuseRadianceHitDist"] = pSource;
+        var["gProbeMeta"] = mRadianceCacheGpu.pProbeMeta[writeIndex];
+        var["gProbeWorldPos"] = mRadianceCacheGpu.pProbeWorldPos;
+        var["gProbeScreenPos"] = mRadianceCacheGpu.pProbeScreenPos;
+        var["gIndirection"] = mRadianceCacheGpu.pIndirection;
+        if (writePayload)
+        {
+            mpScene->bindShaderData(var["gScene"]);
+            mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"], 0u);
+            if (mpEmissiveLightSampler)
+                mpEmissiveLightSampler->bindShaderData(var["emissiveSampler"]);
+        }
+        if (writePayload)
+            var["gProbeRadianceHitDistOut"] = radiance;
+        else
+            var["gProbeRadianceHitDist"] = radiance;
+        if (writePayload)
+            var["gProbeValidityOut"] = mRadianceCacheGpu.pProbeValidity[writeIndex];
+        else
+            var["gProbeValidity"] = mRadianceCacheGpu.pProbeValidity[1u - mRadianceCacheGpu.currIndex];
+        return var;
+    };
+
+    // Build the current payload with the bounded scene-ray producer. The probe
+    // payload has an explicit hit/sky validity sidecar; it is still diagnostic
+    // until persistent GPU allocation/commit and final-resolve integration land.
+    bindCommon(mRadianceCacheGpu.pBuild, mRadianceCacheGpu.pProbeRadiance[mRadianceCacheGpu.currIndex], true);
+    mRadianceCacheGpu.pBuild->execute(pRenderContext, capacity, 1u, 1u);
+    mRadianceCacheGpu.requestCount += activeProbeCount;
+    mRadianceCacheGpu.rayCount += activeProbeCount * mRadianceCacheGpu.probeDirectionCount;
+    mRadianceCacheGpu.traceCount += activeProbeCount;
+    mRadianceCacheGpu.probeRayCount += activeProbeCount * mRadianceCacheGpu.probeDirectionCount;
+    mRadianceCacheGpu.commitCount += activeProbeCount;
+
+    const ref<Texture> pOutput = renderData.getTexture("radianceCache");
+    const ref<Texture> pHitDist = renderData.getTexture("radianceCacheHitDist");
+    const ref<Texture> pValidity = renderData.getTexture("radianceCacheValidity");
+    const ref<Texture> pCacheOutput = mRadianceCacheGpu.pOutput;
+    const ref<Texture> pCacheHitDist = mRadianceCacheGpu.pHitDistOutput;
+    const ref<Texture> pCacheValidity = mRadianceCacheGpu.pValidityOutput;
+    if (pCacheOutput && pCacheHitDist && pCacheValidity)
+    {
+        pRenderContext->clearUAV(mRadianceCacheGpu.pQueryCounters->getUAV().get(), uint4(0u));
+        pRenderContext->clearUAV(mRadianceCacheGpu.pLevelQueryCounters->getUAV().get(), uint4(0u));
+        const uint32_t readIndex = 1u - mRadianceCacheGpu.currIndex;
+        auto var = mRadianceCacheGpu.pInterpolate->getRootVar();
+        var["LumenRadianceCacheCB"]["gFrameDim"] = mFrameDim;
+        var["LumenRadianceCacheCB"]["gSourceDim"] = uint2(pSource->getWidth(), pSource->getHeight());
+        var["LumenRadianceCacheCB"]["gCurrentFrame"] = mFrameIndex;
+        var["LumenRadianceCacheCB"]["gGeneration"] = mRadianceCacheGpu.generation;
+        var["LumenRadianceCacheCB"]["gViewProj"] = pCamera->getViewProjMatrixNoJitter();
+        var["LumenRadianceCacheCB"]["gCacheCameraCenterBaseExtent"] = cacheCenterExtent;
+        var["LumenRadianceCacheCB"]["gCameraPosW"] = cameraPos4;
+        var["LumenRadianceCacheCB"]["gCameraRightW"] = cameraRight4;
+        var["LumenRadianceCacheCB"]["gCameraUpW"] = cameraUp4;
+        var["LumenRadianceCacheCB"]["gCameraForwardW"] = cameraForward4;
+        var["LumenRadianceCacheCB"]["gCameraFocalPrincipal"] = cameraFocalPrincipal;
+        var["gViewW"] = pViewW;
+        var["gLinearZ"] = pLinearZ;
+        var["gDiffuseRadianceHitDist"] = pSource;
+        var["gProbeMeta"] = mRadianceCacheGpu.pProbeMeta[readIndex];
+        var["gProbeWorldPos"] = mRadianceCacheGpu.pProbeWorldPos;
+        var["gProbeScreenPos"] = mRadianceCacheGpu.pProbeScreenPos;
+        var["gProbeRadianceHitDist"] = mRadianceCacheGpu.pProbeRadiance[readIndex];
+        var["gProbeRadianceHitDistPrev"] = mRadianceCacheGpu.pProbeRadiance[mRadianceCacheGpu.currIndex];
+        var["gProbeValidity"] = mRadianceCacheGpu.pProbeValidity[readIndex];
+        var["gIndirection"] = mRadianceCacheGpu.pIndirection;
+        var["gRadianceCacheOutput"] = pCacheOutput;
+        var["gRadianceCacheHitDist"] = pCacheHitDist;
+        var["gRadianceCacheValidityOutput"] = pCacheValidity;
+        var["gRadianceCacheQueryCounters"] = mRadianceCacheGpu.pQueryCounters;
+        var["gRadianceCacheLevelCounters"] = mRadianceCacheGpu.pLevelQueryCounters;
+        mRadianceCacheGpu.pInterpolate->execute(
+            pRenderContext, ((mFrameDim.x + 7u) / 8u) * 8u, ((mFrameDim.y + 7u) / 8u) * 8u, 1u
+        );
+        if (pOutput)
+            pRenderContext->copyResource(pOutput.get(), pCacheOutput.get());
+        if (pHitDist)
+            pRenderContext->copyResource(pHitDist.get(), pCacheHitDist.get());
+        if (pValidity)
+            pRenderContext->copyResource(pValidity.get(), pCacheValidity.get());
+        pRenderContext->copyResource(
+            mRadianceCacheGpu.pQueryCountersReadback.get(), mRadianceCacheGpu.pQueryCounters.get()
+        );
+        pRenderContext->copyResource(
+            mRadianceCacheGpu.pLevelQueryCountersReadback.get(), mRadianceCacheGpu.pLevelQueryCounters.get()
+        );
+        const uint32_t submittedCacheFrame = static_cast<uint32_t>(mRadianceCache->getStats().frameIndex);
+        mRadianceCacheGpu.queryCountersSubmittedFrame = submittedCacheFrame;
+        mRadianceCacheGpu.levelQueryCountersSubmittedFrame = submittedCacheFrame;
+        mRadianceCacheGpu.queryCountersReadbackPending = true;
+        mRadianceCacheGpu.levelQueryCountersReadbackPending = true;
+        mRadianceCacheGpu.producedThisFrame = true;
+        mRadianceCacheGpu.readyCount += activeProbeCount;
+        // The payload written by this dispatch is visible to interpolation only
+        // on the next frame. Keep the fence in the same frame domain as meta.z.
+        mRadianceCacheGpu.lastReadyFrame = mFrameIndex + 1u;
+    }
+    else
+    {
+        mRadianceCacheGpu.producedThisFrame = false;
+        mRadianceCacheGpu.fallbackCount += static_cast<uint64_t>(mFrameDim.x) * mFrameDim.y;
+    }
+    mRadianceCacheGpu.currIndex = 1u - mRadianceCacheGpu.currIndex;
+}
+
+void LumenGIPass::runRoughSpecularDiagnostic(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    const ref<Texture> pOutput = renderData.getTexture("roughSpecularIndirect");
+    const ref<Texture> pValidity = renderData.getTexture("roughSpecularValidity");
+    if ((!pOutput && !pValidity) || any(mFrameDim == uint2(0u, 0u)))
+        return;
+
+    if (!mRoughSpecularDiagnostic.pPass || any(mRoughSpecularDiagnostic.resourceDim != mFrameDim))
+    {
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addShaderLibrary(
+            "RenderPasses/LumenGI/RoughSpecular/LumenRoughSpecularTrace.cs.slang"
+        ).csEntry("main");
+        desc.addTypeConformances(mpScene->getTypeConformances());
+        DefineList defines;
+        defines.add(mpScene->getSceneDefines());
+        if (mpSampleGenerator)
+            defines.add(mpSampleGenerator->getDefines());
+        defines.add("USE_ANALYTIC_LIGHTS", "1");
+        defines.add("LUMEN_GI_ROUGH_SPECULAR_ENABLED", "1");
+        defines.add("is_valid_gLinearZ", "0");
+        defines.add("is_valid_gViewW", "0");
+        defines.add("is_valid_gNormalRoughnessMaterialID", "0");
+        defines.add("is_valid_gRoughSpecularIndirect", "0");
+        defines.add("is_valid_gRoughSpecularValidity", "0");
+        mRoughSpecularDiagnostic.pPass = ComputePass::create(
+            mpDevice,
+            desc,
+            defines,
+            /*createVars=*/true
+        );
+        mRoughSpecularDiagnostic.resourceDim = mFrameDim;
+    }
+
+    ref<Program> pProgram = mRoughSpecularDiagnostic.pPass->getProgram();
+    bool programChanged = false;
+    programChanged |= pProgram->addDefine("LUMEN_GI_ROUGH_SPECULAR_ENABLED", "1");
+    programChanged |= pProgram->addDefine("is_valid_gLinearZ", renderData.getTexture("linearZ") ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gViewW", renderData.getTexture("viewW") ? "1" : "0");
+    programChanged |= pProgram->addDefine(
+        "is_valid_gNormalRoughnessMaterialID",
+        renderData.getTexture("normWRoughnessMaterialID") ? "1" : "0"
+    );
+    programChanged |= pProgram->addDefine("is_valid_gRoughSpecularIndirect", pOutput ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gRoughSpecularValidity", pValidity ? "1" : "0");
+    if (programChanged)
+        mRoughSpecularDiagnostic.pPass->setVars(nullptr);
+
+    ShaderVar var = mRoughSpecularDiagnostic.pPass->getRootVar();
+    var["LumenRoughSpecularTraceCB"]["gFrameDim"] = mFrameDim;
+    var["LumenRoughSpecularTraceCB"]["gFrameIndex"] = mFrameIndex;
+    var["LumenRoughSpecularTraceCB"]["gMaxRoughness"] = 0.8f;
+    var["LumenRoughSpecularTraceCB"]["gMaxRadiance"] = 10.f;
+    var["LumenRoughSpecularTraceCB"]["gSampleCount"] = 4u;
+    if (mpScene)
+    {
+        const ref<Camera>& pCamera = mpScene->getCamera();
+        const float3 cameraPos = pCamera->getPosition();
+        const float3 cameraBackward = normalize(cameraPos - pCamera->getTarget());
+        const float3 cameraRight = normalize(cross(pCamera->getUpVector(), cameraBackward));
+        const float3 cameraUp = cross(cameraBackward, cameraRight);
+        var["LumenRoughSpecularTraceCB"]["gCameraPosW"] = cameraPos;
+        var["LumenRoughSpecularTraceCB"]["gCameraRightW"] = cameraRight;
+        var["LumenRoughSpecularTraceCB"]["gCameraUpW"] = cameraUp;
+        var["LumenRoughSpecularTraceCB"]["gCameraForwardW"] = cameraBackward;
+        var["LumenRoughSpecularTraceCB"]["gFocalLengthPx"] =
+            pCamera->getFocalLength() * (float)mFrameDim.y / pCamera->getFrameHeight();
+        var["LumenRoughSpecularTraceCB"]["gPrincipalX"] = 0.5f * (float)mFrameDim.x;
+        var["LumenRoughSpecularTraceCB"]["gPrincipalY"] = 0.5f * (float)mFrameDim.y;
+        mpScene->bindShaderData(var["gScene"]);
+        mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"], 0u);
+    }
+    if (renderData.getTexture("linearZ"))
+        var["gLinearZ"] = renderData.getTexture("linearZ");
+    if (renderData.getTexture("viewW"))
+        var["gViewW"] = renderData.getTexture("viewW");
+    if (renderData.getTexture("normWRoughnessMaterialID"))
+        var["gNormalRoughnessMaterialID"] = renderData.getTexture("normWRoughnessMaterialID");
+    if (pOutput)
+        var["gRoughSpecularIndirect"] = pOutput;
+    if (pValidity)
+        var["gRoughSpecularValidity"] = pValidity;
+    mRoughSpecularDiagnostic.pPass->execute(
+        pRenderContext,
+        ((mFrameDim.x + 7u) / 8u) * 8u,
+        ((mFrameDim.y + 7u) / 8u) * 8u,
+        1u
+    );
+    mRoughSpecularDiagnostic.producedThisFrame = true;
+}
+
+void LumenGIPass::runTransmissionDiagnostic(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    const ref<Texture> pOutput = renderData.getTexture("transmissionIndirect");
+    const ref<Texture> pValidity = renderData.getTexture("transmissionValidity");
+    if ((!pOutput && !pValidity) || any(mFrameDim == uint2(0u, 0u)))
+        return;
+
+    if (!mTransmissionDiagnostic.pPass || any(mTransmissionDiagnostic.resourceDim != mFrameDim))
+    {
+        DefineList defines;
+        defines.add("LUMEN_GI_TRANSMISSION_ENABLED", "0");
+        defines.add("LUMEN_GI_TRANSMISSION_REFERENCE_ONLY", "1");
+        defines.add("is_valid_gTransmissionIndirect", "0");
+        defines.add("is_valid_gTransmissionValidityOutput", "0");
+        mTransmissionDiagnostic.pPass = ComputePass::create(
+            mpDevice,
+            "RenderPasses/LumenGI/Transmission/LumenTransmissionDiagnostic.cs.slang",
+            "main",
+            defines
+        );
+        mTransmissionDiagnostic.resourceDim = mFrameDim;
+    }
+
+    ref<Program> pProgram = mTransmissionDiagnostic.pPass->getProgram();
+    bool programChanged = false;
+    programChanged |= pProgram->addDefine("LUMEN_GI_TRANSMISSION_ENABLED", "0");
+    programChanged |= pProgram->addDefine("LUMEN_GI_TRANSMISSION_REFERENCE_ONLY", "1");
+    programChanged |= pProgram->addDefine("is_valid_gTransmissionIndirect", pOutput ? "1" : "0");
+    programChanged |= pProgram->addDefine("is_valid_gTransmissionValidityOutput", pValidity ? "1" : "0");
+    if (programChanged)
+        mTransmissionDiagnostic.pPass->setVars(nullptr);
+
+    ShaderVar var = mTransmissionDiagnostic.pPass->getRootVar();
+    var["LumenTransmissionCB"]["gFrameDim"] = mFrameDim;
+    var["LumenTransmissionCB"]["gFrameIndex"] = mFrameIndex;
+    var["LumenTransmissionCB"]["gMaxTransmissionRadiance"] = 10.f;
+    if (pOutput)
+        var["gTransmissionIndirect"] = pOutput;
+    if (pValidity)
+        var["gTransmissionValidityOutput"] = pValidity;
+    mTransmissionDiagnostic.pPass->execute(
+        pRenderContext,
+        ((mFrameDim.x + 7u) / 8u) * 8u,
+        ((mFrameDim.y + 7u) / 8u) * 8u,
+        1u
+    );
+    mTransmissionDiagnostic.producedThisFrame = true;
 }
 
 // =====================================================================================
@@ -3702,10 +6087,9 @@ void LumenGIPass::ensureGDFResources(RenderContext* pRenderContext)
             sizeof(uint32_t), kGDFTraceStatCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
         );
         mSDF.pTraceStatsReadback = mpDevice->createStructuredBuffer(
-            sizeof(uint32_t), kGDFTraceStatCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+            sizeof(uint32_t), kGDFTraceStatCount, ResourceBindFlags::None, MemoryType::ReadBack
         );
         pRenderContext->clearUAV(mSDF.pTraceStats->getUAV().get(), uint4(0));
-        pRenderContext->clearUAV(mSDF.pTraceStatsReadback->getUAV().get(), uint4(0));
     }
 
     // Mesh SDF atlas GPU mirror.  The CPU cache keeps the source quality metadata as
@@ -3755,6 +6139,18 @@ void LumenGIPass::ensureGDFResources(RenderContext* pRenderContext)
     // runGDFSphereTrace because its is_valid defines depend on the graph channel allocation.
     if (!mSDF.pCompose)
         mSDF.pCompose = ComputePass::create(mpDevice, kGDFComposeShaderFile, "main", DefineList());
+    if (mGDFDiagnosticStage == 1 && !mSDF.pComposeDiag)
+        mSDF.pComposeDiag = ComputePass::create(mpDevice, kGDFComposeDiagShaderFile, "main", DefineList());
+    if (mGDFDiagnosticStage == 2 && !mSDF.pComposeDiagAll)
+        mSDF.pComposeDiagAll = ComputePass::create(mpDevice, kGDFComposeDiagAllShaderFile, "main", DefineList());
+    if (mGDFDiagnosticStage == 3 && !mSDF.pComposeDiagBuffers)
+        mSDF.pComposeDiagBuffers = ComputePass::create(mpDevice, kGDFComposeDiagBuffersShaderFile, "main", DefineList());
+    if (mGDFDiagnosticStage == 4 && !mSDF.pComposeDiagAtlas)
+        mSDF.pComposeDiagAtlas = ComputePass::create(mpDevice, kGDFComposeDiagAtlasShaderFile, "main", DefineList());
+    if (mGDFDiagnosticStage == 5 && !mSDF.pComposeDiagBuffersScalar)
+        mSDF.pComposeDiagBuffersScalar = ComputePass::create(mpDevice, kGDFComposeDiagBuffersScalarShaderFile, "main", DefineList());
+    if (mGDFDiagnosticStage == 6 && !mSDF.pComposeDiagCBScalar)
+        mSDF.pComposeDiagCBScalar = ComputePass::create(mpDevice, kGDFComposeDiagCBScalarShaderFile, "main", DefineList());
 
     uploadMeshSDFAtlas(pRenderContext);
 }
@@ -3898,6 +6294,90 @@ void LumenGIPass::runGDFCompose(RenderContext* pRenderContext)
     if (regions.empty())
         return; // no dirty voxels this frame (static camera, no instance changes).
 
+    if (mSDF.levels.empty())
+    {
+        logWarning("C4 GDF diagnostic/compose skipped because no level UAVs are allocated.");
+        return;
+    }
+
+    // C4 bounded descriptor bisect. This opt-in path intentionally executes only one
+    // logical thread against the first dirty level so E1/E2 can distinguish a minimal
+    // UAV contract from the full production descriptor set without changing production
+    // dispatch dimensions or the Hybrid fallback behavior.
+    if (mGDFDiagnosticStage != 0u)
+    {
+        ref<ComputePass> pDiag;
+        switch (mGDFDiagnosticStage)
+        {
+        case 1u: pDiag = mSDF.pComposeDiag; break;
+        case 2u: pDiag = mSDF.pComposeDiagAll; break;
+        case 3u: pDiag = mSDF.pComposeDiagBuffers; break;
+        case 4u: pDiag = mSDF.pComposeDiagAtlas; break;
+        case 5u: pDiag = mSDF.pComposeDiagBuffersScalar; break;
+        case 6u: pDiag = mSDF.pComposeDiagCBScalar; break;
+        default: break;
+        }
+        if (!pDiag)
+        {
+            logWarning("C4 GDF diagnostic stage {} requested but its ComputePass is unavailable.", mGDFDiagnosticStage);
+            return;
+        }
+
+        // E2 reads gGDFDirtyRegions[0]. Upload the same bounded region used by
+        // the diagnostic dispatch before binding the descriptor set; production
+        // batches perform this upload inside the per-level loop below.
+        pRenderContext->updateBuffer(
+            mSDF.pDirtyRegions.get(), &regions.front(), sizeof(LumenGDFDirtyRegionHost)
+        );
+        const uint32_t level = std::min<uint32_t>(regions.front().level, static_cast<uint32_t>(mSDF.levels.size() - 1u));
+        ShaderVar var = pDiag->getRootVar();
+        const bool bindClipmap = mGDFDiagnosticStage == 2u || mGDFDiagnosticStage == 3u ||
+            mGDFDiagnosticStage == 5u || mGDFDiagnosticStage == 6u;
+        const bool bindBuffers = mGDFDiagnosticStage == 2u || mGDFDiagnosticStage == 3u || mGDFDiagnosticStage == 5u;
+        const bool bindAtlas = mGDFDiagnosticStage == 2u || mGDFDiagnosticStage == 4u;
+        if (bindClipmap)
+        {
+            ShaderVar cb = var["LumenGDFComposeCB"];
+            ShaderVar clip = cb["gClipmap"];
+            clip["cameraCenter"] = float3(mSDF.gdf->getCameraCenter().x, mSDF.gdf->getCameraCenter().y, mSDF.gdf->getCameraCenter().z);
+            clip["emptyDistance"] = 0.f;
+            clip["levelCount"] = levelCount;
+            clip["dynamicLevelCount"] = s6gdf::kDynamicLevels;
+            clip["resolution"] = R;
+            clip["instanceCount"] = static_cast<uint32_t>(gdfInstances.size());
+            clip["dirtyRegionCount"] = 1u;
+            clip["frameIndex"] = mFrameIndex;
+            const s6gdf::index3 scroll = mSDF.gdf->scrollFromCameraMove();
+            clip["scroll"] = int3(scroll.x, scroll.y, scroll.z);
+        }
+        if (bindBuffers)
+        {
+            var["gGDFLevelTable"] = mSDF.pLevelTable;
+            var["gGDFInstances"] = mSDF.pGDFInstances;
+            var["gGDFDirtyRegions"] = mSDF.pDirtyRegions;
+        }
+        if (bindAtlas)
+        {
+            var["gFineAtlas"] = mSDF.pFineAtlas;
+            var["gCoarseAtlas"] = mSDF.pCoarseAtlas;
+            var["gPageTable"] = mSDF.pPageTable;
+            var["gVolumes"] = mSDF.pVolumes;
+            var["gInstances"] = mSDF.pAtlasInstances;
+            var["gAtlasInstanceCount"] = mSDF.pScene->instanceTable().instanceCount();
+            var["gAtlasVolumeCount"] = mSDF.pScene->instanceTable().meshCount();
+            var["gAtlasPagesPerSide"] = mSDF.atlasPagesPerSide;
+        }
+        if (mGDFDiagnosticStage == 5u || mGDFDiagnosticStage == 6u)
+            var["gAtlasPagesPerSide"] = mSDF.atlasPagesPerSide;
+        var["gGDFLevel"].setUav(mSDF.levels[level]->getUAV(0));
+        logInfo(
+            "C4 GDF diagnostic dispatch: stage={} level={} logicalThreads=(1,1,1) allDescriptors={}",
+            mGDFDiagnosticStage, level, mGDFDiagnosticStage == 2u
+        );
+        pDiag->execute(pRenderContext, 1u, 1u, 1u);
+        return;
+    }
+
     // Bind the compose pass.
     logInfo(
         "S6 compose bind: P={} texels={} levelCount={} R={} inst={} vol={} fine={} coarse={} pt={} volBuf={} instBuf={} levels={}",
@@ -3930,9 +6410,9 @@ void LumenGIPass::runGDFCompose(RenderContext* pRenderContext)
     var["gPageTable"] = mSDF.pPageTable;
     var["gVolumes"] = mSDF.pVolumes;
     var["gInstances"] = mSDF.pAtlasInstances;
-    var["gAtlasInstanceCount"] = mSDF.pScene->instanceTable().instanceCount();
-    var["gAtlasVolumeCount"] = mSDF.pScene->instanceTable().meshCount();
-    var["gAtlasPagesPerSide"] = mSDF.atlasPagesPerSide;
+    cb["gAtlasInstanceCount"] = mSDF.pScene->instanceTable().instanceCount();
+    cb["gAtlasVolumeCount"] = mSDF.pScene->instanceTable().meshCount();
+    cb["gAtlasPagesPerSide"] = mSDF.atlasPagesPerSide;
 
     // A single RWTexture3D UAV is bound per dispatch. This avoids D3D12 rejecting
     // a partially populated/mixed-format UAV descriptor array; regions are batched
@@ -4157,7 +6637,145 @@ std::map<std::string, double> LumenGIPass::getScreenProbeStats() const
     stats["inactiveProbes"] = (double)mScreenProbeStats.inactiveProbes;
     stats["budgetSkipped"] = (double)mScreenProbeStats.budgetSkipped;
     stats["directionsTraced"] = (double)mScreenProbeStats.directionsTraced;
+    stats["gdfHits"] = (double)mScreenProbeStats.gdfHits;
+    stats["gdfMisses"] = (double)mScreenProbeStats.gdfMisses;
+    stats["cacheLookupHits"] = (double)mScreenProbeStats.cacheLookupHits;
+    stats["cacheLookupAttempts"] = (double)mScreenProbeStats.cacheLookupAttempts;
+    stats["cacheLookupHitsThisFrame"] = (double)mScreenProbeStats.cacheLookupHits;
+    stats["cacheLookupAttemptsThisFrame"] = (double)mScreenProbeStats.cacheLookupAttempts;
+    stats["cacheLookupStatsFrame"] = (double)mScreenProbeStatsFrame;
+    stats["cachePageRejects"] = (double)mScreenProbeStats.cachePageRejects;
+    stats["cacheCoverageRejects"] = (double)mScreenProbeStats.cacheCoverageRejects;
+    stats["cacheMetadataRejects"] = (double)mScreenProbeStats.cacheMetadataRejects;
+    stats["cacheVisibilityRejects"] = (double)mScreenProbeStats.cacheVisibilityRejects;
+    stats["cacheDepthRejects"] = (double)mScreenProbeStats.cacheDepthRejects;
+    stats["cacheAxisRejects"] = (double)mScreenProbeStats.cacheAxisRejects;
+    stats["cacheFacingRejects"] = (double)mScreenProbeStats.cacheFacingRejects;
+    stats["cacheOwnerValid"] = (double)mScreenProbeStats.cacheOwnerValid;
+    stats["historyAccepted"] = (double)mScreenProbeStats.historyAccepted;
+    stats["historyRejectDepth"] = (double)mScreenProbeStats.historyRejectDepth;
+    stats["historyRejectGuide"] = (double)mScreenProbeStats.historyRejectGuide;
+    stats["historyRejectMotion"] = (double)mScreenProbeStats.historyRejectMotion;
+    stats["historyRejectLighting"] = (double)mScreenProbeStats.historyRejectLighting;
+    stats["historyRejectCurrentInvalid"] = (double)mScreenProbeStats.historyRejectCurrentInvalid;
+    stats["historyRejectPreviousInvalid"] = (double)mScreenProbeStats.historyRejectPreviousInvalid;
+    stats["historyReset"] = (double)mScreenProbeStats.historyReset;
+    stats["gdfRouteEnabled"] = (mUseGDF && mSDF.gdf && mSDF.pLevelTable && !mSDF.levels.empty()) ? 1.0 : 0.0;
     stats["screenHitRate"] = (double)mScreenProbeStats.screenHitRate();
     stats["fallbackHitRate"] = (double)mScreenProbeStats.fallbackHitRate();
+    // A1 producer validity/epoch telemetry. These fields are host-side until the
+    // per-direction backend/age sidecar ABI is added; exposing them now lets the
+    // convergence/reset harness distinguish a real reset from stale texture data.
+    stats["historyGeneration"] = (double)mHistoryGeneration;
+    stats["lightingGeneration"] = (double)mLightingGeneration;
+    stats["historyResetCount"] = (double)mHistoryResetCount;
+    stats["lastHistoryResetReason"] = (double)static_cast<uint32_t>(mLastHistoryResetReason);
+    stats["historyResetPending"] = mScreenProbes.historyResetPending ? 1.0 : 0.0;
+    stats["historyResetThisFrame"] = mHistoryResetThisFrame ? 1.0 : 0.0;
+    stats["historyReadIndex"] = (double)(1u - mScreenProbes.screenRadianceHistoryCurrIndex);
+    stats["historyWriteIndex"] = (double)mScreenProbes.screenRadianceHistoryCurrIndex;
+    return stats;
+}
+
+std::map<std::string, double> LumenGIPass::getRadianceCacheStats() const
+{
+    std::map<std::string, double> stats;
+    stats["enabled"] = mUseRadianceCache ? 1.0 : 0.0;
+    // GPU fields are deliberately separate from the CPU clipmap counters below.
+    // A non-zero CPU resident page count must never be mistaken for a dispatched
+    // producer/interpolator or a ready-frame fence.
+    stats["gpuProducerEnabled"] = mRadianceCacheGpu.pBuild ? 1.0 : 0.0;
+    stats["gpuInterpolationEnabled"] = mRadianceCacheGpu.pInterpolate ? 1.0 : 0.0;
+    stats["readyNextFrame"] = mRadianceCacheGpu.producedThisFrame ? 1.0 : 0.0;
+    stats["staleWriteRejects"] = (double)mRadianceCacheGpu.staleWriteRejects;
+    stats["traceCount"] = (double)mRadianceCacheGpu.traceCount;
+    stats["probeRayCount"] = (double)mRadianceCacheGpu.probeRayCount;
+    stats["probeDirectionCount"] = (double)mRadianceCacheGpu.probeDirectionCount;
+    stats["requestCount"] = (double)mRadianceCacheGpu.requestCount;
+    stats["rayCount"] = (double)mRadianceCacheGpu.rayCount;
+    stats["commitCount"] = (double)mRadianceCacheGpu.commitCount;
+    stats["readyCount"] = (double)mRadianceCacheGpu.readyCount;
+    stats["queryHits"] = (double)mRadianceCacheGpu.queryHits;
+    stats["queryMisses"] = (double)mRadianceCacheGpu.queryMisses;
+    stats["queryAttempts"] = (double)mRadianceCacheGpu.queryAttempts;
+    stats["queryCountersFrame"] = (double)mRadianceCacheGpu.queryCountersFrame;
+    stats["queryCountersSubmittedFrame"] = (double)mRadianceCacheGpu.queryCountersSubmittedFrame;
+    stats["queryCountersReadbackPending"] = mRadianceCacheGpu.queryCountersReadbackPending ? 1.0 : 0.0;
+    stats["fallbackCount"] = (double)mRadianceCacheGpu.fallbackCount;
+    stats["projectedProbeCount"] = (double)mRadianceCacheGpu.projectedProbeCount;
+    stats["inBoundsProbeCount"] = (double)mRadianceCacheGpu.inBoundsProbeCount;
+    stats["levelQueryCountersFrame"] = (double)mRadianceCacheGpu.levelQueryCountersFrame;
+    stats["levelQueryCountersSubmittedFrame"] = (double)mRadianceCacheGpu.levelQueryCountersSubmittedFrame;
+    stats["levelQueryCountersReadbackPending"] = mRadianceCacheGpu.levelQueryCountersReadbackPending ? 1.0 : 0.0;
+    // True only after the final resolve has actually received the cache
+    // fallback resources for the current frame. This is intentionally distinct
+    // from producer/interpolator creation and from a diagnostic output copy.
+    stats["finalResolveConnected"] =
+        (mUseRadianceCache && mRadianceCacheGpu.producedThisFrame && mFinalResolve.pPass) ? 1.0 : 0.0;
+    if (!mRadianceCache)
+    {
+        stats["contractStatus"] = 0.0; // disabled/uninitialized
+        return stats;
+    }
+
+    const auto s = mRadianceCache->getStats();
+    stats["contractStatus"] = mRadianceCacheGpu.producedThisFrame ? 2.0 : 1.0;
+    stats["levelCount"] = (double)s.levelCount;
+    stats["resolution"] = (double)s.resolution;
+    stats["maxSlots"] = (double)s.maxSlots;
+    stats["allocatedSlotCount"] = (double)s.allocatedSlotCount;
+    stats["allocatedSlots"] = (double)s.allocatedSlotCount;
+    stats["residentPages"] = (double)s.allocatedSlotCount;
+    stats["freeSlotCount"] = (double)s.freeSlotCount;
+    stats["emptyCellCount"] = (double)s.emptyCellCount;
+    stats["dirtyCells"] = (double)s.emptyCellCount;
+    stats["refreshBudgetPerFrame"] = (double)s.refreshBudgetPerFrame;
+    stats["lastRefreshCount"] = (double)s.lastRefreshCount;
+    stats["refreshedProbes"] = (double)s.lastRefreshCount;
+    stats["frameIndex"] = (double)s.frameIndex;
+    stats["memoryBudgetBytes"] = (double)s.memoryBudgetBytes;
+    stats["estimateMemoryBytes"] = (double)s.estimateMemoryBytes;
+    stats["residentBytes"] = (double)s.estimateMemoryBytes;
+    stats["allocationCount"] = (double)s.allocationCount;
+    stats["evictionCount"] = (double)s.evictionCount;
+    stats["evictions"] = (double)s.evictionCount;
+    stats["releaseCount"] = (double)s.releaseCount;
+    stats["updateCount"] = (double)s.updateCount;
+    stats["dropCount"] = (double)s.dropCount;
+    stats["queryCount"] = (double)s.queryCount;
+    stats["refreshCount"] = (double)s.refreshCount;
+    stats["lastReadyFrame"] = (double)mRadianceCacheGpu.lastReadyFrame;
+    const uint32_t levelCount = std::min<uint32_t>(s.levelCount, 8u);
+    stats["coverageLevelCount"] = (double)levelCount;
+    for (uint32_t level = 0u; level < levelCount; ++level)
+    {
+        const std::string prefix = "coverageLevel" + std::to_string(level);
+        stats[prefix + "ProjectedProbeCount"] = (double)mRadianceCacheGpu.levelProjectedProbeCount[level];
+        stats[prefix + "InBoundsProbeCount"] = (double)mRadianceCacheGpu.levelInBoundsProbeCount[level];
+        stats[prefix + "QueryAttempts"] = (double)mRadianceCacheGpu.levelQueryAttempts[level];
+        stats[prefix + "QueryHits"] = (double)mRadianceCacheGpu.levelQueryHits[level];
+        stats[prefix + "QueryMisses"] = (double)mRadianceCacheGpu.levelQueryMisses[level];
+        stats[prefix + "SampleCount"] = (double)mRadianceCacheGpu.levelSampleCount[level];
+        stats[prefix + "ValidHitDistanceCount"] = (double)mRadianceCacheGpu.levelValidHitDistanceCount[level];
+        stats[prefix + "FallbackSampleCount"] = (double)mRadianceCacheGpu.levelFallbackSampleCount[level];
+    }
+    return stats;
+}
+
+std::map<std::string, double> LumenGIPass::getQualityPresetStats() const
+{
+    std::map<std::string, double> stats;
+    stats["qualityPreset"] = static_cast<double>(static_cast<uint32_t>(mQualityPreset));
+    stats["probeDirectionsPerProbe"] = static_cast<double>(mProbeDirectionsPerProbe);
+    stats["captureMaxPagesPerFrame"] = static_cast<double>(mCaptureMaxPagesPerFrame);
+    stats["cacheLightingFeedbackMaxBounces"] = static_cast<double>(mCacheLightingFeedbackMaxBounces);
+    stats["spatialRadiusMin"] = static_cast<double>(mSpatialRadiusMin);
+    stats["spatialRadiusMax"] = static_cast<double>(mSpatialRadiusMax);
+    stats["spatialNeighborhoodRadius"] = static_cast<double>(mSpatialNeighborhoodRadius);
+    stats["temporalHistoryLengthCap"] = static_cast<double>(mTemporalHistoryLengthCap);
+    stats["gdfTraceMaxSteps"] = static_cast<double>(mGDFTraceMaxSteps);
+    stats["gdfTraceMaxDistance"] = static_cast<double>(mGDFTraceMaxDistance);
+    stats["meshSDFResolution"] = static_cast<double>(mMeshSDFResolution);
+    stats["meshSDFQuality"] = static_cast<double>(mMeshSDFQuality);
     return stats;
 }

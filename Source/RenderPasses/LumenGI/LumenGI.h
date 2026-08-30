@@ -39,6 +39,10 @@
 #include "Spatial/LumenReconstruction.h" // S5-A2 reconstruction host component (full/half/quarter resolution, upscale, spatial-filter CB mirror).
 #include "MeshSDF/LumenMeshSDFScene.h"       // S6-A/A2: scene -> cache -> builder -> volume -> atlas -> instance table (CPU, header-only).
 #include "MeshSDF/LumenGlobalDistanceField.h" // S6-A3: camera-centered GDF clipmap (CPU, header-only).
+#include "RadianceCache/LumenRadianceCache.h" // C10 CPU ownership/usage-feedback contract.
+
+#include <unordered_map>
+#include <unordered_set>
 
 using namespace Falcor;
 
@@ -125,6 +129,7 @@ class LumenGIPass : public RenderPass
 
     LumenGIPass(ref<Device> pDevice, const Properties& props);
 
+    void setProperties(const Properties& props) override;
     Properties getProperties() const override;
     RenderPassReflection reflect(const CompileData& compileData) override;
     void compile(RenderContext* pRenderContext, const CompileData& compileData) override;
@@ -146,9 +151,31 @@ class LumenGIPass : public RenderPass
     ///< Scriptable S4/C2/C7 probe-resource and counter snapshot (screenProbeStats).
     std::map<std::string, double> getScreenProbeStats() const;
 
+    ///< Scriptable C10 preparation snapshot. This reports the CPU clipmap scheduler
+    ///< only; GPU producer/interpolation fields remain zero until C10 resources exist.
+    std::map<std::string, double> getRadianceCacheStats() const;
+
+    ///< Scriptable C11 snapshot of the currently effective quality preset and derived values.
+    std::map<std::string, double> getQualityPresetStats() const;
+
+    ///< Card-specific Surface Cache request lifecycle events.  Unlike the aggregate
+    ///< surfaceCacheStats counters, each record keeps the request/capture/ready/first-hit
+    ///< frame relation and the page generation used for the validation.
+    std::vector<std::map<std::string, double>> getSurfaceCacheEvents() const;
+
 private:
-    void parseProperties(const Properties& props);
-    void resetHistory();
+    void parseProperties(const Properties& props, bool applyPresetDefaults = false);
+    enum class HistoryResetReason : uint32_t
+    {
+        Unknown = 0,
+        Resize = 1,
+        SceneChange = 2,
+        CameraCut = 3,
+        SetScene = 4,
+        HotReload = 5,
+    };
+
+    void resetHistory(HistoryResetReason reason = HistoryResetReason::Unknown);
     void clearOutputs(RenderContext* pRenderContext, const RenderData& renderData) const;
     void createDebugPass(const DefineList& defines = {});
     void createTraceProgram();
@@ -172,6 +199,7 @@ private:
     void ensureCacheLightingResources(RenderContext* pRenderContext);
     void runCacheLighting(RenderContext* pRenderContext);
     void exportCacheDirectRadiance(RenderContext* pRenderContext, const RenderData& renderData);
+    void exportCacheCaptureRadiance(RenderContext* pRenderContext, const RenderData& renderData);
 
     ///< Rebuild pageID -> cardIndex and the per-frame lighting render list from the host
     ///< card->page mirror (mCardPageTable/mCardPageGeneration, maintained from the scheduler
@@ -209,6 +237,22 @@ private:
     void ensureSpatialFilterResources(RenderContext* pRenderContext);
     void runSpatialFilter(RenderContext* pRenderContext, const RenderData& renderData);
     void runFinalResolve(RenderContext* pRenderContext, const RenderData& renderData);
+
+    // ------------------------------------------------------------------------------------------
+    // C10: bounded GPU Radiance Cache seed/interpolate path. This first producer is intentionally
+    // source-backed (current HWRT diffuse radiance) while the full UE-style scene-ray request
+    // tracer is added in the next wave. It still owns explicit generation/ready fencing and never
+    // substitutes CPU bookkeeping for a GPU output.
+    // ------------------------------------------------------------------------------------------
+    void createRadianceCachePrograms();
+    void ensureRadianceCacheResources(RenderContext* pRenderContext);
+    void runRadianceCache(RenderContext* pRenderContext, const RenderData& renderData);
+
+    // E1 diagnostics. These passes are graph-visible but hard-disabled until
+    // directional rough-specular and medium-aware transmission producers own
+    // their inputs; they never alias diffuseGI or finalColor.
+    void runRoughSpecularDiagnostic(RenderContext* pRenderContext, const RenderData& renderData);
+    void runTransmissionDiagnostic(RenderContext* pRenderContext, const RenderData& renderData);
 
     // ------------------------------------------------------------------------------------------
     // S6: Mesh SDF + Global Distance Field host (S6-A data pipeline, S6-B3 compose, S6-B4 sphere
@@ -261,15 +305,23 @@ private:
         ref<Buffer> pInstanceIDs;    ///< Per-instance identity buffer (element i == i), R32Uint, vertex slot 1.
         ref<Buffer> pCards;          ///< gCards StructuredBuffer<LumenCard> (96 B/card), SRV, full upload per frame.
         ref<Buffer> pPageTable;      ///< cardIndex -> pageID (uint32), SRV, host mirror upload per frame.
+        ref<Buffer> pPageGeneration; ///< cardIndex -> capture generation (uint32), SRV, stale-owner guard.
         ref<Buffer> pDrawArgs;       ///< Per-command indirect draw arguments (20 B each), IndirectArg bind.
+        ref<ComputePass> pPageClear; ///< Page-local clear before raster capture (capture-owned atlases).
+        ref<Buffer> pPageIDs;        ///< Unique page IDs for the page-local clear dispatch.
         ref<Texture> pMaterialAtlas; ///< Material atlas, RGBA8 (base color + opacity), UAV + SRV.
         ref<Texture> pRadianceAtlas; ///< Radiance atlas, RGBA16F, UAV + SRV; stale pages cleared by the shader.
         ref<Texture> pMetadataAtlas; ///< Metadata atlas, RGBA16F (depth/flags/normal octahedral), UAV + SRV.
+        ref<Texture> pCaptureOrderAtlas; ///< Deterministic raster winner key, R32Uint, UAV + SRV.
     } mCapture;
 
     uint32_t mAtlasSizeTexels = kLumenSurfaceCacheDefaultAtlasSize;        ///< Atlas side in texels (normalized to whole tiles).
     uint32_t mCapturePagesPerSide = kLumenSurfaceCacheDefaultPagesPerSide; ///< Tiles per atlas side (bound as gPagesPerSide).
     uint32_t mCaptureMaxPagesPerFrame = kLumenCaptureDefaultMaxPagesPerFrame; ///< Per-frame capture budget in pages.
+    uint32_t mSurfaceCachePageClearCommands = 0; ///< Unique pages cleared before the last capture batch.
+    uint64_t mSurfaceCachePageClearTexels = 0; ///< Capture atlas texels cleared before the last batch.
+    uint64_t mSurfaceCachePageClearCommandsTotal = 0; ///< Capture-page clears in the current scene/history epoch.
+    uint64_t mSurfaceCachePageClearTexelsTotal = 0; ///< Cleared capture texels in the current scene/history epoch.
     std::vector<uint32_t> mCardPageTable; ///< Host mirror cardIndex -> pageID (kLumenCardInvalidID when no page is assigned).
     LumenCaptureFrameStats mLastCaptureFrameStats; ///< Stats of the last scheduleFrame() call, for the UI.
 
@@ -283,6 +335,8 @@ private:
     {
         ref<ComputePass> pPass;          ///< LumenSurfaceCacheLighting.cs.slang, entry "main".
         ref<Buffer> pPageToCard;         ///< gLumenPageToCard (uint32, pageCount+1), SRV; pageID -> cardIndex.
+        ref<Buffer> pPageMetadata;      ///< pageID -> {allocator generation, page state, ready frame, reserved}, SRV.
+        ref<Buffer> pCardGrid;           ///< world-space cell -> bounded card candidate IDs, SRV.
         ref<Buffer> pRenderList;         ///< gLumenRenderList (uint32, pageCount), SRV; resident pages to light this frame.
         ref<Texture> pVisibilityAtlas;   ///< gLumenVisibilityAtlas (R16F), UAV + SRV; per-texel confidence.
         ///< S3-B2 multi-bounce feedback double buffer (RGBA16F, RGB = indirect radiance).
@@ -293,6 +347,7 @@ private:
         ref<Texture> pIndirect[2];
         ref<Texture> pBounceCount;       ///< gBounceCountAtlas (R32Uint), UAV; per-texel bounce cap counter.
         uint32_t indirectCurrIndex = 0;  ///< Double-buffer slot written this frame (flipped after each dispatch).
+        bool envSamplerVariant = false;  ///< Root-signature shape used by pPass; rebuild on toggle.
     } mCacheLighting;
 
     ///< Host mirror cardIndex -> page generation at the last capture command (size = card
@@ -301,7 +356,85 @@ private:
     ///< generation owns the page (a stale card->page entry has a mismatched generation).
     std::vector<uint32_t> mCardPageGeneration;
     std::vector<uint32_t> mPageToCardData; ///< Host mirror pageID -> cardIndex (pageCount+1), rebuilt per frame.
+    std::vector<uint4> mPageMetadataData; ///< Host mirror pageID -> {generation, state, first valid frame, reserved}.
+    std::vector<uint32_t> mCardGridData; ///< Host mirror: [cell count|overflow, bounded card IDs...].
+    float3 mCardGridMin = float3(0.f); ///< World-space grid origin for the current card set.
+    float3 mCardGridInvCellSize = float3(1.f); ///< Per-axis inverse cell size.
+    uint32_t mCardGridOverflowCells = 0; ///< Cells that require the correctness full-scan fallback.
+    uint32_t mCardGridCandidateCount = 0; ///< Number of card IDs stored in bounded cells.
+    uint32_t mCardGridCardsIndexed = 0; ///< Active card IDs included, including non-resident pages.
     std::vector<uint32_t> mRenderListData; ///< Host mirror of the frame's lighting render list.
+    uint32_t mSurfaceCacheGenerationRejects = 0; ///< Stale card/page ownership entries rejected this frame.
+    uint32_t mSurfaceCacheStateRejects = 0; ///< Allocated pages in a non-readable lifecycle state rejected this frame.
+    uint32_t mSurfaceCacheStaleOwnerRejects = 0; ///< Card/page generation mismatches rejected this frame.
+    // C6.1 GPU demand feedback, accumulated from validated probe cache hits.
+    uint64_t mSurfaceCacheFeedbackHits = 0;
+    uint64_t mSurfaceCacheFeedbackPages = 0;
+    uint64_t mSurfaceCacheFeedbackDedup = 0;
+    uint64_t mSurfaceCacheFeedbackStaleRejects = 0;
+    // C6.2 per-card miss/request telemetry. Requests are submitted only for a card whose
+    // geometry covers a probe hit but whose page/metadata is unavailable or stale.
+    uint64_t mSurfaceCacheRequestRaw = 0;
+    uint64_t mSurfaceCacheRequestCards = 0;
+    uint64_t mSurfaceCacheRequestDedup = 0;
+    uint64_t mSurfaceCacheRequestStaleRejects = 0;
+    uint64_t mSurfaceCacheRequestCaptureCompleted = 0;
+    // Explicit frame provenance for the strict C6 request -> next-frame
+    // publication contract.  The counters above are cumulative; these frame
+    // stamps prevent a readback/scheduler handoff from being misread as a
+    // same-frame GPU publication.
+    uint32_t mSurfaceCacheRequestObservedFrame = 0;
+    uint32_t mSurfaceCacheRequestCaptureFrame = 0;
+    // Surface Cache owns a monotonic scheduler clock. It must not reuse
+    // mFrameIndex because history resets intentionally rewind that counter.
+    uint32_t mSurfaceCacheFrameIndex = 0;
+    // OR-ed reason bits from the GPU per-card request ring. Keep these as
+    // separate raw-request counters so C6 priority/coverage diagnostics do
+    // not infer a cause from aggregate requestCards alone.
+    uint64_t mSurfaceCacheRequestUnmapped = 0;
+    uint64_t mSurfaceCacheRequestStaleOwner = 0;
+    uint64_t mSurfaceCacheRequestMetadataInvalid = 0;
+    uint64_t mSurfaceCacheRequestVisibilityInvalid = 0;
+    // Per-host-frame event counters. Unlike the cumulative counters above these are
+    // reset at execute() entry and are used to prove request -> capture -> ready
+    // ordering without reconstructing events from asynchronous readback deltas.
+    uint64_t mSurfaceCacheRequestRawThisFrame = 0;
+    uint64_t mSurfaceCacheRequestCardsThisFrame = 0;
+    uint64_t mSurfaceCacheRequestCaptureCompletedThisFrame = 0;
+    uint32_t mSurfaceCachePageMetadataPendingThisFrame = 0;
+    uint32_t mSurfaceCachePageMetadataReadyThisFrame = 0;
+    std::unordered_set<uint32_t> mSurfaceCachePendingReadyPages;
+    std::unordered_set<uint32_t> mSurfaceCacheRequestedCards;
+    // GPU miss requests are observed from the previous integrate dispatch. Keep
+    // them for one host frame before enqueueing so publication cannot occur on
+    // the same frame as request readback.
+    std::unordered_set<uint32_t> mSurfaceCacheDeferredRequestCards;
+    std::unordered_map<uint32_t, uint32_t> mSurfaceCacheDeferredRequestFrameByCard;
+    uint32_t mSurfaceCacheDeferredRequestFrame = 0;
+
+    struct SurfaceCacheRequestEvent
+    {
+        uint64_t sequence = 0;
+        uint32_t sceneGeneration = 0;
+        uint32_t cardIndex = kLumenCardInvalidID;
+        uint32_t pageID = kInvalidPageID;
+        uint32_t generation = 0;
+        uint32_t requestFrame = 0;
+        uint32_t captureFrame = 0;
+        uint32_t readyFrame = 0;
+        uint32_t firstHitFrame = 0;
+        uint32_t reasonBits = 0;
+        uint32_t requestCount = 0;
+        uint32_t lookupHits = 0;
+        uint32_t state = 0; ///< 1=requested, 2=captured, 3=ready, 4=hit, 5=stale.
+    };
+    // Telemetry-only event ledger capacity. This does not change scheduler admission, capture
+    // budget, residency, or any correctness threshold; it prevents long tiny-atlas pressure
+    // runs from losing identity records before the strict validator can drain them.
+    static constexpr size_t kMaxSurfaceCacheRequestEvents = 65536u;
+    std::vector<SurfaceCacheRequestEvent> mSurfaceCacheRequestEvents;
+    uint64_t mSurfaceCacheRequestEventSequence = 0;
+    uint64_t mSurfaceCacheRequestEventDropped = 0;
 
     ///< Optional cache-lighting GPU counters (LumenGICounterIndex layout). SEPARATE buffer from
     ///< mpLumenGICounters (trace): the trace readback/copy happens earlier in the frame and the
@@ -340,12 +473,30 @@ private:
         ref<ComputePass> pUpdate;    ///< LumenScreenProbeTrace.cs.slang, entry "updateMain" (1 thread / probe).
         ref<ComputePass> pTrace;     ///< entry "traceMain" (1 thread / (probe, direction)).
         ref<ComputePass> pFinalize;  ///< entry "finalizeMain" (1 thread / probe).
+        ref<ComputePass> pScreenRadianceHistoryPass; ///< UE-style per-pixel radiance history update.
         ref<ComputePass> pIntegrate; ///< LumenScreenProbeIntegrate.cs.slang, entry "main" (S4.3, 1 thread / probe).
         ref<ComputePass> pInterpolate; ///< LumenScreenProbeInterpolate.cs.slang, entry "main" (S4.3, 8x8 threads).
         ref<Buffer> pMetadata;       ///< gProbeMeta StructuredBuffer<LumenScreenProbe::Meta> (64 B), UAV + SRV.
         ref<Buffer> pHitRecords;     ///< gProbeHitRecords StructuredBuffer<LumenScreenProbe::Hit> (32 B), UAV + SRV.
-        ref<Buffer> pCounters;       ///< gProbeCounters StructuredBuffer<LumenScreenProbe::Counters> (32 B), UAV.
+        ref<Buffer> pCounters;       ///< gProbeCounters StructuredBuffer<LumenScreenProbe::Counters> (96 B), UAV.
         ref<Buffer> pCountersReadback; ///< ReadBack mirror of pCounters for the host stats.
+        ///< Optional C6.1 per-page demand feedback: uint2{hit count, page generation}.
+        ref<Buffer> pCacheFeedback;
+        ref<Buffer> pCacheFeedbackReadback;
+        uint32_t cacheFeedbackPageCount = 0;
+        uint32_t cacheFeedbackSceneGeneration = 0;
+        // Surface Cache scheduler frame at which the GPU feedback UAV was
+        // submitted. Readback is consumed one host frame later; event
+        // firstHitFrame must retain dispatch provenance rather than the
+        // current consumer frame.
+        uint32_t cacheFeedbackSubmittedFrame = 0;
+        bool cacheFeedbackReadbackPending = false;
+        ///< Optional C6.2 per-card miss requests: uint2{raw request count, miss reason bits}.
+        ref<Buffer> pCacheRequests;
+        ref<Buffer> pCacheRequestsReadback;
+        uint32_t cacheRequestCardCount = 0;
+        uint32_t cacheRequestSceneGeneration = 0;
+        bool cacheRequestReadbackPending = false;
         ref<Texture> pHZBNative;     ///< gHZBMips native floor-halved R32F mip chain (probe march; built per frame).
         ///< S4.3 internal integrated-probe radiance (RGBA16F, full-res, sparse writes at the
         ///< probe tile-center texel): RGB = integrated incident irradiance E, A = confidence.
@@ -358,6 +509,29 @@ private:
         ///< C7 cross-frame accumulated probe estimate. RGB stores the running mean incident
         ///< irradiance and A stores the accumulated traced-direction count (up to RGBA16F max).
         ref<Texture> pRadianceHistory;
+        ///< Full-resolution ping-pong raw screen-radiance history. RGB is the
+        ///< unmodulated HWRT radiance mean; A is the secondary hit distance.
+        ref<Texture> pScreenRadianceHistory[2];
+        ///< Full-resolution ping-pong linear-depth history used for reprojection rejection.
+        ref<Texture> pScreenRadianceDepthHistory[2];
+        ///< Full-resolution ping-pong normal/material guide history used to reject
+        ///< coplanar-but-different surfaces in the screen-radiance producer.
+        ref<Texture> pScreenRadianceGuideHistory[2];
+        ///< Full-resolution ping-pong source luminance moments. RG stores mean and mean-square;
+        ///< this is distinct from downstream probe-irradiance moments.
+        ref<Texture> pScreenRadianceMoments[2];
+        ///< Full-resolution ping-pong lighting-generation fence. R32Uint stores the
+        ///< mLightingGeneration epoch associated with each raw radiance sample.
+        ref<Texture> pScreenRadianceLightingGeneration[2];
+        ///< Full-resolution ping-pong raw-radiance history age. R32Uint stores the number
+        ///< of consecutive accepted reprojections (0 means invalid/reset). This is separate
+        ///< from RGBA16F alpha, which remains the secondary hit distance.
+        ref<Texture> pScreenRadianceAge[2];
+        ///< Full-resolution ping-pong per-pixel history validity sidecar. R32Uint: 1 means
+        ///< the corresponding RGB/hit-distance sample is valid for reprojection; 0 means
+        ///< invalid/reset. This is deliberately separate from hit-distance alpha and age.
+        ref<Texture> pScreenRadianceValidity[2];
+        uint32_t screenRadianceHistoryCurrIndex = 0;
         uint32_t probeCount = 0;     ///< Probe count the buffers were sized for (0 = not created).
         uint2 resourceDim = {0, 0};  ///< Frame dims the resources were built for.
         bool counterReadbackPending = false;
@@ -386,6 +560,13 @@ private:
     uint32_t mProbeDirectionsPerProbe = LumenScreenProbe::kDefaultDirectionsPerProbe;
     uint32_t mProbeMaxProbesPerFrame = 0u;
     LumenScreenProbe::Stats mScreenProbeStats; ///< Last completed dispatch read-back.
+    // Host frame associated with mScreenProbeStats.  This prevents consumers
+    // from treating the cumulative lookup counters as current-request events.
+    uint32_t mScreenProbeStatsFrame = 0u;
+    // Scheduler-frame stamp attached when the GPU counter readback is submitted.
+    // The readback is consumed one execute later, so using mFrameIndex at consume
+    // time would misattribute cache lookup events across history resets.
+    uint32_t mScreenProbeCountersSubmittedFrame = 0u;
 
     ///< S4.3 integrate weight mode (gWeightMode in the shared probe CB): 0 = cosine-weighted
     ///< hemisphere (the only Z1-consistent mode; the trace samples a cosine-weighted set).
@@ -435,6 +616,7 @@ private:
         ///< the temporal history so the spatial filter can use a true temporal variance.
         ref<Texture> pMoments;
         ref<Texture> pPrevDepth;          ///< S5-A1 previous-frame linear depth (R32F, blit of linearZ.x).
+        ref<Texture> pPrevNormal;         ///< UE-style previous-frame packed normal/material (RGBA16F blit).
         uint32_t historyCurrIndex = 0;    ///< History slot written this frame (flipped after each dispatch).
         uint2 resourceDim = {0, 0};       ///< Frame dims the resources were built for.
         ///< Camera cut / resize / scene-change reset: marks the prev double buffer for a hard clear
@@ -446,9 +628,9 @@ private:
     } mTemporalFilter;
 
     ///< S5-B1 tuning (LumenTemporalFilterCB; defaults frozen with Z5's LumenTemporalFilterData.slang).
-    bool mTemporalClampHistory = false;           ///< gClampHistory: AABB-clamp history to the current 3x3 (TAA anti-ghost; off in the S5 MVP -- see S5 report).
+    bool mTemporalClampHistory = true;            ///< gClampHistory: UE-style AABB clamp history to the current 3x3 neighborhood.
     float mTemporalHistoryAlpha = 0.1f;           ///< gHistoryAlpha: base EMA weight toward the current frame.
-    float mTemporalHistoryLengthCap = 255.f;      ///< gHistoryLengthCap: output history length cap (task gate: no overflow).
+    float mTemporalHistoryLengthCap = 10.f;       ///< gHistoryLengthCap: UE-style MaxFramesAccumulated cap.
     float mTemporalDepthThreshold = 0.05f;        ///< gDepthThreshold (m): depthW dead zone below which weight = 1.
     float mTemporalDepthSigmaInv = 8.0f;          ///< gDepthSigmaInv (1/m): depthW exponential falloff beyond the zone.
     float mTemporalDepthRelativeThreshold = 0.05f; ///< gDepthRelativeThreshold: hard reject on relative depth jump.
@@ -468,6 +650,7 @@ private:
         ///< LumenSpatialFilter.cs.slang, entry "main" (8x8 threads, variance-guided bilateral).
         ref<ComputePass> pFilter;
         ref<Texture> pOutput; ///< C8 internal spatial result; graph output is an optional mirror.
+        ref<Texture> pScratch; ///< Ping-pong target for the UE-style multi-pass spatial filter.
         ref<Texture> pVariance; ///< C8 internal combined variance; graph output is an optional mirror.
         uint2 resourceDim = {0, 0};
         bool producedThisFrame = false; ///< Spatial dispatch completed for the current frame.
@@ -488,12 +671,15 @@ private:
     ///< mirrored by LumenReconstruction::SpatialFilterConstantBuffer). Every field below is set on
     ///< the CB each dispatch; values match the frozen shader defaults so the pass is deterministic
     ///< and the radius / threshold / variance fields can be retuned per preset (S8).
-    float mSpatialRadiusMin = 0.0f;               ///< gRadiusMin: adaptive radius floor (pixels).
-    float mSpatialRadiusMax = 3.0f;               ///< gRadiusMax: adaptive radius ceiling (pixels).
-    float mSpatialVarianceThresholdLow = 0.01f;   ///< gVarianceThresholdLow: rel-var below which radius = gRadiusMin.
-    float mSpatialVarianceThresholdHigh = 0.25f;  ///< gVarianceThresholdHigh: rel-var above which radius = gRadiusMax.
+    // The probe interpolation grid is currently 8x8 pixels. Keep a non-zero
+    // bilateral floor and allow the adaptive pass to cover one probe cell;
+    // depth/normal/material gates still prevent cross-surface bleeding.
+    float mSpatialRadiusMin = 2.0f;               ///< gRadiusMin: UE-style realtime denoise floor (pixels).
+    float mSpatialRadiusMax = 4.0f;               ///< gRadiusMax: adaptive radius ceiling (pixels).
+    float mSpatialVarianceThresholdLow = 0.0f;   ///< gVarianceThresholdLow: rel-var below which radius = gRadiusMin.
+    float mSpatialVarianceThresholdHigh = 0.20f; ///< gVarianceThresholdHigh: rel-var above which radius = gRadiusMax.
     bool mSpatialFireflyClamp = true;             ///< gFireflyClamp: firefly replace + clamp.
-    uint32_t mSpatialNeighborhoodRadius = 1u;     ///< gNeighborhoodRadius: variance window radius (1 = 3x3, 2 = 5x5).
+    uint32_t mSpatialNeighborhoodRadius = 2u;     ///< gNeighborhoodRadius: variance window radius (1 = 3x3, 2 = 5x5).
     float mSpatialTemporalVarianceWeight = 1.0f;  ///< gTemporalVarianceWeight: scale on the S5-A1 temporal variance (0 = spatial only).
     float mSpatialDepthThreshold = 0.05f;         ///< gDepthThreshold (m): depthW dead zone.
     float mSpatialDepthSigmaInv = 8.0f;           ///< gDepthSigmaInv (1/m): depthW falloff beyond the zone.
@@ -509,6 +695,8 @@ private:
     ///< Scriptable S3 gate channel name: exposes the internal radiance atlas (RGB = direct,
     ///< linear) at atlas resolution for tests/lumengi/run_cachelighting.py (Agent N).
     static constexpr const char* kCacheDirectRadiance = "cacheDirectRadiance";
+    ///< Diagnostic snapshot of the capture-owned radiance atlas before S3 cache lighting.
+    static constexpr const char* kCacheCaptureRadiance = "cacheCaptureRadiance";
 
     ref<Scene> mpScene;
     sigs::Connection mUpdateFlagsConnection;
@@ -545,6 +733,16 @@ private:
 
     uint2 mFrameDim = {0, 0};
     uint32_t mFrameIndex = 0;
+    uint64_t mHistoryGeneration = 0;
+    uint64_t mLightingGeneration = 1;
+    // Surface-cache page generations are allocator-local and intentionally reset when a
+    // scene is reloaded. Keep a separate monotonic scene epoch so reload invalidation is
+    // observable without reusing stale page IDs/generations across scenes.
+    uint32_t mSurfaceCacheSceneGeneration = 0;
+    uint32_t mSurfaceCacheResetCount = 0;
+    uint32_t mHistoryResetCount = 0;
+    HistoryResetReason mLastHistoryResetReason = HistoryResetReason::Unknown;
+    bool mHistoryResetThisFrame = false;
     bool mOptionsChanged = false;
     bool mEnabled = true;
 
@@ -553,6 +751,7 @@ private:
     DebugMode mDebugMode = DebugMode::None;
     bool mUseSurfaceCache = false;
     bool mUseCacheLighting = false;
+    bool mUseCacheCardGrid = false; ///< Experimental candidate grid; keep full scan as the production default until A/B equivalence closes.
 
     // ------------------------------------------------------------------------------------------
     // S3-B2: multi-bounce feedback configuration (mirrored into the
@@ -566,8 +765,81 @@ private:
     bool mUseScreenTrace = false;
     bool mUseScreenProbes = false;
     bool mUseTemporalFilter = false;
+    bool mUseScreenRadianceMoments = true;
     bool mUseSpatialFilter = false;
     bool mUseRadianceCache = false;
+    std::unique_ptr<LumenRadianceCache> mRadianceCache;
+    // Scene/hot-reload boundaries can occur before execute() clears the per-frame
+    // history flag. Keep an explicit RC reset request so the GPU epoch, payload
+    // ping-pong buffers, and query readback counters cannot cross that boundary.
+    bool mRadianceCacheResetPending = false;
+
+    struct
+    {
+        ref<ComputePass> pBuild;       ///< C10 source-backed probe payload producer.
+        ref<ComputePass> pInterpolate; ///< C10 generation/ready-checked pixel output.
+        ref<Buffer> pProbeMeta[2];     ///< uint4 {world-position index, generation, readyFrame, valid}, ping-pong fence.
+        ref<Buffer> pProbeWorldPos;    ///< float4 world position per slot.
+        ref<Buffer> pProbeScreenPos;   ///< float4 projected pixel x/y, view depth, valid.
+        ref<Buffer> pProbeRadiance[2]; ///< float4 RGB radiance + hit distance, ping-pong payload.
+        ref<Buffer> pProbeValidity[2]; ///< uint hit/sky/radiance/producer validity bitmask, ping-pong.
+        ref<Buffer> pQueryCounters;     ///< uint4 {attempts, valid hits, invalid/miss, reserved} UAV.
+        ref<Buffer> pQueryCountersReadback; ///< Previous dispatch query counters.
+        ref<Buffer> pLevelQueryCounters; ///< uint[levels * 8] per-level query/sample counters.
+        ref<Buffer> pLevelQueryCountersReadback; ///< Previous dispatch per-level counters.
+        ref<Texture> pIndirection;     ///< R32Uint compact slot indirection (diagnostic/ABI fence).
+        ref<Texture> pOutput;           ///< Internal full-resolution cache output.
+        ref<Texture> pHitDistOutput;    ///< Internal full-resolution cache hit-distance output.
+        ref<Texture> pValidityOutput;   ///< Internal full-resolution hit/sky validity bitmask.
+        uint32_t slotCapacity = 0;
+        uint32_t levelCounterCount = 0;
+        uint32_t currIndex = 0;
+        uint32_t generation = 1;
+        uint32_t lastReadyFrame = 0;
+        uint64_t traceCount = 0;
+        uint64_t probeRayCount = 0;
+        uint32_t probeDirectionCount = 8;
+        uint64_t requestCount = 0; ///< Allocated probe requests submitted to the bounded producer.
+        uint64_t rayCount = 0;     ///< Deterministic probe rays submitted (requestCount * directions).
+        uint64_t commitCount = 0;
+        uint64_t readyCount = 0;   ///< Probe payload slots published behind the next-frame fence.
+        uint64_t staleWriteRejects = 0;
+        uint64_t queryAttempts = 0; ///< Pixels dispatched to interpolation; valid hits require a GPU readback counter.
+        uint64_t queryHits = 0;
+        uint64_t queryMisses = 0;
+        uint32_t queryCountersSubmittedFrame = 0; ///< Cache clock of the dispatch copied to readback.
+        uint32_t queryCountersFrame = 0;
+        bool queryCountersReadbackPending = false;
+        uint32_t levelQueryCountersSubmittedFrame = 0; ///< Cache clock of the per-level dispatch.
+        uint32_t levelQueryCountersFrame = 0;
+        bool levelQueryCountersReadbackPending = false;
+        std::array<uint64_t, 8> levelQueryAttempts = {};
+        std::array<uint64_t, 8> levelQueryHits = {};
+        std::array<uint64_t, 8> levelQueryMisses = {};
+        std::array<uint64_t, 8> levelSampleCount = {};
+        std::array<uint64_t, 8> levelValidHitDistanceCount = {};
+        std::array<uint64_t, 8> levelFallbackSampleCount = {};
+        std::array<uint64_t, 8> levelProjectedProbeCount = {};
+        std::array<uint64_t, 8> levelInBoundsProbeCount = {};
+        uint64_t fallbackCount = 0;
+        uint64_t projectedProbeCount = 0;
+        uint64_t inBoundsProbeCount = 0;
+        bool producedThisFrame = false;
+    } mRadianceCacheGpu;
+
+    struct
+    {
+        ref<ComputePass> pPass;
+        uint2 resourceDim = {0, 0};
+        bool producedThisFrame = false;
+    } mRoughSpecularDiagnostic;
+
+    struct
+    {
+        ref<ComputePass> pPass;
+        uint2 resourceDim = {0, 0};
+        bool producedThisFrame = false;
+    } mTransmissionDiagnostic;
 
     // ------------------------------------------------------------------------------------------
     // S6: Mesh SDF / Global Distance Field state (see the S6 section comment in the .cpp).
@@ -606,6 +878,11 @@ private:
     float mGDFTraceMaxDistance = 20.f;
     ///< S6-B3: empty-distance scale in voxels (empty GDF voxels store this * voxelSize).
     float mGDFEmptyDistanceScale = 8.f;
+    ///< C4 diagnostic stage: 0=production compose, 1=single-UAV E1, 2=all-descriptor E2,
+    ///< 3=CB+GDF buffers E2a, 4=atlas descriptors E2b, 5=CB+GDF buffers+uniform,
+    ///< 6=CB+uniform only E2d.
+    ///< This is intentionally opt-in and never changes the default production path.
+    uint32_t mGDFDiagnosticStage = 0u;
 
     ///< S6 host resources + CPU components. pScene and gdf are CPU-only; the rest are GPU.
     struct
@@ -631,6 +908,18 @@ private:
 
         ///< S6-B3 compose pass (LumenGDFCompose.cs.slang).
         ref<ComputePass> pCompose;
+        ///< C4 E1 diagnostic compose pass (single level UAV).
+        ref<ComputePass> pComposeDiag;
+        ///< C4 E2 diagnostic compose pass (all production descriptors).
+        ref<ComputePass> pComposeDiagAll;
+        ///< C4 E2a diagnostic compose pass (CB + GDF buffers).
+        ref<ComputePass> pComposeDiagBuffers;
+        ///< C4 E2b diagnostic compose pass (atlas SRVs + scalar uniforms).
+        ref<ComputePass> pComposeDiagAtlas;
+        ///< C4 E2c diagnostic pass (CB + GDF buffers + one global uniform).
+        ref<ComputePass> pComposeDiagBuffersScalar;
+        ///< C4 E2d diagnostic pass (CB + one global uniform).
+        ref<ComputePass> pComposeDiagCBScalar;
         ///< S6-B4 sphere-trace pass (LumenGDFTrace.cs.slang).
         ref<ComputePass> pTrace;
 

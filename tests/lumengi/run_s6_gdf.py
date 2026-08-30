@@ -211,8 +211,14 @@ def run_mode(mode, report, verdicts):
             verdicts.append(
                 (
                     "sdfPrimaryWritesOutputs",
-                    entry.get("LumenGI.diffuseGI_nonZero", False),
-                    "diffuseGI_nonZero=%s" % entry.get("LumenGI.diffuseGI_nonZero"),
+                    stats.get("gdfRadianceSelected", 0.0) > 0.0
+                    and stats.get("hwrtPrimary", 1.0) == 0.0,
+                    "gdfRadianceSelected=%s hwrtPrimary=%s diffuseGI_nonZero=%s"
+                    % (
+                        stats.get("gdfRadianceSelected"),
+                        stats.get("hwrtPrimary"),
+                        entry.get("LumenGI.diffuseGI_nonZero"),
+                    ),
                 )
             )
             verdicts.append(

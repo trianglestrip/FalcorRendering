@@ -230,6 +230,9 @@ cbuffer LumenSurfaceCacheLightingCB
 #ifndef is_valid_gLumenPageToCard
 #define is_valid_gLumenPageToCard 1
 #endif
+#ifndef is_valid_gLumenPageMetadata
+#define is_valid_gLumenPageMetadata 1
+#endif
 #ifndef is_valid_gLumenRenderList
 #define is_valid_gLumenRenderList 1
 #endif
@@ -282,6 +285,11 @@ StructuredBuffer<LumenCard> gCards;
 */
 StructuredBuffer<uint> gLumenPageToCard;
 
+/** Page metadata indexed by page ID: x = allocator generation, y = page state
+    (Free=0, Allocated=1, Touched=2, EvictedPending=3). */
+// pageID -> {allocator generation, page state, first frame visible to ScreenProbe, reserved}.
+StructuredBuffer<uint4> gLumenPageMetadata;
+
 /** Render list of pages to light this frame (S3-A1 scheduler output, sorted
     by priority/dirty/age): gLumenRenderList[i] is a page ID. Optional: when
     unbound the shader runs in full-atlas mode where threadgroup x lights
@@ -306,16 +314,6 @@ Texture2D<float4> gMetadataAtlas;
 */
 Texture2D<float4> gMaterialParamsAtlas;
 
-/** Environment sampler. Host: EnvMapSampler::bindShaderData(var["envMapSampler"])
-    and LUMEN_GI_HAS_ENVIRONMENT_SAMPLER = 1 when created. Unbound ->
-    uniform-sphere fallback over gScene.envMap. The declaration is conditionally
-    compiled so the parameter (with its sampler state) only enters the root
-    signature when the host binds it.
-*/
-#if LUMEN_GI_HAS_ENVIRONMENT_SAMPLER
-EnvMapSampler envMapSampler;
-#endif
-
 /** Emissive triangle sampler (LightBVHSampler in S3). Host:
     mpEmissiveSampler->bindShaderData(var["emissiveSampler"]) and
     LUMEN_GI_HAS_EMISSIVE_SAMPLER = 1, with the _EMISSIVE_LIGHT_SAMPLER_TYPE
@@ -323,6 +321,15 @@ EnvMapSampler envMapSampler;
     sampler type) -> emissive next-event term is a miss constant. The
     declaration is conditional like the environment sampler above.
 */
+
+/** Environment sampler. Use a nested parameter block, matching the PathTracer
+    contract. A direct module-global EnvMapSampler is compiled as an implicit
+    mixed resource/uniform parameter and can produce D3D12 E_INVALIDARG at
+    dispatch even when all four fields are bound. */
+#if LUMEN_GI_HAS_ENVIRONMENT_SAMPLER
+ParameterBlock<EnvMapSampler> envMapSampler;
+#endif
+
 #if LUMEN_GI_HAS_EMISSIVE_SAMPLER
 EmissiveLightSampler emissiveSampler;
 #endif

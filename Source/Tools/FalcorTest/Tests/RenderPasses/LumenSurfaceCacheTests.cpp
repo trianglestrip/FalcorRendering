@@ -146,6 +146,9 @@ CPU_TEST(LumenSurfaceCache_LruEvictionRespectsMinResidency)
     EXPECT_EQ(cache.allocatePage(), 10);
     EXPECT_EQ(cache.allocatePage(), 11);
     EXPECT_EQ(cache.getGeneration(9), 2);
+    EXPECT_EQ(cache.getStats().lastEvictedPageID, 11);
+    EXPECT_EQ(cache.getStats().lastAllocatedPageID, 11);
+    EXPECT_EQ(cache.getStats().lastAllocatedGeneration, 2);
     for (uint32_t pageID = 1; pageID <= 8; ++pageID)
     {
         EXPECT_TRUE(cache.isPageAllocated(pageID));
@@ -397,6 +400,9 @@ CPU_TEST(LumenSurfaceCache_BudgetBoundary)
     EXPECT_TRUE(stats.isWithinMemoryBudget());
     EXPECT_EQ(cache.getResidentBytes(), kTestBudgetBytes);
     EXPECT_EQ(cache.getStats().evictionCount, 2);
+    EXPECT_EQ(cache.getStats().lastEvictedPageID, 2);
+    EXPECT_EQ(cache.getStats().lastAllocatedPageID, 12);
+    EXPECT_EQ(cache.getStats().lastAllocatedGeneration, 1);
     EXPECT_FALSE(cache.isPageAllocated(1));
     EXPECT_FALSE(cache.isPageAllocated(2));
     EXPECT_TRUE(cache.isPageAllocated(3));

@@ -57,6 +57,14 @@ static constexpr uint32_t kMaxMip = 12u;
 static constexpr uint32_t kSeed = 0x51B8DC0Du;                      ///< Fixed base seed (task rule 5).
 static constexpr uint32_t kCounterCount = 8u;
 
+// Surface Cache lookup acceleration contract. The host builds a world-space
+// uniform grid over currently owned cards; each cell stores up to 32 card IDs.
+// An overflow bit keeps the correctness fallback explicit: the shader scans
+// all cards for that cell instead of silently dropping candidates.
+static constexpr uint32_t kCacheCardGridDim = 16u;
+static constexpr uint32_t kCacheCardGridMaxCandidates = 32u;
+static constexpr uint32_t kCacheCardGridCellStride = 1u + kCacheCardGridMaxCandidates;
+
 ///< Probe grid dimensions for a frame (ceil of frame/tile), probes per axis.
 static uint2 probeGridDims(uint2 frameDim)
 {
@@ -131,8 +139,11 @@ static constexpr uint32_t kHitFlagHWRTMiss = 1u << 2;
 static constexpr uint32_t kHitFlagFallbackUnavailable = 1u << 3;
 static constexpr uint32_t kHitFlagRadianceReused = 1u << 4;
 static constexpr uint32_t kHitFlagEnvironment = 1u << 5;
+static constexpr uint32_t kHitFlagGDFHit = 1u << 6;
 
-///< Counter layout (gProbeCounters[0]).
+///< Counter layout (gProbeCounters[0]). The first 16 uints are the original
+///< trace/cache counters; history counters retain their frozen offsets and
+///< cache-coverage diagnostics are appended after them.
 struct Counters
 {
     uint32_t screenHits;
@@ -143,8 +154,28 @@ struct Counters
     uint32_t inactiveProbes;
     uint32_t budgetSkipped;
     uint32_t directionsTraced;
+    uint32_t gdfHits;
+    uint32_t gdfMisses;
+    uint32_t cacheLookupHits;
+    uint32_t cacheLookupAttempts;
+    uint32_t cachePageRejects;
+    uint32_t cacheCoverageRejects;
+    uint32_t cacheMetadataRejects;
+    uint32_t cacheVisibilityRejects;
+    uint32_t historyAccepted;
+    uint32_t historyRejectDepth;
+    uint32_t historyRejectGuide;
+    uint32_t historyRejectMotion;
+    uint32_t historyRejectLighting;
+    uint32_t historyRejectCurrentInvalid;
+    uint32_t historyRejectPreviousInvalid;
+    uint32_t historyReset;
+    uint32_t cacheDepthRejects;
+    uint32_t cacheAxisRejects;
+    uint32_t cacheFacingRejects;
+    uint32_t cacheOwnerValid;
 };
-static_assert(sizeof(Counters) == 32, "LumenScreenProbe::Counters is 32 bytes (matches the shader)");
+static_assert(sizeof(Counters) == 112, "LumenScreenProbe::Counters is 112 bytes (matches the shader)");
 
 ///< Per-frame read-back stats for the UI and scriptable gates.
 struct Stats
@@ -161,6 +192,26 @@ struct Stats
     uint32_t inactiveProbes = 0;
     uint32_t budgetSkipped = 0;
     uint32_t directionsTraced = 0;
+    uint32_t gdfHits = 0;
+    uint32_t gdfMisses = 0;
+    uint32_t cacheLookupHits = 0;
+    uint32_t cacheLookupAttempts = 0;
+    uint32_t cachePageRejects = 0;
+    uint32_t cacheCoverageRejects = 0;
+    uint32_t cacheMetadataRejects = 0;
+    uint32_t cacheVisibilityRejects = 0;
+    uint32_t historyAccepted = 0;
+    uint32_t historyRejectDepth = 0;
+    uint32_t historyRejectGuide = 0;
+    uint32_t historyRejectMotion = 0;
+    uint32_t historyRejectLighting = 0;
+    uint32_t historyRejectCurrentInvalid = 0;
+    uint32_t historyRejectPreviousInvalid = 0;
+    uint32_t historyReset = 0;
+    uint32_t cacheDepthRejects = 0;
+    uint32_t cacheAxisRejects = 0;
+    uint32_t cacheFacingRejects = 0;
+    uint32_t cacheOwnerValid = 0;
 
     float screenHitRate() const
     {

@@ -571,6 +571,17 @@ namespace Mogwai
 
     void Renderer::setScene(const ref<Scene>& pScene)
     {
+        // Scene replacement releases a large graph of GPU resources (BLASes,
+        // material textures and pass-owned history).  RenderContext keeps command
+        // buffers and deferred-release queues alive until a fence advances, so a
+        // reload can otherwise retain the previous scene while the new one is
+        // being submitted.  Synchronize only when replacing an existing scene;
+        // this keeps the normal per-frame path untouched while making scripted
+        // scene churn deterministic and bounded.
+        const bool replacingScene = mpScene != nullptr && mpScene.get() != pScene.get();
+        if (replacingScene)
+            getDevice()->wait();
+
         mpScene = pScene;
 
         if (mpScene)
@@ -595,6 +606,13 @@ namespace Mogwai
             g.pGraph->setScene(mpScene);
             g.sceneUpdates = IScene::UpdateFlags::None;
         }
+
+        // The assignment above drops the previous scene and each render pass has
+        // released its scene-scoped resources.  Advance the device fence once more
+        // so those deferred releases are reclaimed before the next frame/reload.
+        if (replacingScene)
+            getDevice()->wait();
+
         getGlobalClock().setTime(0);
     }
 

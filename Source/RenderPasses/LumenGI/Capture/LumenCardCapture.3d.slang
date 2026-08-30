@@ -79,6 +79,9 @@ import LumenCardCaptureData;
 #ifndef is_valid_gDebugTexture
 #define is_valid_gDebugTexture 0
 #endif
+#ifndef is_valid_gCaptureOrderAtlas
+#define is_valid_gCaptureOrderAtlas 0
+#endif
 
 #define is_valid(name) (is_valid_##name != 0)
 
@@ -94,13 +97,37 @@ cbuffer LumenCardCaptureCB
     float gNearMargin;      ///< Camera distance in front of the front face (meters).
 };
 
-StructuredBuffer<LumenCard> gCards;
+// The host card upload is 96 bytes: four float4 slots followed by priority and
+// three scalar padding values (LumenCardScene.h).  Do not use the shared
+// float3-based LumenCard here: StructuredBuffer structs use scalar/C-style
+// packing, so that spelling would put boundsMax/center/extent at 28/40/52
+// instead of the host's 32/48/64 offsets and would project every card from
+// corrupted bounds.  Keep this record local to the capture pass so the shared
+// shader ABI is unchanged.
+struct LumenCardCaptureRecord
+{
+    uint meshID;
+    uint instanceID;
+    uint faceIndex;
+    uint dirtyFlags;
+    float4 boundsMin;
+    float4 boundsMax;
+    float4 center;
+    float4 extent;
+    float priority;
+    float padding0;
+    float padding1;
+    float padding2;
+};
+
+StructuredBuffer<LumenCardCaptureRecord> gCards;
 
 RWTexture2D<float4> gMaterialAtlas;      // RGBA8: base color + opacity.
 RWTexture2D<float4> gRadianceAtlas;      // RGBA16F: cleared to zero on capture.
 RWTexture2D<float4> gMetadataAtlas;      // RGBA16F: depth, validity, normal octahedral.
 RWTexture2D<float4> gMaterialParamsAtlas; // RGBA16F: roughness + emissive.
 RWTexture2D<float4> gDebugTexture;       // Optional validity/fallback debug view.
+RWTexture2D<uint> gCaptureOrderAtlas;    // R32Uint: page-local deterministic winner key.
 
 #if !defined(INTERPOLATION_MODE)
 #define INTERPOLATION_MODE linear
@@ -128,11 +155,11 @@ struct LumenCardCaptureVSOut
     the front face lies nearMargin meters in front of the camera and the box
     spans [nearMargin, nearMargin + extent[axis]] along the view axis.
 */
-float3 lumenCardCameraPosition(const LumenCard card, float3 viewDir, float nearMargin)
+float3 lumenCardCameraPosition(const LumenCardCaptureRecord card, float3 viewDir, float nearMargin)
 {
     const uint axis = lumenCardFaceAxis(card.faceIndex);
-    const float halfDepth = 0.5f * lumenCardComponent(card.extent, axis);
-    return card.center - viewDir * (halfDepth + nearMargin);
+    const float halfDepth = 0.5f * lumenCardComponent(card.extent.xyz, axis);
+    return card.center.xyz - viewDir * (halfDepth + nearMargin);
 }
 
 /** Orthographic clip position of a world-space point for the card camera.
@@ -141,13 +168,13 @@ float3 lumenCardCameraPosition(const LumenCard card, float3 viewDir, float nearM
     extent on any used axis) return a degenerate position (w = 0) so nothing
     rasterizes.
 */
-float4 lumenCardProject(const LumenCard card, float3 viewDir, float3 right, float3 up, float3 posW, float nearMargin)
+float4 lumenCardProject(const LumenCardCaptureRecord card, float3 viewDir, float3 right, float3 up, float3 posW, float nearMargin)
 {
     const uint2 axes = lumenCardFacePerpendicularAxes(card.faceIndex);
     const uint axis = lumenCardFaceAxis(card.faceIndex);
-    const float halfW = 0.5f * lumenCardComponent(card.extent, axes.x);
-    const float halfH = 0.5f * lumenCardComponent(card.extent, axes.y);
-    const float depthRange = lumenCardComponent(card.extent, axis) + 2.f * nearMargin;
+    const float halfW = 0.5f * lumenCardComponent(card.extent.xyz, axes.x);
+    const float halfH = 0.5f * lumenCardComponent(card.extent.xyz, axes.y);
+    const float depthRange = lumenCardComponent(card.extent.xyz, axis) + 2.f * nearMargin;
 
     if (halfW <= 1e-6f || halfH <= 1e-6f || depthRange <= 1e-6f)
         return float4(0.f, 0.f, 0.f, 0.f);
@@ -181,7 +208,7 @@ LumenCardCaptureVSOut vsMain(VSIn vIn)
         return vOut;
     }
 
-    const LumenCard card = gCards[gCardIndex];
+    const LumenCardCaptureRecord card = gCards[gCardIndex];
 
     // The host normally sets gNearMargin; fall back to the frozen default
     // when the cbuffer value was never written.
@@ -230,6 +257,24 @@ void psMain(LumenCardCaptureVSOut vOut, uint triangleIndex : SV_PrimitiveID)
 
     const int2 ipos = int2(vOut.posH.xy);
 
+    // Raster UAV writes from overlapping triangles have no ordering guarantee.  Use a
+    // page-local atomic winner keyed by quantized card-camera depth, then the owning card.
+    // SV_PrimitiveID restarts for every draw, so using it (or a hash of it) in the low bits
+    // allows equal-depth fragments from different cards/draws to race and publish different
+    // material/normal texels.  A page has one authoritative owner; using that owner directly
+    // makes the cross-draw tie deterministic.  Equal-depth triangles from the same owner still
+    // write the same material page and retain the full-precision depth in gMetadataAtlas.
+    if (is_valid(gCaptureOrderAtlas))
+    {
+        const float depthKey = saturate(isfinite(vOut.viewDepth) ? vOut.viewDepth : 1.f);
+        const uint depthQ = min(uint(round(depthKey * 65535.f)), 65535u);
+        const uint winnerKey = (depthQ << 16u) | (gCardIndex & 0xffffu);
+        uint previousKey = 0xffffffffu;
+        InterlockedMin(gCaptureOrderAtlas[ipos], winnerKey, previousKey);
+        if (winnerKey > previousKey)
+            return;
+    }
+
     // Interpolated view depth is exact under the orthographic projection.
     const float depth = vOut.viewDepth;
 
@@ -277,11 +322,17 @@ void psMain(LumenCardCaptureVSOut vOut, uint triangleIndex : SV_PrimitiveID)
 
     ShadingData sd = gScene.materials.prepareShadingData(v, vOut.materialID, V);
 
-    // Backfaces of single-sided materials are not part of the surface and
-    // must not be captured (equivalent to back-face culling; the host may
-    // also cull them).
-    if (!sd.frontFacing && !sd.mtl.isDoubleSided())
-        return;
+    // A card camera is deliberately placed outside the card AABB.  For an
+    // enclosed mesh (for example Cornell walls whose material front faces
+    // point into the room), that camera sees the back side of a single-sided
+    // triangle even though the triangle is the surface represented by the
+    // card.  Surface Cache capture is a material/page representation rather
+    // than a visibility raster pass, so rejecting those samples here would
+    // leave the page metadata empty and make every cache query fail.  Keep
+    // the shading data returned by the material system (including its
+    // front-facing state) and write the captured surface for both winding
+    // orientations.  The card/page slab and lookup-facing tests remain the
+    // visibility/correctness fences downstream.
 
     // Create the material instance and query its properties, exactly like
     // GBufferRaster. For double-sided materials the material system flips

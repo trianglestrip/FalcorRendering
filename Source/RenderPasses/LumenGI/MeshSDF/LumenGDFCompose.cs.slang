@@ -119,6 +119,12 @@
 cbuffer LumenGDFComposeCB
 {
     LumenGDFClipmapParams gClipmap;
+    // Keep all compose constants in one explicit CB. Falcor's implicit global
+    // cbuffer cannot be combined reliably with this nested CB on the D3D12
+    // descriptor path (C4 E2d reproduces E_INVALIDARG with only one scalar).
+    uint gAtlasInstanceCount;               ///< Atlas instance count (== gInstances count).
+    uint gAtlasVolumeCount;                 ///< Atlas volume count (== gVolumes count).
+    uint gAtlasPagesPerSide;                ///< Atlas geometry: pagesPerSide^3 slots/atlas.
 }
 
 StructuredBuffer<LumenGDFLevelParams> gGDFLevelTable;
@@ -137,9 +143,6 @@ Texture3D<float> gCoarseAtlas;                  ///< R32Float staging view of no
 StructuredBuffer<uint> gPageTable;              ///< [instanceID * 12 + mip] = base page slot.
 StructuredBuffer<LumenMeshSDFVolumeDescriptor> gVolumes; ///< Per mesh (deduplicated).
 StructuredBuffer<LumenMeshSDFAtlasInstance> gInstances;  ///< Per registered instance.
-uniform uint gAtlasInstanceCount;               ///< Atlas instance count (== gInstances count).
-uniform uint gAtlasVolumeCount;                 ///< Atlas volume count (== gVolumes count).
-uniform uint gAtlasPagesPerSide;                ///< Atlas geometry: pagesPerSide^3 slots/atlas.
 
 // -------------------------------------------------------------------------------------
 // Helpers

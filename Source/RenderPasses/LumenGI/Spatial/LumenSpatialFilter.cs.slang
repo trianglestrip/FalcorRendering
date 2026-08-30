@@ -198,6 +198,27 @@ float lumenSpatialFilterConfidence(const int2 pixel, const float fallbackA)
     return saturate(fallbackA);
 }
 
+/** A neighbor may contribute to the spatial statistics only when its sample and
+ *  confidence are finite and the confidence is non-zero.  RGB is deliberately
+ *  not inspected here: a valid black radiance sample still carries information
+ *  when its confidence is above the validity epsilon.
+ */
+static const float kLumenSpatialFilterValidityEpsilon = 1e-4f;
+
+bool lumenSpatialFilterSampleIsValid(
+    const int2 pixel,
+    const float4 sample,
+    out float confidence
+)
+{
+    confidence = 0.f;
+    if (any(isnan(sample)) || any(isinf(sample)))
+        return false;
+    confidence = lumenSpatialFilterConfidence(pixel, sample.a);
+    return !isnan(confidence) && !isinf(confidence) &&
+           confidence > kLumenSpatialFilterValidityEpsilon;
+}
+
 /** Depth affinity factor (same dead-zone + exponential form as the S4-B3
  *  interpolate weight): 1 within gDepthThreshold meters, exponential falloff
  *  beyond, so coplanar taps dominate and silhouettes cut.
@@ -275,7 +296,11 @@ void lumenSpatialFilterVarianceEstimate(
             const float w = lumenSpatialFilterDepthWeight(pixelZ, z);
             if (w < 1e-3f)
                 continue;
-            const float3 gi = lumenSpatialFilterSanitize(gGIInput.Load(int3(p, 0)).rgb);
+            const float4 tapGI = gGIInput.Load(int3(p, 0));
+            float tapConfidence;
+            if (!lumenSpatialFilterSampleIsValid(p, tapGI, tapConfidence))
+                continue;
+            const float3 gi = lumenSpatialFilterSanitize(tapGI.rgb);
             const float lum = lumenSpatialFilterLuminance(gi);
             sumLum += w * lum;
             sumLumSq += w * lum * lum;
@@ -428,8 +453,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 continue;
 
             const float4 tapGI = gGIInput.Load(int3(p, 0));
+            float conf;
+            if (!lumenSpatialFilterSampleIsValid(p, tapGI, conf))
+                continue;
             const float3 gi = lumenSpatialFilterSanitize(tapGI.rgb);
-            const float conf = lumenSpatialFilterConfidence(p, tapGI.a);
             const float lum = lumenSpatialFilterLuminance(gi);
 
             accRGB += w * gi;

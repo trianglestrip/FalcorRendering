@@ -767,7 +767,176 @@ The current verdicts and artifacts are maintained in
 - C8/C9 mark-on equivalence: PASS; mark-off direct production endpoints: BLOCKED; `finalColor`: SKIP.
 - C4/C5: BLOCKED by fresh R32Float `runGDFCompose` `E_INVALIDARG`; E1/E2 shaders compile but host descriptor bisect remains pending.
 - C10-C12 remain deferred until C1, C4/C5, C7 and C8/C9 close.
+
+### Runtime evidence delta (2026-08-12)
+
+- C4 host E1 single-UAV diagnostic passes at logical `(1,1,1)` (`artifacts/lumengi/C4/E1-20260812/mogwai.log`).
+- E2 full descriptor and production compose still fail `E_INVALIDARG`; E2a CB+GDF buffers and E2b atlas/scalars pass independently (`artifacts/lumengi/C4/E2a-20260812b/gdf-diagnostic.json`, `artifacts/lumengi/C4/E2b-20260812/gdf-diagnostic.json`).
+- The next C4 task is combined root-signature/descriptor layout bisection. C5 Hybrid and C10-C12 remain blocked by this production compose failure.
+
+### Runtime evidence delta (2026-08-12b)
+
+- E2d (`CB + one global uniform + UAV`) remains a reproducible `E_INVALIDARG`.
+- Production compose was repaired by moving atlas scalar uniforms into the
+  explicit compose CB; fresh GPU run passes both levels at `(8,1,512)`:
+  `artifacts/lumengi/C4/production-cbfix-20260812/mogwai.log`.
+- Update C4 only to “compose dispatch fixed / Trace Router not closed”; do not
+  advance C5 or C10-C12 until GDF hit records are routed before Probe Integrate
+  and Hybrid counters prove selected/fallback backends.
+
+### UE5.8 reference alignment (2026-08-10)
+
+详细的 UE5.8 源码对照、CodeGraph 证据边界、生产链 DAG、参数基线、Wave
+所有权和 Luna 接手提示见
+`docs/LumenGI_UE5.8_Reference_Optimization_Plan.md`。UE CodeGraph 已初始化但
+全量索引中断，当前仅作可查询定位依据；不得据此宣称完整调用图。下一节点仍是
+C4 Trace Router（Screen miss -> GDF -> HWRT），不是 C5 Hybrid 或 C10。
 | S9 发布回归 | [ ] | S8 | 核心回归证据已有，完整图像/动态/性能/validation/soak 发布矩阵未关闭 | 保留 `artifacts/lumengi/S9/`（analytic/dynamic/stability/s2verify/smoke + 110/110 unit）；完整矩阵待续 |
+
+## Current status override (2026-08-11)
+
+The older runtime deltas above are historical and are superseded by the current artifacts:
+
+- C1 EnvMapSampler ParameterBlock variant: PASS (`artifacts/lumengi/C1/*parameterblock-20260811/`).
+- C4 production compose and Screen→GDF→HWRT probe route: PASS (`artifacts/lumengi/C4/gdf-probe-router-v4-20260811/`); C5 Hybrid quality remains open.
+- C6 generation/state/stale-owner lifecycle telemetry: PASS for the tested Cornell static/low-budget matrix (`artifacts/lumengi/C6/page-telemetry-20260811-v5/`).
+- C7/A1 producer sidecar and scene-reload/camera-cut reset matrix: PASS (`artifacts/lumengi/C7/probe-validity-transitions-20260811-full-v1/`).
+- C7/A2 guide history, source moments runtime, and static image-quality comparison: PASS (`artifacts/lumengi/A2/screenradiance-moments-compare-20260811-v2/`).
+- C7 dynamic light/material/environment generation fence: PASS at 800x450 (`artifacts/lumengi/C7/lighting-generation-20260811-v2/`).
+- C8/C9 marked export equivalence: PASS; unmarked direct endpoints remain contractually BLOCKED (`artifacts/lumengi/C8/export-equivalence-20260811-post-a2/`).
+- C8 raw-buffer FrameCapture compatibility: PASS for marked texture exports after non-texture outputs are skipped with warning (`artifacts/lumengi/C8/export-equivalence-20260812-framecapture-fix/`); mark-off endpoints remain contractually BLOCKED.
+- C5 GDF probe router: combined Screen→GDF→Surface Cache hit-lighting PASS on `material_test` (`gdfHits=42`, `cacheLookupHits=1`, `artifacts/lumengi/C5/gdf-probe-router-material-cache-on-20260812/`); Cornell remains a coverage/metadata BLOCKED case.
+- C5 reject telemetry: page/state rejects are zero; Cornell misses are dominated by card coverage (`cacheCoverageRejects=56091`), while Arcade has `cacheLookupHits=22` but no GDF hits. Combined-route closure is still BLOCKED.
+- C9 FinalResolve contract gate is PASS: `tests/lumengi/run_c9_resolve_contract.py` verifies finite/alpha validity, legal-black preservation, single `E*albedo/PI`, raw-HWRT passthrough, internal/public copies, and separate temporal confidence; artifact `artifacts/lumengi/C9/resolve-contract/resolve-contract.json`.
+- C5 material route also passes at 800x450/8 frames (`gdfHits` 149-190, non-zero `cacheLookupHits`, finite/non-negative, no fatal/E_INVALIDARG); coverage rejects remain high, so card/page mapping is still open (`artifacts/lumengi/C5/gdf-probe-router-material-cache-on-800x450-20260812/`).
+- Current Release multi-view material smoke passes front/left/right at 800x450/16 frames with finite/non-negative outputs and no runtime errors (`artifacts/lumengi/screenshots/convergence-test-20260812-multiview/`).
+
+Still open before the final completion claim: C5 multi-scene/higher-resolution hit-lighting quality, cache coverage diagnosis, multi-scene and multi-angle image gates, independent GPU
+timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 release matrix.
+
+### Latest execution delta (2026-08-12)
+
+- C5 slab/facing mapping fix: PASS on material 320x180 (`gdfHits=42`, `cacheLookupHits=23`), material 800x450 (`160`, `179`), and Cornell 320x180 (`607`, `2`); artifacts are under `artifacts/lumengi/C5/*slabfix-20260812/`.
+- The fix removes the exact capture-face-plane false reject but keeps generation/state/metadata/visibility fences. High coverage/page reject counts and O(cards) lookup remain open quality/performance work.
+- The 800x450 and Cornell JSON reports were written successfully; Mogwai was terminated after artifact write and verified absent. No completion claim is made for GPU timing/VRAM, soak, rough-specular/transmission, or C10-C12.
+- Profiler calibration is now wired to explicit production properties. At 640x360, 20 warmup + 60 capture, whole-frame GPU P95/P99/max are `5.416/5.554/5.554 ms`; LumenGI lane P95/P99/max are `4.740/4.986/5.090 ms` (`artifacts/lumengi/benchmark/c5-slab-production-640x360-20260812/`). This is a calibration PASS only; 800/1280, VRAM, three-run and soak gates remain open.
+- Follow-up production profiler runs completed at 800x450 and 1280x720. Whole-frame GPU P95/P99/max are `7.095/7.312/7.475 ms` and `13.252/13.596/13.804 ms`; LumenGI P95/P99/max are `6.687/6.724/6.764 ms` and `12.648/12.769/12.905 ms`. Artifacts: `artifacts/lumengi/benchmark/c5-slab-production-800x450-20260812/` and `artifacts/lumengi/benchmark/c5-slab-production-1280x720-20260812/`. Short calibration only; repeat/VRAM/soak gates remain open.
+- Final Release rebuild provenance: post-build material cache-on 320x180 gate remains `PASS` (`gdfHits=42`, `cacheLookupHits=23`) at `artifacts/lumengi/C5/gdf-probe-router-material-cache-on-postbuild-20260812/`; JSON written and Mogwai cleanup verified.
+- Full 1280x720 production stress sample completed with 120 warmup + 600 capture frames: whole-frame GPU P95/P99/max `13.378/13.565/14.252 ms`; LumenGI `12.628/12.732/12.911 ms`; no fatal/E_INVALIDARG/validation/device-removed error (`artifacts/lumengi/benchmark/c5-slab-production-1280x720-20260812-full600/`). Three-run, VRAM-budget and multi-hour soak remain open.
+- Two independent 1280x720/60-frame repeats completed: whole-frame P95/P99/max `13.481/13.585/13.640 ms` and `13.381/13.550/13.658 ms`; LumenGI `12.717/12.880/12.880 ms` and `12.610/12.664/12.712 ms`. Together with full600, three timing distributions now exist; VRAM and multi-hour soak remain open.
+- Benchmark manifests now include typed `surface_cache` and `screen_probe` stats. The 640x360 stats run records 90 allocated/completed pages, 460800 resident bytes, zero generation/state rejects, 50 GDF hits and zero cache hits on convergence_test (`artifacts/lumengi/benchmark/c5-slab-production-640x360-20260812-stats/`); keep this as a negative cache-coverage control.
+
+### ScreenProbe validity convergence delta (2026-08-12)
+
+- Post-rebuild Cornell/front 800x450 sidecar protocol frames 1/8/32/96 all PASS with 182400 records/checkpoint, generation 2→3 and age 0→1, explicit Invalid/Screen/HWRT backends, finite/non-negative outputs, and no runtime errors (`artifacts/lumengi/screenprobe-convergence/postbytes-20260812/`).
+- Direction-union identity and full UE radiance-history parity (normal/material/moments) remain open; do not infer them from this producer-side sidecar gate.
+
+### Latest image checkpoint (2026-08-12)
+
+- `convergence_test.pyscene` 800x450, 96 sequential frames, front/left/right completed on the current Release binary (`artifacts/lumengi/screenshots/convergence-test-resolved-20260812/`). Three PNGs and 36 EXRs are finite/non-negative; runtime log has no Fatal/E_INVALIDARG/validation/device-removed errors.
+- Direct shadows and metal reflection are visible. Glass/transmission rows show black/missing-looking regions and remain `PARTIAL/UNSUPPORTED`, because the current RTXDI/LumenGI chain has no transmission producer. Do not claim glass support until the PathTracer+NRD reference is replaced by a production transmission contract.
+
+### Exact byte telemetry delta (2026-08-12)
+
+- Added exact `residentBytes`, `memoryBudgetBytes`, and MiB compatibility fields to `surfaceCacheStats`.
+- Rebuilt Release with `/m:1`; benchmark `artifacts/lumengi/benchmark/c5-slab-production-640x360-exactbytes-20260812/manifest.json` completed with 90 allocated/completed pages, `residentBytes=460800`, `memoryBudgetBytes=536870912`, and zero allocation/generation/state rejects.
+- This is resource-side Surface Cache evidence, not total VRAM or soak closure; GPU-wide memory capture and multi-hour stability remain open.
+
+### Current closure override (2026-08-15)
+
+- C9 direct-plus-diffuse final-color/export equivalence is PASS at
+  `artifacts/lumengi/C9/finalcolor-contract-v4-20260815/`.
+- A2 bounded source/history quality is PASS at
+  `artifacts/lumengi/A2/source-quality/compare-20260815/`, with the four
+  dynamic reset/mutation cases passing; broad multi-scene no-noise remains
+  open.
+- C10 raycast-gridfix producer and consumer contracts are PASS at
+  `artifacts/lumengi/C10/raycast-gridfix-20260815/`; query readback is
+  reconciled but broad probe coverage remains OPEN (97.76% miss fraction,
+  4/32 projected probes in bounds).
+- C5 coverage quality, C6 pressure eventual per-card completion/soak,
+  production rough-specular/transmission, GPU-wide VRAM, and long release
+  matrices remain unchecked. The final completion checklist below therefore
+  stays intentionally unmarked.
+
+### Current closure delta (2026-08-17)
+
+- C5 controlled producer-drift reproduction is now closed for the paired
+  equivalence case: `artifacts/lumengi/C5/producer-isolation-full-full-20260817-cardowner-v3/c5-paired-equivalence.json`
+  is `PASS` at the unchanged `1e-4` tolerance after the card-owner capture
+  tie-break fix. This does not close broad coverage-reject quality, tiny-atlas
+  identity, pressure latency, or release soak gates.
+- C6 pressure event-ledger rerun is `PASS` at
+  `artifacts/lumengi/C6/event-ledger-65536-pressure-20260817/nextframe-gate.json`
+  with 208 samples and zero dropped records; long soak and GPU-wide VRAM remain
+  open.
+- A2 dynamic transition runs (static/camera-cut/scene-reload/
+  lighting-generation/material-geometry) now each have five real PNG/EXR
+  checkpoints and pass reset/generation telemetry under
+  `artifacts/lumengi/A2/dynamic-*-20260817/`; low-frequency mottle keeps the
+  production no-noise checklist open.
+
+- C6 tiny-atlas replay `artifacts/lumengi/C6/tiny-sphere-drain-replay-20260818/`
+  now consumes explicit `surfaceCacheEvents` identity. It reports 160 sampled
+  frames, 48 distinct card IDs, 16 page IDs, eviction/stale-owner transitions,
+  and passes the strict next-frame gate. Long soak, GPU-wide VRAM, and broad
+  mutation coverage remain unchecked.
+
+### Current closure delta (2026-08-20)
+
+- C9 RenderGraph endpoint exposure is corrected: the resolved composite is the
+  first marked output, so the same-process unmark/recompile transition remains
+  readable in `artifacts/lumengi/C9/same-process-endpoint-20260820-v5/`.
+  Runtime shader compilation and finite/non-negative direct+indirect output are
+  bounded PASS. Mark-on/off still differs (`meanAbsError=2.339e-3`,
+  `maxAbsError=0.1559`), so strict export equivalence remains open.
+- The C10 two-phase coverage PASS, C6 pressure/drain PASS, and 113/113 Lumen
+  CPU tests remain valid. A2 multi-scene no-noise sidecars, C5 broad coverage,
+  GPU-wide VRAM/30-minute+ soak, and production rough-specular/transmission
+  remain OPEN/BLOCKED; do not mark the final completion checklist below.
+- Offline evidence tooling is complete: A2 linear sidecar validation and the
+  strict S2 30-minute/2-hour launcher pass self-tests. They preserve
+  `BLOCKED`/`OPEN` when runtime sidecars, authoritative VRAM, or long-duration
+  provenance are absent; they do not close production gates by themselves.
+- The A2 linear sidecars for Cornell and Arcade now report `PASS` across all
+  five transition cases and checkpoints `[1, 8, 16, 32, 64]`; this closes the
+  measured raw/resolved variance gate, not C9 export equivalence or release
+  soak.
+
+### Current closure delta (2026-08-22)
+
+- Mogwai now exposes the live renderer device through the additive read-only
+  `m.device.info` binding. The Release build and a 60-second D3D12 smoke prove
+  authoritative RTX 2060 SUPER / Direct3D 12 provenance.
+- C9 same-frame retained-resource evidence is `PASS_BOUNDED` only: the marked
+  composite resource is read again after metadata unmark with zero producer
+  executions and byte-identical output. Strict recompiled export-on/off
+  equivalence remains open (`mean=3.5627e-5`, `max=5.2490e-3` in the fresh
+  replay artifact), so the final checklist remains unmarked.
+- S2 dynamic churn reached 1800 seconds / 108000 frames with live provenance.
+  The required two-hour material/reload/resize phase failed after about 422.6
+  seconds with `MemoryError: bad allocation` from `m.renderFrame()` and no child
+  artifact. Keep S2 release soak `BLOCKED`; diagnose renderer/Surface Cache
+  resource ownership rather than reducing the churn workload.
+- C6 bounded lifecycle, C10 two-phase coverage, and A2 linear sidecar gates
+  remain valid bounded passes. Rough-specular/transmission are diagnostic only;
+  production shutdown is not authorized until C9 strict equivalence, S2 soak,
+  and the remaining release gates close.
+
+### Current closure delta (2026-08-30)
+
+- Material-only S2 isolation completed 1200 logical seconds / 72,000 frames with
+  1,201 material mutations and complete `surfaceCacheStats`/`m.device`
+  provenance at `artifacts/lumengi/release/soak-isolation-20260830-material-1200s/churn.json`;
+  no allocation failure occurred. This is diagnostic evidence and is not a
+  release soak substitute.
+- `Mogwai::Renderer::setScene()` now fences before and after replacing an
+  existing scene so scene-scoped deferred GPU resources are reclaimed between
+  reloads. Release `Mogwai` rebuilt with `--parallel 1`, CodeGraph sync and all
+  dependency-free self-tests pass.
+- Re-run the strict two-hour churn after this guard. Keep S2 `BLOCKED` until a
+  complete post-fix child artifact and authoritative launcher/gate PASS exist;
+  do not lower cadence, alter thresholds, or authorize shutdown meanwhile.
 
 ## 21. 最终完成条件
 

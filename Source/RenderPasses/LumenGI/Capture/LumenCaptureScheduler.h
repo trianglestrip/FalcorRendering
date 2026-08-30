@@ -109,6 +109,12 @@ static constexpr uint32_t kLumenCaptureDefaultMaxPagesPerFrame = 64;
 ///< Guards against stalls if the root drops a completion (e.g. capture pass skipped).
 static constexpr uint32_t kLumenCaptureDefaultInFlightTimeoutFrames = 8;
 
+// Prevent a high-priority dirty card from monopolizing a tiny capture budget forever.
+// Once a card has waited this many scheduling passes it is promoted ahead of the normal
+// geometric priority. This mirrors UE's starvation protection in the surface-cache request
+// queue and is required for deterministic page pressure/eviction tests.
+static constexpr uint32_t kLumenCaptureStarvationPromotionFrames = 8;
+
 ///< Per-card scheduling state machine maintained by the scheduler.
 ///
 ///<     (dirty in scene / needsCapture)              allocatePage() succeeds
@@ -157,6 +163,9 @@ struct LumenCaptureFrameStats
     uint32_t releasedPages = 0;      ///< Pages released because their card vanished/unsupported.
     uint32_t lostPages = 0;          ///< Pages evicted/reallocated out from under a card.
     uint32_t touchCalls = 0;         ///< Explicit touchPage() calls (re-captures; allocations are implicitly touched).
+    uint32_t lastCommandCardID = kLumenCardInvalidID; ///< Last emitted card ID, or invalid when no command was emitted.
+    uint32_t lastCommandPageID = kInvalidPageID;      ///< Page of the last emitted command.
+    uint32_t lastCommandGeneration = 0;               ///< Generation of the last emitted command.
 };
 
 ///< Per-frame output of scheduleFrame(). Commands are sorted by capture priority
@@ -182,12 +191,16 @@ struct LumenCaptureSchedulerStats
     uint64_t totalReleases = 0;           ///< Pages released (unsupported/removed cards).
     uint64_t totalLostPages = 0;          ///< Pages evicted out from under a card.
     uint64_t totalTouches = 0;            ///< Explicit touchPage() calls.
+    uint64_t totalRequestDeduplications = 0; ///< Dirty/pending sources collapsed into one work item.
     uint64_t completedCaptures = 0;       ///< Commands completed through completeCaptures().
     double averageQueuedFrames = 0.0;     ///< Total queued frames / completed captures.
     uint32_t maxQueuedFrames = 0;         ///< Longest card queue wait (dirty -> completed).
     uint32_t pendingQueueDepth = 0;       ///< Cards in PendingAllocation right now.
     uint32_t maxPendingDepth = 0;         ///< Deepest pending queue ever reached.
     uint64_t structuralRebuildCount = 0;  ///< scheduleFrame() calls carrying Geometry/MeshesChanged.
+    uint32_t lastCommandCardID = kLumenCardInvalidID; ///< Last emitted card ID.
+    uint32_t lastCommandPageID = kInvalidPageID;      ///< Page of the last emitted command.
+    uint32_t lastCommandGeneration = 0;               ///< Generation of the last emitted command.
 };
 
 /**
@@ -244,6 +257,15 @@ public:
     void completeCaptures(const std::vector<LumenCaptureCommand>& commands);
 
     /**
+     * @brief Check whether a specific emitted command was accepted as Resident.
+     *
+     * This is intentionally separate from completeCaptures(). The root pass uses it to
+     * advance card-specific request telemetry only after the scheduler's page and generation
+     * validation succeeds; command emission alone is not capture completion.
+     */
+    bool isCaptureComplete(const LumenCaptureCommand& command) const;
+
+    /**
      * @brief Scene reload/reset: release every page held by the scheduler and clear the
      * whole state machine (records, pending queue, statistics, frame index).
      *
@@ -281,6 +303,42 @@ public:
     ///< Cards currently waiting for a page (PendingAllocation).
     uint32_t getPendingCount() const { return countPending(); }
 
+    /**
+     * @brief Queue a host-validated demand request for a card.
+     *
+     * GPU feedback is consumed by the root before scheduleFrame(). The request is merged into
+     * the same per-card worklist as dirty/evicted cards, so page allocation, priority ordering,
+     * budget enforcement and generation-safe completion remain centralized here.
+     *
+     * @return true when this call changed the card's queued state; false for an invalid,
+     * unsupported or already queued card.
+     */
+    bool enqueueFeedbackRequest(uint32_t cardIndex)
+    {
+        if (cardIndex >= mNeedsCapture.size() || !isCardSupported(cardIndex))
+            return false;
+        if (mNeedsCapture[cardIndex])
+        {
+            ++mTotalRequestDeduplications;
+            return false;
+        }
+        mNeedsCapture[cardIndex] = 1;
+        return true;
+    }
+
+    /**
+     * @brief Query whether a feedback request would be a new scheduler work item.
+     *
+     * This is intentionally read-only.  Surface Cache telemetry uses it to
+     * distinguish a new miss request from a repeated GPU miss for a card that is
+     * already queued by dirty/in-flight work; repeated misses must not create
+     * false N->N+1 publication events.
+     */
+    bool canAcceptFeedbackRequest(uint32_t cardIndex) const
+    {
+        return cardIndex < mNeedsCapture.size() && isCardSupported(cardIndex) && !mNeedsCapture[cardIndex];
+    }
+
 private:
     struct CardRecord
     {
@@ -293,6 +351,7 @@ private:
     {
         uint32_t cardIndex = kLumenCardInvalidID;
         float priority = 0.f;
+        uint32_t queuedFrames = 0;
     };
 
     ///< Release pages of vanished/unsupported cards and detect evicted pages. Also sizes the
@@ -333,11 +392,15 @@ private:
     uint64_t mTotalReleases = 0;
     uint64_t mTotalLostPages = 0;
     uint64_t mTotalTouches = 0;
+    uint64_t mTotalRequestDeduplications = 0;
     uint64_t mTotalQueuedFrames = 0;
     uint64_t mCompletedCaptureCount = 0;
     uint32_t mMaxQueuedFrames = 0;
     uint32_t mMaxPendingDepth = 0;
     uint64_t mStructuralRebuildCount = 0;
+    uint32_t mLastCommandCardID = kLumenCardInvalidID;
+    uint32_t mLastCommandPageID = kInvalidPageID;
+    uint32_t mLastCommandGeneration = 0;
     LumenCaptureFrameStats mLastFrameStats;
 };
 
@@ -373,12 +436,21 @@ LumenCaptureFrame LumenCaptureScheduler<TCardScene, TPageCache>::scheduleFrame(F
     mWorklist.clear();
     const auto addWorkItem = [this, cardCount](uint32_t cardIndex)
     {
-        if (cardIndex >= cardCount || mInWorklist[cardIndex])
+        if (cardIndex >= cardCount)
         {
             return;
         }
+        if (mInWorklist[cardIndex])
+        {
+            ++mTotalRequestDeduplications;
+            return;
+        }
         mInWorklist[cardIndex] = 1;
-        mWorklist.push_back(WorkItem{cardIndex, mpCardScene->getCard(cardIndex).priority});
+        mWorklist.push_back(WorkItem{
+            cardIndex,
+            mpCardScene->getCard(cardIndex).priority,
+            cardIndex < mQueuedFrames.size() ? mQueuedFrames[cardIndex] : 0u,
+        });
     };
     for (uint32_t cardIndex : mpCardScene->getDirtyCardIndices())
     {
@@ -407,6 +479,12 @@ LumenCaptureFrame LumenCaptureScheduler<TCardScene, TPageCache>::scheduleFrame(F
         mWorklist.end(),
         [](const WorkItem& lhs, const WorkItem& rhs)
         {
+            const bool lhsPromoted = lhs.queuedFrames >= kLumenCaptureStarvationPromotionFrames;
+            const bool rhsPromoted = rhs.queuedFrames >= kLumenCaptureStarvationPromotionFrames;
+            if (lhsPromoted != rhsPromoted)
+            {
+                return lhsPromoted;
+            }
             if (lhs.priority != rhs.priority)
             {
                 return lhs.priority > rhs.priority;
@@ -493,6 +571,12 @@ LumenCaptureFrame LumenCaptureScheduler<TCardScene, TPageCache>::scheduleFrame(F
         mNeedsCapture[item.cardIndex] = 0;
         mEmitted[item.cardIndex] = 1;
         frame.commands.push_back(cmd);
+        stats.lastCommandCardID = cmd.cardIndex;
+        stats.lastCommandPageID = cmd.pageID;
+        stats.lastCommandGeneration = cmd.generation;
+        mLastCommandCardID = cmd.cardIndex;
+        mLastCommandPageID = cmd.pageID;
+        mLastCommandGeneration = cmd.generation;
         --budget;
     }
 
@@ -589,6 +673,17 @@ void LumenCaptureScheduler<TCardScene, TPageCache>::completeCaptures(const std::
 }
 
 template <typename TCardScene, typename TPageCache>
+bool LumenCaptureScheduler<TCardScene, TPageCache>::isCaptureComplete(const LumenCaptureCommand& command) const
+{
+    if (command.cardIndex >= mRecords.size())
+        return false;
+    const CardRecord& record = mRecords[command.cardIndex];
+    return record.state == LumenCaptureCardState::Resident && record.pageID == command.pageID &&
+        record.generation == command.generation && mpPageCache->isPageAllocated(command.pageID) &&
+        mpPageCache->getGeneration(command.pageID) == command.generation;
+}
+
+template <typename TCardScene, typename TPageCache>
 void LumenCaptureScheduler<TCardScene, TPageCache>::reset()
 {
     for (CardRecord& record : mRecords)
@@ -615,11 +710,15 @@ void LumenCaptureScheduler<TCardScene, TPageCache>::reset()
     mTotalReleases = 0;
     mTotalLostPages = 0;
     mTotalTouches = 0;
+    mTotalRequestDeduplications = 0;
     mTotalQueuedFrames = 0;
     mCompletedCaptureCount = 0;
     mMaxQueuedFrames = 0;
     mMaxPendingDepth = 0;
     mStructuralRebuildCount = 0;
+    mLastCommandCardID = kLumenCardInvalidID;
+    mLastCommandPageID = kInvalidPageID;
+    mLastCommandGeneration = 0;
     mLastFrameStats = LumenCaptureFrameStats{};
 }
 
@@ -727,6 +826,7 @@ LumenCaptureSchedulerStats LumenCaptureScheduler<TCardScene, TPageCache>::getSta
     stats.totalReleases = mTotalReleases;
     stats.totalLostPages = mTotalLostPages;
     stats.totalTouches = mTotalTouches;
+    stats.totalRequestDeduplications = mTotalRequestDeduplications;
     stats.completedCaptures = mCompletedCaptureCount;
     stats.averageQueuedFrames = mCompletedCaptureCount != 0
         ? static_cast<double>(mTotalQueuedFrames) / static_cast<double>(mCompletedCaptureCount)
@@ -735,6 +835,9 @@ LumenCaptureSchedulerStats LumenCaptureScheduler<TCardScene, TPageCache>::getSta
     stats.pendingQueueDepth = countPending();
     stats.maxPendingDepth = mMaxPendingDepth;
     stats.structuralRebuildCount = mStructuralRebuildCount;
+    stats.lastCommandCardID = mLastCommandCardID;
+    stats.lastCommandPageID = mLastCommandPageID;
+    stats.lastCommandGeneration = mLastCommandGeneration;
     return stats;
 }
 } // namespace Falcor

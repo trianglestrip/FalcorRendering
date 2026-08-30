@@ -218,6 +218,10 @@ CPU_TEST(LumenCaptureScheduler_PriorityOrderedCaptures)
     }
 
     scheduler.completeCaptures(frame.commands);
+    for (const auto& command : frame.commands)
+    {
+        EXPECT_TRUE(scheduler.isCaptureComplete(command));
+    }
     EXPECT_EQ(scene.dirtyCount(), 0u);
     EXPECT_TRUE(scheduler.getCardState(6) == LumenCaptureCardState::Resident);
     EXPECT_EQ(cache.getAllocatedPageCount(), 18u);
@@ -338,14 +342,15 @@ CPU_TEST(LumenCaptureScheduler_AtlasFullPendingRetryStarvation)
     }
 
     // Frame 11: the frame-6 pages (last touched at frame 6) pass the 5-frame residency
-    // window. The cards whose pages are evicted during this frame (16..31) are only
-    // detected next frame, so the worklist is the first cohort (0..15) plus the pending
-    // cards: 16 commands, 88 failures.
+    // window. Starvation promotion has now aged the pending cohort past the fairness
+    // threshold, so cards 32..47 are selected instead of allowing the original high
+    // priority cohort to monopolize the atlas. This is the deterministic anti-starvation
+    // behavior required by the production pressure gate.
     LumenCaptureFrame frame11 = scheduler.scheduleFrame(IScene::UpdateFlags::None);
     EXPECT_EQ(frame11.commands.size(), 16u);
     for (uint32_t i = 0; i < 16; ++i)
     {
-        EXPECT_EQ(frame11.commands[i].cardIndex, i);
+        EXPECT_EQ(frame11.commands[i].cardIndex, 32u + i);
         EXPECT_EQ(frame11.commands[i].pageID, i + 1);
         EXPECT_EQ(cache.getGeneration(frame11.commands[i].pageID), 3u);
     }

@@ -5,6 +5,7 @@ variables so the same script works in local runs and CI without argument parsing
 """
 
 from pathlib import Path
+import json
 import os
 import sys
 import traceback
@@ -43,13 +44,28 @@ CONFIGURATION = {
     "scene": os.getenv("LUMENGI_BENCHMARK_SCENE"),
     "quality_preset": os.getenv("LUMENGI_BENCHMARK_QUALITY", "High"),
     "random_seed": int(os.getenv("LUMENGI_BENCHMARK_SEED", "1")),
+    "pass_properties": {},
 }
+
+_properties_text = os.getenv("LUMENGI_BENCHMARK_PROPERTIES", "").strip()
+if _properties_text:
+    try:
+        _properties = json.loads(_properties_text)
+    except json.JSONDecodeError as error:
+        raise ValueError("LUMENGI_BENCHMARK_PROPERTIES must be a JSON object") from error
+    if not isinstance(_properties, dict):
+        raise ValueError("LUMENGI_BENCHMARK_PROPERTIES must be a JSON object")
+    CONFIGURATION["pass_properties"] = _properties
 
 
 def collect_pass_data(graph):
     lumen_pass = graph.getPass("LumenGI")
     properties = json_safe(lumen_pass.getDictionary())
-    runtime_stats = json_safe(getattr(lumen_pass, "stats", {}))
+    runtime_stats = {
+        "surface_cache": json_safe(getattr(lumen_pass, "surfaceCacheStats", {})),
+        "screen_probe": json_safe(getattr(lumen_pass, "screenProbeStats", {})),
+        "pass": json_safe(getattr(lumen_pass, "stats", {})),
+    }
     return properties, runtime_stats
 
 
@@ -68,7 +84,9 @@ def run_benchmark():
     if graph is None:
         raise RuntimeError("scripts/LumenGI.py did not create the LumenGI render graph")
 
-    graph.updatePass("LumenGI", {"qualityPreset": CONFIGURATION["quality_preset"]})
+    pass_properties = {"qualityPreset": CONFIGURATION["quality_preset"]}
+    pass_properties.update(CONFIGURATION["pass_properties"])
+    graph.updatePass("LumenGI", pass_properties)
     if CONFIGURATION["scene"]:
         m.loadScene(CONFIGURATION["scene"])
 

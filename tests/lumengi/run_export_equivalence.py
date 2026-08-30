@@ -172,8 +172,12 @@ def _create_graph(filter_spec, policy, index):
     # BlitPass outputs are marked in all policies.  They are neutral readback
     # sentinels, not a final-color composite and not replacements for the
     # resolvedDiffuseGI production channel.
-    graph.addPass(createPass("BlitPass", {"filter": "Linear"}), "ResolvedReadback")
-    graph.addPass(createPass("BlitPass", {"filter": "Linear"}), "DiffuseReadback")
+    # Preserve the linear HDR contract in the diagnostic readback sentinels.
+    # BlitPass defaults to RGBA8 when outputFormat is omitted, which quantizes
+    # GI and makes the sentinel unsuitable even for health/equivalence checks.
+    sentinel_options = {"filter": "Linear", "outputFormat": "RGBA16Float"}
+    graph.addPass(createPass("BlitPass", sentinel_options), "ResolvedReadback")
+    graph.addPass(createPass("BlitPass", sentinel_options), "DiffuseReadback")
     graph.addEdge("LumenGI.resolvedDiffuseGI", "ResolvedReadback.src")
     graph.addEdge("LumenGI.diffuseGI", "DiffuseReadback.src")
     for output in SENTINEL_OUTPUTS:

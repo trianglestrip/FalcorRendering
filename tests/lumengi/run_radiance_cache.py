@@ -60,6 +60,7 @@ import numpy as np
 RESOLUTION = (640, 360)
 FRAME_RATE = 60
 SCENE_CORNELL = "test_scenes/cornell_box.pyscene"
+SCENE_PRIMARY = os.environ.get("LUMEN_RC_SCENE", SCENE_CORNELL)
 SCENE_POINTLIGHT = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "scenes", "cornell_pointlight.pyscene")
 )
@@ -68,9 +69,11 @@ OUT_JSON = os.environ.get("LUMEN_RADIANCE_CACHE_OUT", "artifacts/lumengi/S7/radi
 USE_RADIANCE_CACHE = bool(os.environ.get("LUMEN_RADIANCE_CACHE_ENABLE", "") != "0")
 
 # S7_TODO[cache_channel] / S7_TODO[stats_channel].
-RADIANCE_CACHE_CHANNELS = ["radianceCache", "radianceCacheStats", "radianceCacheHitDist"]
+# Stats are a Python binding, not a render-graph texture. Keep channel probing
+# separate so an optional dictionary cannot be mistaken for a produced image.
+RADIANCE_CACHE_CHANNELS = ["radianceCache", "radianceCacheHitDist", "radianceCacheValidity"]
 RADIANCE_CACHE_STATS_BINDING = "radianceCacheStats"
-RADIANCE_CACHE_PROP = "useRadianceCache"  # parsed (LumenGI.cpp:345), not wired pre-S7.
+RADIANCE_CACHE_PROP = "useRadianceCache"  # C10 bounded producer/fallback; lifecycle gates remain open.
 
 # Trajectory (fixed, same spirit as run_temporal.py).
 WARMUP_FRAMES = int(os.environ.get("LUMEN_RC_WARMUP_FRAMES", "8"))
@@ -80,6 +83,17 @@ PAN_DELTA = float3(0.05, 0.0, -0.02)
 LIGHT_MOVE_STEPS = int(os.environ.get("LUMEN_RC_LIGHT_STEPS", "5"))
 LIGHT_MOVE_DELTA = float3(0.02, -0.02, 0.0)
 SETTLE_FRAMES = int(os.environ.get("LUMEN_RC_SETTLE_FRAMES", "12"))
+RUN_DYNAMIC_SCENE = os.environ.get("LUMEN_RC_DYNAMIC_SCENE", "1") not in ("0", "false", "off")
+FAR_FIELD_CAMERA_Z = os.environ.get("LUMEN_RC_FAR_FIELD_CAMERA_Z", "")
+
+# Optional phase metadata for strict C10 coverage runs.  The GPU trajectory is
+# unchanged; these fields only describe which authored camera/scene phase the
+# captured manifest belongs to.  No phase is inferred from counters.
+PHASE_ID = os.environ.get("LUMEN_RC_PHASE_ID", "")
+_phase_level_tokens = os.environ.get("LUMEN_RC_EXPECTED_LEVELS", "").split(",")
+PHASE_EXPECTED_LEVELS = tuple(
+    int(token.strip()) for token in _phase_level_tokens if token.strip().lstrip("-").isdigit()
+)
 
 # S7_TODO gates (placeholders; freeze with root):
 PLATEAU_REL_TOL = 0.05        # resident-bytes plateau: max/min within this.
@@ -93,8 +107,51 @@ SCROLL_CELLS = 2              # camera pan in level-0 cells for the scroll test.
 CAM_START_POS = float3(0, 0.28, 1.2)
 CAM_START_TARGET = float3(0, 0.28, 0)
 CAM_UP = float3(0, 1, 0)
-CAM_FOCAL_LENGTH = 35.0
+# Keep the original short variable and accept the explicit phase-runner name.
+# The latter is used by near-field coverage manifests so camera metadata cannot
+# be confused with the render-pass focal-distance setting.
+CAM_FOCAL_LENGTH = float(
+    os.environ.get("LUMEN_RC_CAMERA_FOCAL_LENGTH", os.environ.get("LUMEN_RC_FOCAL_LENGTH", "35.0"))
+)
 LIGHT_NAME = "LumenGITestPointLight"
+
+
+def _attach_level_coverage(stats):
+    """Materialize explicit host-exported per-level counters for strict C10 gates.
+
+    The values are flattened in the pybind map because Falcor maps cannot carry
+    nested arrays. This helper only reshapes keys with an explicit level prefix;
+    it never derives a level denominator from global counters.
+    """
+    if not isinstance(stats, dict):
+        return stats
+    try:
+        level_count = int(stats.get("coverageLevelCount", 0))
+    except Exception:
+        level_count = 0
+    if level_count <= 0:
+        return stats
+    fields = (
+        ("ProjectedProbeCount", "projectedProbeCount"),
+        ("InBoundsProbeCount", "inBoundsProbeCount"),
+        ("QueryAttempts", "queryAttempts"),
+        ("QueryHits", "queryHits"),
+        ("QueryMisses", "queryMisses"),
+        ("SampleCount", "sampleCount"),
+        ("ValidHitDistanceCount", "validHitDistanceCount"),
+        ("FallbackSampleCount", "fallbackSampleCount"),
+    )
+    records = []
+    for level in range(level_count):
+        prefix = "coverageLevel%d" % level
+        record = {"level": level}
+        if all((prefix + suffix) in stats for suffix, _ in fields):
+            for suffix, name in fields:
+                record[name] = stats[prefix + suffix]
+            records.append(record)
+    if len(records) == level_count:
+        stats["coverageByLevel"] = records
+    return stats
 
 
 # -------------------------------------------------------------------------------------
@@ -497,6 +554,12 @@ def create_lumen_graph(extra_outputs):
     ]:
         graph.addEdge(*edge)
     graph.markOutput("LumenGI.diffuseGI")
+    # Diagnostic producer evidence; this preserves the RGBA16F alpha hit-distance
+    # contract and lets the cache gate distinguish an empty source from an empty
+    # indirection/query result.
+    graph.markOutput("LumenGI.diffuseRadianceHitDist")
+    graph.markOutput("GBufferRT.linearZ")
+    graph.markOutput("GBufferRT.viewW")
     for ch in extra_outputs:
         graph.markOutput("LumenGI." + ch)
     return graph
@@ -530,6 +593,10 @@ def _setup_scene(scene_path, camera_pos=None, camera_target=None):
     m.clock.framerate = FRAME_RATE
     m.clock.time = 0
     m.clock.pause()
+    # Keep authored camera pose/target unless an explicit phase override is
+    # supplied, but make the phase focal length an explicit part of the
+    # projection contract for both authored and overridden cameras.
+    m.scene.camera.focalLength = CAM_FOCAL_LENGTH
     if camera_pos is not None and camera_target is not None:
         camera = m.scene.camera
         camera.position = camera_pos
@@ -548,8 +615,108 @@ def render_one(label, phase_records, prev_gi):
     gi = grab("LumenGI.diffuseGI")[..., :3]
     rec = {"phase": label, "frame": int(m.clock.frame),
            "gi_mean": float(gi.mean()),
+           "gi_min": float(gi.min()),
+           "gi_max": float(gi.max()),
            "gi_finite": bool(math.isfinite(float(gi.min())) and math.isfinite(float(gi.max()))),
            "gi_nonneg": bool(float(gi.min()) >= 0.0)}
+    # Keep the cache evidence separate from the legacy diffuse-GI trajectory.
+    # A channel being reflected is not enough: record finite/nonnegative and
+    # non-zero coverage for both the radiance and hit-distance contracts.
+    cache_metrics = {}
+    for channel in RADIANCE_CACHE_CHANNELS:
+        try:
+            tex = grab("LumenGI." + channel)
+            if channel == "radianceCacheValidity":
+                mask = np.asarray(tex, dtype=np.uint64)
+                cache_metrics[channel] = {
+                    "finite": bool(np.isfinite(mask.astype(np.float64)).all()),
+                    "nonnegative": True,
+                    "sampleCount": int(mask.size),
+                    "min": int(mask.min()) if mask.size else 0,
+                    "max": int(mask.max()) if mask.size else 0,
+                    "maskMean": float(mask.mean()),
+                    "maskMax": int(mask.max()) if mask.size else 0,
+                    "validFraction": float(np.count_nonzero(mask != 0) / max(1, mask.size)),
+                    "hitFraction": float(np.count_nonzero((mask & 1) != 0) / max(1, mask.size)),
+                    "skyFraction": float(np.count_nonzero((mask & 2) != 0) / max(1, mask.size)),
+                }
+                continue
+            rgb = np.asarray(tex[..., :3], dtype=np.float64)
+            alpha = np.asarray(tex[..., 3], dtype=np.float64) if tex.ndim >= 3 and tex.shape[-1] > 3 else None
+            cache_metrics[channel] = {
+                "finite": bool(np.isfinite(rgb).all() and (alpha is None or np.isfinite(alpha).all())),
+                "nonnegative": bool((rgb >= 0.0).all() and (alpha is None or (alpha >= 0.0).all())),
+                "sampleCount": int(rgb.shape[0] * rgb.shape[1]) if rgb.ndim >= 2 else int(rgb.size),
+                "valueMin": float(min(float(rgb.min()), float(alpha.min()))) if alpha is not None else float(rgb.min()),
+                "valueMax": float(max(float(rgb.max()), float(alpha.max()))) if alpha is not None else float(rgb.max()),
+                "rgbMean": float(rgb.mean()),
+                "rgbMax": float(rgb.max()),
+                "nonzeroRgbFraction": float(np.count_nonzero(rgb > 1e-6) / max(1, rgb.size)),
+                "alphaMean": float(alpha.mean()) if alpha is not None else 0.0,
+                "alphaMin": float(alpha.min()) if alpha is not None else 0.0,
+                "alphaMax": float(alpha.max()) if alpha is not None else 0.0,
+                # Hit distance 65504 is the explicit fp16 miss sentinel. Keep
+                # valid-hit coverage separate from RGB so legal black radiance
+                # is not discarded as an invalid sample.
+                "validHitFraction": float(
+                    np.count_nonzero((alpha > 0.0) & (alpha < 65504.0)) / max(1, alpha.size)
+                ) if alpha is not None else 0.0,
+            }
+        except Exception as exc:
+            cache_metrics[channel] = {"error": str(exc)}
+    validity = cache_metrics.get("radianceCacheValidity", {})
+    validity_summary = {
+        "finite": validity.get("finite", False),
+        "hitFraction": validity.get("hitFraction", 0.0),
+        "skyFraction": validity.get("skyFraction", 0.0),
+        "validFraction": validity.get("validFraction", 0.0),
+    }
+    for channel in ("radianceCache", "radianceCacheHitDist"):
+        metrics = cache_metrics.get(channel)
+        if not isinstance(metrics, dict) or "error" in metrics:
+            continue
+        metrics["validity"] = dict(validity_summary)
+        metrics["hitDistance"] = {
+            "finite": metrics.get("finite", False),
+            "nonMissFraction": metrics.get("validHitFraction", 0.0),
+            "missSentinel": 65504.0,
+        }
+    rec["radianceCache"] = cache_metrics
+    try:
+        rec["radianceCacheStats"] = _attach_level_coverage(
+            dict(m.activeGraph.getPass("LumenGI").radianceCacheStats)
+        )
+    except Exception as exc:
+        rec["radianceCacheStats"] = {"error": str(exc)}
+    try:
+        raw = np.asarray(grab("LumenGI.diffuseRadianceHitDist"), dtype=np.float64)
+        raw_rgb = raw[..., :3]
+        rec["rawSource"] = {
+            "finite": bool(np.isfinite(raw).all()),
+            "nonnegative": bool((raw_rgb >= 0.0).all()),
+            "rgbMean": float(raw_rgb.mean()),
+            "rgbMax": float(raw_rgb.max()),
+            "nonzeroRgbFraction": float(np.count_nonzero(raw_rgb > 1e-6) / max(1, raw_rgb.size)),
+            "alphaMean": float(raw[..., 3].mean()) if raw.shape[-1] > 3 else 0.0,
+            "alphaMax": float(raw[..., 3].max()) if raw.shape[-1] > 3 else 0.0,
+            "validHitFraction": float(
+                np.count_nonzero((raw[..., 3] > 0.0) & (raw[..., 3] < 65504.0)) /
+                max(1, raw[..., 3].size)
+            ) if raw.shape[-1] > 3 else 0.0,
+        }
+    except Exception as exc:
+        rec["rawSource"] = {"error": str(exc)}
+    try:
+        depth = np.asarray(m.activeGraph.get_output("GBufferRT.linearZ").to_numpy(), dtype=np.float64)
+        view = np.asarray(m.activeGraph.get_output("GBufferRT.viewW").to_numpy(), dtype=np.float64)
+        rec["gbufferGuide"] = {
+            "depthPositiveFraction": float(np.count_nonzero(depth[..., 0] > 0.0) / max(1, depth[..., 0].size)),
+            "depthMax": float(depth[..., 0].max()),
+            "viewFinite": bool(np.isfinite(view).all()),
+            "viewMean": [float(x) for x in view[..., :3].mean(axis=(0, 1))],
+        }
+    except Exception as exc:
+        rec["gbufferGuide"] = {"error": str(exc)}
     if prev_gi is not None:
         rec["gi_framediff"] = float(np.abs(gi - prev_gi).mean())
     phase_records.append(rec)
@@ -567,12 +734,9 @@ def run_gpu_section():
         if probe_channel(ch):
             available.append(ch)
 
+    # The active graph is created below; defer the binding lookup until after
+    # setActiveGraph() so a valid Python property is not misreported as missing.
     binding = None
-    try:
-        binding = m.activeGraph.getPass("LumenGI").radianceCacheStats
-        report["radianceCacheStats"] = dict(binding)
-    except Exception as exc:
-        report["radianceCacheStats_error"] = str(exc)
 
     report["channels_available"] = available
     report["series"] = []
@@ -582,14 +746,46 @@ def run_gpu_section():
     graph = create_lumen_graph(extra)
     m.addGraph(graph)
     m.setActiveGraph(graph)
+    try:
+        binding = m.activeGraph.getPass("LumenGI").radianceCacheStats
+        report["radianceCacheStats"] = _attach_level_coverage(dict(binding))
+    except Exception as exc:
+        report["radianceCacheStats_error"] = str(exc)
 
     prev_gi = None
     resident_samples = []
 
-    # Static (VRAM plateau phase).
-    _setup_scene(SCENE_CORNELL, CAM_START_POS, CAM_START_TARGET)
+    # Static (VRAM plateau phase).  Cornell keeps the historical near-field baseline;
+    # sphere_array (or another explicitly selected scene) is allowed to retain its authored
+    # far camera so screen samples exercise static clipmap levels instead of only level 0.
+    if SCENE_PRIMARY == SCENE_CORNELL:
+        _setup_scene(SCENE_PRIMARY, CAM_START_POS, CAM_START_TARGET)
+    elif FAR_FIELD_CAMERA_Z:
+        # Explicit far-field validation camera.  Keep the authored sphere-array
+        # orientation as the default, but allow a bounded probe-coverage run to
+        # move the camera toward the array center without changing production
+        # scene assets.  Invalid values remain authored-camera behavior.
+        try:
+            far_z = float(FAR_FIELD_CAMERA_Z)
+            if math.isfinite(far_z):
+                _setup_scene(SCENE_PRIMARY, float3(0.0, 0.0, far_z), float3(0.0, 0.0, 0.0))
+            else:
+                _setup_scene(SCENE_PRIMARY)
+        except (TypeError, ValueError):
+            _setup_scene(SCENE_PRIMARY)
+    else:
+        _setup_scene(SCENE_PRIMARY)
     for i in range(WARMUP_FRAMES):
         rec, prev_gi = render_one("warmup", phase_records, prev_gi)
+    # The CPU scheduler is created lazily by LumenGI::execute(), so capture a
+    # post-render snapshot as well as the pre-render binding probe.
+    if binding is not None:
+        try:
+            report["radianceCacheStatsAfterWarmup"] = _attach_level_coverage(
+                dict(m.activeGraph.getPass("LumenGI").radianceCacheStats)
+            )
+        except Exception as exc:
+            report["radianceCacheStats_afterWarmup_error"] = str(exc)
     for i in range(STATIC_FRAMES):
         rec, prev_gi = render_one("static", phase_records, prev_gi)
         if binding is not None:
@@ -603,6 +799,13 @@ def run_gpu_section():
                 resident_samples.append(float(np.asarray(tex, dtype=np.float32).mean()))
             except Exception:
                 pass
+    if binding is not None:
+        try:
+            report["radianceCacheStatsAfterStatic"] = _attach_level_coverage(
+                dict(m.activeGraph.getPass("LumenGI").radianceCacheStats)
+            )
+        except Exception as exc:
+            report["radianceCacheStats_afterStatic_error"] = str(exc)
     if resident_samples and len(resident_samples) >= 4:
         tail = resident_samples[-4:]
         plateau = (max(tail) - min(tail)) <= PLATEAU_REL_TOL * max(abs(x) for x in tail) or (max(tail) == min(tail))
@@ -622,22 +825,27 @@ def run_gpu_section():
     else:
         verdicts.append(("G1 GPU clipmap scroll (S7_TODO[cache_channel])", "SKIP"))
 
-    # Dynamic light response.
-    prev_gi = None
-    _setup_scene(SCENE_POINTLIGHT, CAM_START_POS, CAM_START_TARGET)
-    for i in range(WARMUP_FRAMES):
-        rec, prev_gi = render_one("light-warmup", phase_records, prev_gi)
-    point_light = m.scene.getLight(LIGHT_NAME)
-    for i in range(LIGHT_MOVE_STEPS):
-        point_light.position = point_light.position + LIGHT_MOVE_DELTA
-        rec, prev_gi = render_one("light-move-%d" % i, phase_records, prev_gi)
-    for i in range(SETTLE_FRAMES):
-        rec, prev_gi = render_one("light-settle", phase_records, prev_gi)
-    if available or binding is not None:
-        verdicts.append(("G4 GPU dynamic light response within %d frames (S7_TODO[stats_channel])"
-                         % LIGHT_RESPONSE_FRAMES, "SKIP"))
+    # Dynamic light response.  A static-only run is useful for clipmap-level
+    # coverage because changing scenes resets the cache epoch and hides the
+    # long-lived level population evidence behind the later scene.
+    if RUN_DYNAMIC_SCENE:
+        prev_gi = None
+        _setup_scene(SCENE_POINTLIGHT, CAM_START_POS, CAM_START_TARGET)
+        for i in range(WARMUP_FRAMES):
+            rec, prev_gi = render_one("light-warmup", phase_records, prev_gi)
+        point_light = m.scene.getLight(LIGHT_NAME)
+        for i in range(LIGHT_MOVE_STEPS):
+            point_light.position = point_light.position + LIGHT_MOVE_DELTA
+            rec, prev_gi = render_one("light-move-%d" % i, phase_records, prev_gi)
+        for i in range(SETTLE_FRAMES):
+            rec, prev_gi = render_one("light-settle", phase_records, prev_gi)
+        if available or binding is not None:
+            verdicts.append(("G4 GPU dynamic light response within %d frames (S7_TODO[stats_channel])"
+                             % LIGHT_RESPONSE_FRAMES, "SKIP"))
+        else:
+            verdicts.append(("G4 GPU dynamic light response (S7_TODO[cache_channel])", "SKIP"))
     else:
-        verdicts.append(("G4 GPU dynamic light response (S7_TODO[cache_channel])", "SKIP"))
+        verdicts.append(("G4 GPU dynamic light response", "SKIP_STATIC_ONLY"))
 
     if available:
         verdicts.append(("S7_TODO Radiance Cache channel '%s' present" % available[0], "PASS"))
@@ -652,13 +860,152 @@ def run_gpu_section():
     return report, verdicts
 
 
+def _strict_counter(value):
+    """Convert the C++ map's numeric values to the strict integer ABI."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, int(round(number)))
+
+
+def _strict_channel_descriptor(gpu_report, channel):
+    records = []
+    for sample in gpu_report.get("series", []):
+        metrics = sample.get("radianceCache", {}).get(channel, {})
+        if isinstance(metrics, dict) and "error" not in metrics:
+            records.append(metrics)
+    if not records:
+        return {
+            "available": False,
+            "sampleCount": 0,
+            "finite": False,
+            "nonnegative": False,
+            "min": 0.0,
+            "max": 0.0,
+        }
+    if channel == "radianceCacheValidity":
+        finite = all(bool(item.get("finite", False)) for item in records)
+        nonnegative = all(bool(item.get("nonnegative", False)) for item in records)
+        minimum = min(float(item.get("min", 0.0)) for item in records)
+        maximum = max(float(item.get("max", item.get("maskMax", 0.0))) for item in records)
+        sample_count = max(_strict_counter(item.get("sampleCount", 0)) for item in records)
+    else:
+        finite = all(bool(item.get("finite", False)) for item in records)
+        nonnegative = all(bool(item.get("nonnegative", False)) for item in records)
+        minimum = min(float(item.get("valueMin", item.get("rgbMin", 0.0))) for item in records)
+        maximum = max(float(item.get("valueMax", item.get("rgbMax", 0.0))) for item in records)
+        sample_count = max(_strict_counter(item.get("sampleCount", 0)) for item in records)
+    return {
+        "available": True,
+        "sampleCount": sample_count,
+        "finite": finite,
+        "nonnegative": nonnegative,
+        "min": minimum,
+        "max": maximum,
+    }
+
+
+def _strict_gpu_manifest(gpu_report):
+    """Project live GPU samples into the frozen consumer-side C10 ABI.
+
+    This is an evidence projection only. It does not synthesize hits, ready
+    frames, or non-black fallback values; every value comes from a captured
+    channel or the LumenGI stats binding.
+    """
+    channels = {
+        channel: _strict_channel_descriptor(gpu_report, channel)
+        for channel in RADIANCE_CACHE_CHANNELS
+    }
+    stats_after = gpu_report.get("radianceCacheStatsAfterWarmup", {})
+    if not isinstance(stats_after, dict):
+        stats_after = {}
+    stats = {
+        "gpuProducerEnabled": _strict_counter(stats_after.get("gpuProducerEnabled", 0)),
+        "gpuInterpolationEnabled": _strict_counter(stats_after.get("gpuInterpolationEnabled", 0)),
+        "requestCount": _strict_counter(stats_after.get("requestCount", 0)),
+        "traceCount": _strict_counter(stats_after.get("traceCount", 0)),
+        "commitCount": _strict_counter(stats_after.get("commitCount", 0)),
+        "readyCount": _strict_counter(stats_after.get("readyCount", 0)),
+        "staleWriteRejects": _strict_counter(stats_after.get("staleWriteRejects", 0)),
+    }
+    frames = []
+    seen_frames = set()
+    # The first Cornell warmup/static trajectory has one monotonic clock. The
+    # later light trajectory intentionally resets the scene and starts a new
+    # epoch, so it is not mixed into this frame-pair proof.
+    for sample in gpu_report.get("series", []):
+        if sample.get("phase") not in ("warmup", "static"):
+            continue
+        frame = _strict_counter(sample.get("frame", 0))
+        if frame in seen_frames:
+            continue
+        raw = sample.get("radianceCacheStats", {})
+        if not isinstance(raw, dict):
+            continue
+        seen_frames.add(frame)
+        frames.append({
+            "frame": frame,
+            "requestCount": _strict_counter(raw.get("requestCount", 0)),
+            "traceCount": _strict_counter(raw.get("traceCount", 0)),
+            "commitCount": _strict_counter(raw.get("commitCount", 0)),
+            "readyCount": _strict_counter(raw.get("readyCount", 0)),
+            "staleWriteRejects": _strict_counter(raw.get("staleWriteRejects", 0)),
+        })
+    frames.sort(key=lambda item: item["frame"])
+    fallback_samples = [
+        sample for sample in gpu_report.get("series", [])
+        if sample.get("gi_finite") is True and sample.get("gi_nonneg") is True
+    ]
+    fallback_max = max((float(sample.get("gi_max", 0.0)) for sample in fallback_samples), default=0.0)
+    fallback = {
+        "observed": bool(fallback_samples),
+        "sampleCount": len(fallback_samples),
+        "finite": bool(fallback_samples) and all(sample.get("gi_finite") is True for sample in fallback_samples),
+        "nonnegative": bool(fallback_samples) and all(sample.get("gi_nonneg") is True for sample in fallback_samples),
+        "nonblack": fallback_max > 0.0,
+        "max": fallback_max,
+        "source": "LumenGI.diffuseGI (explicit fallback output)",
+    }
+    return {
+        "schema": "LumenGI.RadianceCacheGpuGate.v1",
+        "schemaVersion": "LumenGI.RadianceCacheGpuGate.v1",
+        "gpuApiAvailable": bool(all(channels[channel].get("available") for channel in RADIANCE_CACHE_CHANNELS)),
+        "channels": channels,
+        "radianceCacheStats": dict(stats, frames=frames),
+        "fallback": fallback,
+    }
+
+
 def main():
     report = {
         "stage": "S7",
         "script": "run_radiance_cache.py",
         "role": "S7-C Radiance Cache regression (Agent Z15)",
-        "status": "skeleton",
+        "schema": "LumenGI.C10.RadianceCacheProducerGate.v1",
+        "schemaVersion": "LumenGI.C10.RadianceCacheProducerGate.v1",
+        "status": "partial",
+        "finalResolveConnected": False,
         "resolution": list(RESOLUTION),
+        "primaryScene": SCENE_PRIMARY,
+        "phaseId": PHASE_ID or None,
+        "expectedLevels": list(PHASE_EXPECTED_LEVELS) if PHASE_EXPECTED_LEVELS else None,
+        "phaseMetadata": {
+            "phaseId": PHASE_ID or None,
+            "expectedLevels": list(PHASE_EXPECTED_LEVELS) if PHASE_EXPECTED_LEVELS else None,
+            "scene": SCENE_PRIMARY,
+            "camera": {
+                "position": ([0.0, 0.0, float(FAR_FIELD_CAMERA_Z)] if FAR_FIELD_CAMERA_Z else None),
+                "positionSource": "farFieldOverride" if FAR_FIELD_CAMERA_Z else "authoredScene",
+                "farFieldCameraZ": float(FAR_FIELD_CAMERA_Z) if FAR_FIELD_CAMERA_Z else None,
+                "focalLength": CAM_FOCAL_LENGTH,
+            },
+            "trajectory": {
+                "warmupFrames": WARMUP_FRAMES,
+                "staticFrames": STATIC_FRAMES,
+                "dynamicScene": RUN_DYNAMIC_SCENE,
+            },
+        },
         "config": {
             "useRadianceCache": USE_RADIANCE_CACHE,
             "radianceCacheProp": RADIANCE_CACHE_PROP,
@@ -666,6 +1013,8 @@ def main():
             "plateau_rel_tol": PLATEAU_REL_TOL,
             "light_response_frames": LIGHT_RESPONSE_FRAMES,
             "table_size": TABLE_SIZE,
+            "primary_scene": SCENE_PRIMARY,
+            "dynamic_scene": RUN_DYNAMIC_SCENE,
         },
     }
     verdicts = []
@@ -692,12 +1041,26 @@ def main():
 
     gpu_report, gpu_verdicts = run_gpu_section()
     report["gpu"] = gpu_report
+    report["gpuGate"] = _strict_gpu_manifest(gpu_report)
     verdicts.extend(gpu_verdicts)
+
+    # Host-side C10 telemetry is authoritative for whether the final resolve
+    # actually received the cache fallback resources. Keep the top-level field
+    # false when an older artifact has no such evidence.
+    connected = False
+    for rec in report.get("series", []):
+        stats = rec.get("radianceCacheStats", {}) if isinstance(rec, dict) else {}
+        if isinstance(stats, dict) and float(stats.get("finalResolveConnected", 0.0) or 0.0) > 0.5:
+            connected = True
+    warm = gpu_report.get("radianceCacheStatsAfterWarmup", {}) if isinstance(gpu_report, dict) else {}
+    if isinstance(warm, dict) and float(warm.get("finalResolveConnected", 0.0) or 0.0) > 0.5:
+        connected = True
+    report["finalResolveConnected"] = connected
 
     report["verdicts"] = [(name, v) for name, v in verdicts]
     report["summary"] = "PASS" if all(v == "PASS" for _, v in verdicts) else "FAIL"
     if any(v == "SKIP" for _, v in verdicts):
-        report["summary"] = "SKIP" if all(v != "FAIL" for _, v in verdicts) else "FAIL"
+        report["summary"] = "PARTIAL" if all(v != "FAIL" for _, v in verdicts) else "FAIL"
 
     for name, verdict in verdicts:
         print("RADIANCE VERDICT", name, verdict)

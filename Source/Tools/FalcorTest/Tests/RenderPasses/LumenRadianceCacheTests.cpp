@@ -48,6 +48,7 @@ CPU_TEST(LumenRadianceCache_Constants)
     EXPECT_EQ(kRadianceCacheDefaultLevelCount, 6u);
     EXPECT_EQ(kRadianceCacheDefaultBaseExtentMeters, 4.0f);
     EXPECT_EQ(kRadianceCacheDefaultResolution, 8u);
+    EXPECT_EQ(kRadianceCacheMaxResolution, 1024u);
     EXPECT_EQ(kRadianceCacheDefaultRefreshBudgetPerFrame, 64u);
     EXPECT_EQ(kRadianceCacheDefaultMaxSlots, 4096u);
     EXPECT_EQ(kRadianceCacheDefaultMinResidencyFrames, 2u);
@@ -103,6 +104,9 @@ CPU_TEST(LumenRadianceCache_ConstructionClampsInvalidInputs)
     LumenRadianceCache maxed(4.f, 100, 8, 8, 8, 8);
     EXPECT_EQ(maxed.getLevelCount(), 16u);
     EXPECT_EQ(maxed.getMaxSlots(), 8u);
+
+    LumenRadianceCache keySafe(4.f, 1, 4096, 1, 1, 1);
+    EXPECT_EQ(keySafe.getResolution(), kRadianceCacheMaxResolution);
 }
 
 CPU_TEST(LumenRadianceCache_LevelGeometry)
@@ -328,6 +332,45 @@ CPU_TEST(LumenRadianceCache_TickSchedulesBudgetNewSlots)
     EXPECT_EQ(cache.getStats().refreshCount, 64ull);
 }
 
+CPU_TEST(LumenRadianceCache_TickReservesEveryLevelWhenBudgetAllows)
+{
+    // A global distance score must not starve a cold clipmap level. With a
+    // budget >= levelCount the first tick reserves one cold cell per level,
+    // then fills the remaining requests by the normal deterministic ordering.
+    LumenRadianceCache cache(4.f, 6, 8, 4096, 64, 1, 0);
+    const auto& requests = cache.tick();
+    EXPECT_EQ(requests.size(), 64u);
+    std::vector<bool> seen(6u, false);
+    for (const auto& request : requests)
+    {
+        if (request.level < seen.size())
+            seen[request.level] = true;
+    }
+    for (bool levelSeen : seen)
+        EXPECT_TRUE(levelSeen);
+}
+
+CPU_TEST(LumenRadianceCache_TickPopulatesColdStaticLevels)
+{
+    // GPU confidence is fed back asynchronously.  A cold allocated slot must
+    // not starve empty cells in the static clipmap while that feedback is
+    // pending; after enough bounded ticks, level 1 must receive ownership.
+    LumenRadianceCache cache(4.f, 2, 8, 1024, 32, 1, 0);
+    for (uint32_t frame = 0; frame < 20u; ++frame)
+        cache.tick();
+
+    bool hasStaticProbe = false;
+    for (uint32_t slot = 1u; slot <= cache.getMaxSlots(); ++slot)
+    {
+        if (cache.getSlot(slot).allocated && cache.getSlot(slot).level == 1u)
+        {
+            hasStaticProbe = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(hasStaticProbe);
+}
+
 CPU_TEST(LumenRadianceCache_TickDeterministicAcrossInstances)
 {
     auto collectKeys = []()
@@ -397,6 +440,28 @@ CPU_TEST(LumenRadianceCache_QueryEmptyCacheInvalid)
     EXPECT_FALSE(r.fresh);
     EXPECT_EQ(r.allocatedCornerCount, 0u);
     EXPECT_EQ(r.radiance[0], 0.f);
+}
+
+CPU_TEST(LumenRadianceCache_QueryMarksLastUsedAndTouchValidatesSlot)
+{
+    LumenRadianceCache cache(4.f, 1, 8, 8, 8, 1, 0);
+    cache.advanceFrame();
+    const uint32_t slot = cache.allocateProbe(0, LumenRadianceCache::index3(3, 3, 3));
+    const float rad[3] = {1.f, 1.f, 1.f};
+    EXPECT_TRUE(cache.updateProbe(slot, rad, 0u));
+    EXPECT_EQ(cache.getSlot(slot).lastUsedFrame, 1ull);
+
+    cache.advanceFrame();
+    EXPECT_TRUE(cache.touchProbe(slot));
+    EXPECT_EQ(cache.getSlot(slot).lastUsedFrame, 2ull);
+    EXPECT_FALSE(cache.touchProbe(kInvalidProbeSlot));
+    EXPECT_FALSE(cache.touchProbe(9999u));
+
+    // Query consumption also updates the usage timestamp, which is the signal used by
+    // the UE-style LRU eviction policy rather than radiance update age alone.
+    cache.advanceFrame();
+    cache.query(LumenRadianceCache::float3(-0.25f, -0.25f, -0.25f));
+    EXPECT_EQ(cache.getSlot(slot).lastUsedFrame, 3ull);
 }
 
 CPU_TEST(LumenRadianceCache_QueryOutsideFootprintInvalid)
