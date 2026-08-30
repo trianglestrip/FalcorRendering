@@ -1099,3 +1099,8 @@ present.
   raw requests. The order sensitivity confirms that the current macro changes
   scheduler-visible behavior under the existing lifecycle, so it remains
   disabled rather than being treated as a performance optimization.
+- The final 800x450 ToneMapper PNGs remain visually near-identical despite the
+  telemetry failure: v1 wave-off/on differs on `0.699%` of RGBA samples with
+  max `1` 8-bit level; the reverse-order v2 pair differs on `2.681%` with max
+  `2`. This is screenshot evidence only and cannot override the exact request
+  ledger failure.

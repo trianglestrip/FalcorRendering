@@ -1179,6 +1179,9 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   This order sensitivity rules out promoting the current aggregation macro as
   a safe optimization; keep the macro disabled pending semantic and atomic
   benefit evidence.
+- Screenshot context for the same pairs is visually close but not exact: v1
+  ToneMapper PNGs differ on `0.699%` of RGBA samples (max one 8-bit level),
+  and v2 on `2.681%` (max two). Keep the ledger verdict authoritative.
 
 ## 21. 最终完成条件
 

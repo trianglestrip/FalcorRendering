@@ -1726,3 +1726,8 @@ while wave-on produced `306` / `993,036`. The result is order-sensitive and
 confirms that the current macro changes scheduler-visible behavior; keep it
 disabled until a deterministic semantic match and atomic/timestamp benefit are
 both demonstrated.
+
+The corresponding 800x450 ToneMapper screenshots are visually close: v1
+wave-off/on changes `0.699%` of RGBA samples (maximum one 8-bit level), while
+reverse-order v2 changes `2.681%` (maximum two levels). These PNG comparisons
+are useful visual context but do not override the request-ledger `FAIL`.
