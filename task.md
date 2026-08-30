@@ -1174,6 +1174,11 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   `988831/988881` (first request `31461/31451`). Both request and exact scopes
   remain `FAIL`; the optional validator `--require-same-process` is fail-closed
   and the production aggregation macro stays disabled.
+- Reverse-order C9 same-process replay v2 is also `FAIL`: wave-off had
+  `325` events and `1,025,987` raw requests versus wave-on `306` and `993,036`.
+  This order sensitivity rules out promoting the current aggregation macro as
+  a safe optimization; keep the macro disabled pending semantic and atomic
+  benefit evidence.
 
 ## 21. 最终完成条件
 

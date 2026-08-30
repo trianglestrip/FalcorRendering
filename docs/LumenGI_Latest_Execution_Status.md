@@ -1092,3 +1092,10 @@ present.
   `--scope exact` offline validators therefore return `FAIL`. The optional
   `--require-same-process` validator guard is retained for future runs, but no
   equivalence or production-performance claim is promoted.
+- A reverse-order replay at
+  `artifacts/lumengi/C9/request-wave-same-process-20260830-v2-on-first/`
+  also fails request scope, more strongly: wave-off produced `325` events and
+  `1,025,987` raw requests while wave-on produced `306` events and `993,036`
+  raw requests. The order sensitivity confirms that the current macro changes
+  scheduler-visible behavior under the existing lifecycle, so it remains
+  disabled rather than being treated as a performance optimization.

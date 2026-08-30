@@ -1718,3 +1718,11 @@ counts differ `988831/988881` (first request count `31461/31451`). Both
 request-scope and exact-scope validators are `FAIL`; keep the shader macro
 default-off. `run_c9_request_wave_equivalence.py --require-same-process` is an
 optional fail-closed guard for process, pair, phase, and host-variant evidence.
+
+A reverse-order same-process replay at
+`artifacts/lumengi/C9/request-wave-same-process-20260830-v2-on-first/` also
+fails request scope: wave-off produced `325` events / `1,025,987` raw requests,
+while wave-on produced `306` / `993,036`. The result is order-sensitive and
+confirms that the current macro changes scheduler-visible behavior; keep it
+disabled until a deterministic semantic match and atomic/timestamp benefit are
+both demonstrated.
