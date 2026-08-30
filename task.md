@@ -1147,6 +1147,17 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   watchdog (default disabled); timeout is reported as `BLOCKED` and does not
   alter any quality threshold.
 
+- C5 diagnostic controls v4/v5 separate the filter interaction: temporal-off
+  passes `195/195` with `probeInterpolated` max meanAbs about `1.64e-5`, while
+  spatial-off still fails at about `1.69e-3`; production temporal/spatial
+  defaults remain enabled and C5 remains `FAIL/OPEN`.
+- The opt-in `LUMEN_C5_FORCE_PROBE_TEMPORAL_UAV_BARRIER=1` v6 artifact records
+  the barrier telemetry and lowers frame-2 probe meanAbs to about `6.23e-3`,
+  but still fails 21 strict checks. It is retained as default-off diagnostic
+  evidence only. S1 cache-off v7 is correctly `BLOCKED` (no lookup activity),
+  while cache-on v8 keeps `diffuseRadianceHitDist` identical and leaves a
+  single late probe mismatch; no S1 fix or threshold change is justified.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：

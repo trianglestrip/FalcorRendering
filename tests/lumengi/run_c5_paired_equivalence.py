@@ -60,6 +60,9 @@ USE_SURFACE_CACHE = os.environ.get("LUMEN_C5_PAIRED_EQ_SURFACE_CACHE", "1") not 
 USE_CACHE_LIGHTING = os.environ.get("LUMEN_C5_PAIRED_EQ_CACHE_LIGHTING", "1") not in ("0", "false", "off")
 USE_TEMPORAL = os.environ.get("LUMEN_C5_PAIRED_EQ_TEMPORAL", "1") not in ("0", "false", "off")
 USE_SPATIAL = os.environ.get("LUMEN_C5_PAIRED_EQ_SPATIAL", "1") not in ("0", "false", "off")
+FORCE_PROBE_TEMPORAL_UAV_BARRIER = os.environ.get(
+    "LUMEN_C5_FORCE_PROBE_TEMPORAL_UAV_BARRIER", "0"
+) not in ("0", "false", "off")
 SAVE_ARRAYS = os.environ.get("LUMEN_C5_PAIRED_EQ_SAVE_ARRAYS", "0") not in ("0", "false", "off")
 SAVE_ARRAYS_MAX_FRAMES = max(1, int(os.environ.get("LUMEN_C5_PAIRED_EQ_SAVE_ARRAYS_MAX_FRAMES", "8")))
 
@@ -585,6 +588,7 @@ def _run() -> int:
             "useCacheLighting": USE_CACHE_LIGHTING,
             "useTemporalFilter": USE_TEMPORAL,
             "useSpatialFilter": USE_SPATIAL,
+            "forceProbeTemporalUavBarrier": FORCE_PROBE_TEMPORAL_UAV_BARRIER,
         },
         "protocol": {
             "oneMogwaiProcess": True,

@@ -1676,3 +1676,23 @@ The paired runner also records process/capture timing and supports an opt-in
 `LUMEN_C5_PAIRED_EQ_TIMEOUT_SECONDS` watchdog (default `0`, disabled). It
 checks only between frames and reports a timeout as blocked evidence, leaving
 all quality thresholds and production behavior unchanged.
+
+The next C5 controls narrow the remaining paired divergence without changing
+production behavior. The temporal-off diagnostic
+`artifacts/lumengi/C5/paired-equivalence-current-20260830-v4-temporal-off/`
+passes all `195/195` checks (`probeInterpolated` maximum meanAbs about
+`1.64e-5`), while the spatial-off control
+`.../paired-equivalence-current-20260830-v5-spatial-off/` still fails with a
+maximum probe meanAbs about `1.69e-3`. This points at the temporal-history
+interaction; temporal-off remains diagnostic-only.
+
+The opt-in `LUMEN_C5_FORCE_PROBE_TEMPORAL_UAV_BARRIER=1` run at
+`.../paired-equivalence-current-20260830-v6-probe-temporal-uav-barrier/`
+records `probeTemporalUavBarrier=1` and real activity but still fails 21 strict
+checks. It lowers frame-2 probe meanAbs to about `6.23e-3` from the default
+`1.80e-2`, not enough for the frozen `1e-4` bound. Keep the explicit barrier
+test-only and default-off. The S1 cache-off control v7 is correctly BLOCKED
+(zero cache lookup/readback activity); the valid cache-on v8 control leaves
+`diffuseRadianceHitDist` identical and shows only a late frame-8 probe delta,
+so it does not implicate S1 RT and the cache/temporal scheduler interaction
+remains OPEN.

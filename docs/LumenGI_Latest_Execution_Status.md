@@ -1035,3 +1035,30 @@ present.
   render seconds. An opt-in `LUMEN_C5_PAIRED_EQ_TIMEOUT_SECONDS` watchdog
   remains disabled by default and only stops between frames; a timeout is
   reported as `BLOCKED`/`renderError` and never changes the quality threshold.
+
+- A temporal-off diagnostic at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v4-temporal-off/`
+  passed all `195/195` checks. With temporal filtering disabled,
+  `probeInterpolated` stayed within the frozen tolerance (maximum meanAbs
+  about `1.64e-5`), which localizes the full-path divergence to interaction
+  with temporal history rather than proving a production fix. A spatial-off
+  control at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v5-spatial-off/`
+  still failed (maximum probe meanAbs about `1.69e-3`), so spatial filtering is
+  not the primary lever.
+- The opt-in
+  `LUMEN_C5_FORCE_PROBE_TEMPORAL_UAV_BARRIER=1` experiment at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v6-probe-temporal-uav-barrier/`
+  records the new `probeTemporalUavBarrier=1` telemetry and real activity, but
+  still fails `21` strict checks. Frame-2 `probeInterpolated` meanAbs fell to
+  about `6.23e-3` from the default `1.80e-2`, yet remains far outside the
+  `1e-4` gate; keep the barrier diagnostic-only and default-off.
+- An S1 channel control at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v7-s1-cache-off/`
+  was correctly `BLOCKED` because disabling Cache Lighting produced zero cache
+  lookup activity and zero readback channels. The valid cache-on follow-up at
+  `artifacts/lumengi/C5/paired-equivalence-current-20260830-v8-s1-cache-on/`
+  kept `diffuseRadianceHitDist` identical across passes and still had only one
+  failing probe comparison (frame 8, meanAbs about `7.68e-4`); this does not
+  identify S1 RT as the source and leaves the cache/temporal scheduling
+  interaction open.

@@ -4359,6 +4359,15 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         const char* value = std::getenv("LUMEN_C9_FORCE_CACHE_READBACK_UAV_BARRIER");
         return value && (std::string(value) == "1" || std::string(value) == "true");
     }();
+    // Test-only synchronization probe for the S4.3 -> S5 edge.  The normal
+    // ComputePass resource tracking should transition the interpolated UAV to
+    // an SRV before temporal filtering; this opt-in barrier checks whether an
+    // explicit UAV edge changes the paired full/grid result.
+    const bool forceProbeTemporalUavBarrier = []()
+    {
+        const char* value = std::getenv("LUMEN_C5_FORCE_PROBE_TEMPORAL_UAV_BARRIER");
+        return value && (std::string(value) == "1" || std::string(value) == "true");
+    }();
     // C4 production router: screen miss -> composed GDF -> HWRT.  The GDF is only
     // eligible after compose resources exist; a missing level table keeps the legacy
     // screen -> HWRT path intact for the first setup frame.
@@ -4797,6 +4806,8 @@ void LumenGIPass::runScreenProbeTrace(RenderContext* pRenderContext, const Rende
         const uint32_t interpThreadsX = ((mFrameDim.x + 7u) / 8u) * 8u;
         const uint32_t interpThreadsY = ((mFrameDim.y + 7u) / 8u) * 8u;
         mScreenProbes.pInterpolate->execute(pRenderContext, interpThreadsX, interpThreadsY, 1);
+        if (forceProbeTemporalUavBarrier)
+            pRenderContext->uavBarrier(pGIOutput.get());
         mScreenProbes.producedThisFrame = true;
         if (hasProbeInterpolated)
             pRenderContext->copyResource(renderData.getTexture("probeInterpolated").get(), pGIOutput.get());
@@ -6773,6 +6784,11 @@ std::map<std::string, double> LumenGIPass::getScreenProbeStats() const
     stats["historyResetCount"] = (double)mHistoryResetCount;
     stats["lastHistoryResetReason"] = (double)static_cast<uint32_t>(mLastHistoryResetReason);
     stats["historyResetPending"] = mScreenProbes.historyResetPending ? 1.0 : 0.0;
+    const char* probeTemporalBarrier = std::getenv("LUMEN_C5_FORCE_PROBE_TEMPORAL_UAV_BARRIER");
+    stats["probeTemporalUavBarrier"] =
+        probeTemporalBarrier && (std::string(probeTemporalBarrier) == "1" || std::string(probeTemporalBarrier) == "true")
+        ? 1.0
+        : 0.0;
     stats["historyResetThisFrame"] = mHistoryResetThisFrame ? 1.0 : 0.0;
     stats["historyReadIndex"] = (double)(1u - mScreenProbes.screenRadianceHistoryCurrIndex);
     stats["historyWriteIndex"] = (double)mScreenProbes.screenRadianceHistoryCurrIndex;
