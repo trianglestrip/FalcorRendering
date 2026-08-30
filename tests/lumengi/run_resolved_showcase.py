@@ -42,6 +42,18 @@ DISABLE_SURFACE_CACHE_FEEDBACK_READBACK = (
     or os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_READBACK", "0").strip().lower()
     not in ("0", "false", "off")
 )
+# Optional atomics sub-splits. The aggregate atomics switch disables both
+# classes; these narrower flags isolate page-hit feedback from miss requests.
+DISABLE_SURFACE_CACHE_FEEDBACK_PAGE_ATOMICS = (
+    DISABLE_SURFACE_CACHE_FEEDBACK_ATOMICS
+    or os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_FEEDBACK_PAGE_ATOMICS", "0").strip().lower()
+    not in ("0", "false", "off")
+)
+DISABLE_SURFACE_CACHE_REQUEST_ATOMICS = (
+    DISABLE_SURFACE_CACHE_FEEDBACK_ATOMICS
+    or os.environ.get("LUMEN_C9_DISABLE_SURFACE_CACHE_REQUEST_ATOMICS", "0").strip().lower()
+    not in ("0", "false", "off")
+)
 # Test-only synchronization probe for cache feedback/request readback copies.
 FORCE_CACHE_READBACK_UAV_BARRIER = os.environ.get("LUMEN_C9_FORCE_CACHE_READBACK_UAV_BARRIER", "0").strip().lower() not in ("0", "false", "off")
 # Diagnostic-only LumenGI filter switches. Defaults preserve the production
@@ -1024,6 +1036,8 @@ for label, scene_path in _scenes():
                 "disableSurfaceCacheFeedback": DISABLE_SURFACE_CACHE_FEEDBACK,
                 "disableSurfaceCacheFeedbackAtomics": DISABLE_SURFACE_CACHE_FEEDBACK_ATOMICS,
                 "disableSurfaceCacheFeedbackReadback": DISABLE_SURFACE_CACHE_FEEDBACK_READBACK,
+                "disableSurfaceCacheFeedbackPageAtomics": DISABLE_SURFACE_CACHE_FEEDBACK_PAGE_ATOMICS,
+                "disableSurfaceCacheRequestAtomics": DISABLE_SURFACE_CACHE_REQUEST_ATOMICS,
                 "forceCacheReadbackUavBarrier": FORCE_CACHE_READBACK_UAV_BARRIER,
                 "lumenTemporalFilter": USE_LUMEN_TEMPORAL_FILTER,
                 "lumenSpatialFilter": USE_LUMEN_SPATIAL_FILTER,

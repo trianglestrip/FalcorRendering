@@ -1074,6 +1074,20 @@ timing/VRAM/soak evidence, rough-specular/transmission producer, and C10-C12 rel
   Self-test and v36/v37 artifact checks pass. The split evidence localizes
   readback/scheduler timing but does not close the production C9 gate.
 
+- v39-v40 split the atomics themselves. v39 disabled only page-hit feedback
+  atomics and retained miss requests; strict C9 failed (`mean=5.0315e-5`,
+  `p99=7.0810e-4`, `max=2.5948e-3`) with request raw/cards
+  `3101353/953`. v40 disabled only miss-request atomics and retained page
+  feedback; strict C9 passed (`mean=2.8565e-6`, `p99=7.1168e-5`,
+  `max=2.1065e-3`) with page feedback `269302/465` and zero requests. This
+  localizes the variance to request atomics or scheduler interaction. Request
+  suppression prevents demand capture, so it remains diagnostic-only.
+
+- The split validator now covers page/request sub-modes, positive activity in
+  the enabled domain, and compatibility with older artifacts. Feedback/request
+  readback is also guarded by `hasNormal` to prevent stale UAV copies when the
+  integrate producer is absent.
+
 ## 21. 最终完成条件
 
 仅当以下条件同时满足，整个 LumenGI 实现才可标记为完成：

@@ -1600,3 +1600,18 @@ flags, lookup activity, zero host feedback/request counters, and telemetry
 freshness. Self-test plus v36/v37 artifact checks pass. These diagnostics
 localize host readback/scheduler timing but do not justify a production change;
 the default C9 gate remains `FAIL/OPEN` and thresholds stay frozen.
+
+The v39-v40 atomics sub-split separates page feedback from miss requests. v39
+disabled only page-hit feedback atomics and retained requests; strict C9
+failed (`mean=5.0315e-5`, `p99=7.0810e-4`, `max=2.5948e-3`) with
+`requestRaw=3101353` and `requestCards=953`. v40 disabled only request atomics
+and retained page feedback; strict C9 passed (`mean=2.8565e-6`,
+`p99=7.1168e-5`, `max=2.1065e-3`) with `269302` feedback hits / `465` pages
+and zero request counters. The current evidence localizes the variance to
+request atomics or their host scheduler path. Disabling requests removes demand
+capture and is therefore diagnostic-only, not a production fix.
+
+`run_c9_feedback_split_validator.py` now supports both sub-split modes and
+legacy artifacts, requiring positive activity from the enabled domain. The
+feedback/request copy blocks are additionally guarded by `hasNormal` so a graph
+without the integrate producer cannot replay stale UAV contents.

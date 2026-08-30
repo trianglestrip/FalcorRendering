@@ -4,7 +4,7 @@
 This is an offline evidence check. It does not change C9 pixel thresholds and
 does not promote either split diagnostic to a production pass. The validator
 proves that the requested isolation mode was actually recorded, cache lookup
-activity remained present, host feedback/request counters were zero, and the
+activity remained present, counters in the disabled domain were zero, and the
 one-frame/two-frame telemetry lag stayed within the observed contract.
 """
 
@@ -13,18 +13,22 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Tuple
 
 
-FEEDBACK_FIELDS = (
+FEEDBACK_COUNTER_FIELDS = (
     "surfaceCacheFeedbackHits",
     "surfaceCacheFeedbackPages",
     "surfaceCacheFeedbackDedup",
     "surfaceCacheFeedbackStaleRejects",
+)
+
+REQUEST_COUNTER_FIELDS = (
     "surfaceCacheRequestRaw",
     "surfaceCacheRequestCards",
     "surfaceCacheRequestDedup",
     "surfaceCacheRequestStaleRejects",
+    "surfaceCacheRequestCaptureCompleted",
     "requestRawThisFrame",
     "requestCardsThisFrame",
     "requestCaptureCompletedThisFrame",
@@ -34,10 +38,17 @@ FEEDBACK_FIELDS = (
     "surfaceCacheRequestReasonVisibilityInvalid",
 )
 
+FEEDBACK_FIELDS = FEEDBACK_COUNTER_FIELDS + REQUEST_COUNTER_FIELDS
+
 FEEDBACK_FRAME_FIELDS = (
     "requestObservedFrame",
     "requestCaptureFrame",
     "cacheFeedbackStatsFrame",
+)
+
+TARGET_ATOMIC_FLAG_FIELDS = (
+    "disableSurfaceCacheFeedbackPageAtomics",
+    "disableSurfaceCacheRequestAtomics",
 )
 
 
@@ -55,16 +66,45 @@ def _bool_config(config: Dict[str, Any], key: str) -> Tuple[bool, bool]:
     return True, value
 
 
-def _expected_mode(mode: str) -> Tuple[bool, bool, bool]:
+def _expected_mode(mode: str) -> Tuple[Dict[str, bool], Tuple[str, ...]]:
     if mode == "atomics-off":
-        return False, True, False
+        return ({
+            "disableSurfaceCacheFeedback": False,
+            "disableSurfaceCacheFeedbackAtomics": True,
+            "disableSurfaceCacheFeedbackReadback": False,
+            "disableSurfaceCacheFeedbackPageAtomics": True,
+            "disableSurfaceCacheRequestAtomics": True,
+        }, ("feedback", "request"))
     if mode == "readback-off":
-        return False, False, True
+        return ({
+            "disableSurfaceCacheFeedback": False,
+            "disableSurfaceCacheFeedbackAtomics": False,
+            "disableSurfaceCacheFeedbackReadback": True,
+            "disableSurfaceCacheFeedbackPageAtomics": False,
+            "disableSurfaceCacheRequestAtomics": False,
+        }, ("feedback", "request"))
+    if mode == "feedback-atomics-off":
+        return ({
+            "disableSurfaceCacheFeedback": False,
+            "disableSurfaceCacheFeedbackAtomics": False,
+            "disableSurfaceCacheFeedbackReadback": False,
+            "disableSurfaceCacheFeedbackPageAtomics": True,
+            "disableSurfaceCacheRequestAtomics": False,
+        }, ("feedback",))
+    if mode == "request-atomics-off":
+        return ({
+            "disableSurfaceCacheFeedback": False,
+            "disableSurfaceCacheFeedbackAtomics": False,
+            "disableSurfaceCacheFeedbackReadback": False,
+            "disableSurfaceCacheFeedbackPageAtomics": False,
+            "disableSurfaceCacheRequestAtomics": True,
+        }, ("request",))
     raise ValueError(f"unsupported mode: {mode}")
 
 
 def validate(payload: Dict[str, Any], mode: str) -> Dict[str, Any]:
-    expected_aggregate, expected_atomics, expected_readback = _expected_mode(mode)
+    expected_flags, zero_groups = _expected_mode(mode)
+    legacy_mode = mode in ("atomics-off", "readback-off")
     deterministic = payload.get("deterministicReplay")
     if not isinstance(deterministic, dict):
         return {"schema": "LumenGI.C9.FeedbackSplit.v1", "status": "BLOCKED", "mode": mode,
@@ -77,25 +117,36 @@ def validate(payload: Dict[str, Any], mode: str) -> Dict[str, Any]:
         return {"schema": "LumenGI.C9.FeedbackSplit.v1", "status": "BLOCKED", "mode": mode,
                 "reason": "missing config or telemetry objects"}
 
+    # Artifacts produced before the page/request split may omit both target
+    # flags. Preserve their compatibility for the two original modes, but a
+    # partially present pair is ambiguous and therefore BLOCKED.
+    for mapping, label in ((config, "config"), (cache, "surfaceCacheStats")):
+        present = [key in mapping for key in TARGET_ATOMIC_FLAG_FIELDS]
+        if legacy_mode and any(present) and not all(present):
+            return {"schema": "LumenGI.C9.FeedbackSplit.v1", "status": "BLOCKED", "mode": mode,
+                    "reason": f"partial target atomic flags in {label}"}
+
     checks: Dict[str, Any] = {}
-    for key, expected in (
-        ("disableSurfaceCacheFeedback", expected_aggregate),
-        ("disableSurfaceCacheFeedbackAtomics", expected_atomics),
-        ("disableSurfaceCacheFeedbackReadback", expected_readback),
-    ):
+    for key, expected in expected_flags.items():
         ok, actual = _bool_config(config, key)
         if not ok:
+            if legacy_mode and key in TARGET_ATOMIC_FLAG_FIELDS and not any(
+                target_key in config for target_key in TARGET_ATOMIC_FLAG_FIELDS
+            ):
+                checks[key] = {"compatibility": "missing in legacy artifact", "pass": True}
+                continue
             return {"schema": "LumenGI.C9.FeedbackSplit.v1", "status": "BLOCKED", "mode": mode,
                     "reason": f"missing or non-boolean config flag: {key}"}
         checks[key] = {"expected": expected, "actual": actual, "pass": actual == expected}
 
-    for key, expected in (
-        ("disableSurfaceCacheFeedback", expected_aggregate),
-        ("disableSurfaceCacheFeedbackAtomics", expected_atomics),
-        ("disableSurfaceCacheFeedbackReadback", expected_readback),
-    ):
+    for key, expected in expected_flags.items():
         ok, actual = _number(cache, key)
         if not ok:
+            if legacy_mode and key in TARGET_ATOMIC_FLAG_FIELDS and not any(
+                target_key in cache for target_key in TARGET_ATOMIC_FLAG_FIELDS
+            ):
+                checks[f"telemetry.{key}"] = {"compatibility": "missing in legacy artifact", "pass": True}
+                continue
             return {"schema": "LumenGI.C9.FeedbackSplit.v1", "status": "BLOCKED", "mode": mode,
                     "reason": f"missing or non-numeric surface-cache flag: {key}"}
         checks[f"telemetry.{key}"] = {"expected": float(expected), "actual": actual, "pass": actual == expected}
@@ -108,17 +159,36 @@ def validate(payload: Dict[str, Any], mode: str) -> Dict[str, Any]:
     checks["cacheLookupActivity"] = {"attempts": attempts, "hits": hits, "pass": attempts > 0 and hits > 0}
 
     missing = []
-    nonzero = {}
+    values = {}
     for key in FEEDBACK_FIELDS:
         ok, value = _number(cache, key)
         if not ok:
             missing.append(key)
-        elif value != 0.0:
-            nonzero[key] = value
+        else:
+            values[key] = value
     if missing:
         return {"schema": "LumenGI.C9.FeedbackSplit.v1", "status": "BLOCKED", "mode": mode,
                 "reason": "missing feedback/request telemetry", "missing": missing}
-    checks["feedbackRequestCountersZero"] = {"pass": not nonzero, "nonzero": nonzero}
+    group_fields = {"feedback": FEEDBACK_COUNTER_FIELDS, "request": REQUEST_COUNTER_FIELDS}
+    disabled_nonzero = {
+        key: values[key]
+        for group in zero_groups
+        for key in group_fields[group]
+        if values[key] != 0.0
+    }
+    checks["disabledCountersZero"] = {"pass": not disabled_nonzero, "nonzero": disabled_nonzero}
+
+    active_group = {
+        "feedback-atomics-off": "request",
+        "request-atomics-off": "feedback",
+    }.get(mode)
+    if active_group:
+        active_fields = {"feedback": FEEDBACK_COUNTER_FIELDS, "request": REQUEST_COUNTER_FIELDS}[active_group]
+        active_activity = {key: values[key] for key in active_fields if values[key] > 0.0}
+        if not active_activity:
+            return {"schema": "LumenGI.C9.FeedbackSplit.v1", "status": "BLOCKED", "mode": mode,
+                    "reason": f"enabled {active_group} atomics have no observed activity"}
+        checks["enabledCounterActivity"] = {"group": active_group, "positive": active_activity, "pass": True}
 
     frame_values = {}
     for key in FEEDBACK_FRAME_FIELDS:
@@ -170,25 +240,26 @@ def validate(payload: Dict[str, Any], mode: str) -> Dict[str, Any]:
 
 
 def _fixture(mode: str) -> Dict[str, Any]:
-    atomics = mode == "atomics-off"
-    readback = mode == "readback-off"
+    flags, _ = _expected_mode(mode)
     cache = {
-        "disableSurfaceCacheFeedback": 0.0,
-        "disableSurfaceCacheFeedbackAtomics": float(atomics),
-        "disableSurfaceCacheFeedbackReadback": float(readback),
+        key: float(value) for key, value in flags.items()
+    }
+    cache.update({
         "cacheLookupStatsFrame": 94.0,
         "surfaceCacheFrameIndex": 95.0,
         "schedulerFrameIndex": 96.0,
-    }
+    })
     for key in FEEDBACK_FIELDS:
         cache[key] = 0.0
     for key in FEEDBACK_FRAME_FIELDS:
         cache[key] = 0.0
+    if mode == "feedback-atomics-off":
+        cache["surfaceCacheRequestRaw"] = 3.0
+    elif mode == "request-atomics-off":
+        cache["surfaceCacheFeedbackHits"] = 3.0
     return {
         "deterministicReplay": {"config": {
-            "disableSurfaceCacheFeedback": False,
-            "disableSurfaceCacheFeedbackAtomics": atomics,
-            "disableSurfaceCacheFeedbackReadback": readback,
+            **flags,
         }},
         "screenProbeStats": {"cacheLookupAttempts": 100.0, "cacheLookupHits": 5.0, "cacheLookupStatsFrame": 94.0},
         "surfaceCacheStats": cache,
@@ -197,9 +268,23 @@ def _fixture(mode: str) -> Dict[str, Any]:
 
 
 def self_test() -> None:
-    for mode in ("atomics-off", "readback-off"):
+    for mode in ("atomics-off", "readback-off", "feedback-atomics-off", "request-atomics-off"):
         result = validate(_fixture(mode), mode)
         assert result["status"] == "PASS", (mode, result)
+    feedback_fixture = _fixture("feedback-atomics-off")
+    feedback_fixture["surfaceCacheStats"]["surfaceCacheRequestRaw"] = 3.0
+    assert validate(feedback_fixture, "feedback-atomics-off")["status"] == "PASS"
+    request_fixture = _fixture("request-atomics-off")
+    request_fixture["surfaceCacheStats"]["surfaceCacheFeedbackHits"] = 3.0
+    assert validate(request_fixture, "request-atomics-off")["status"] == "PASS"
+    legacy = _fixture("atomics-off")
+    for key in TARGET_ATOMIC_FLAG_FIELDS:
+        legacy["deterministicReplay"]["config"].pop(key)
+        legacy["surfaceCacheStats"].pop(key)
+    assert validate(legacy, "atomics-off")["status"] == "PASS"
+    partial = _fixture("atomics-off")
+    partial["deterministicReplay"]["config"].pop(TARGET_ATOMIC_FLAG_FIELDS[0])
+    assert validate(partial, "atomics-off")["status"] == "BLOCKED"
     bad = _fixture("atomics-off")
     bad["surfaceCacheStats"]["schedulerFrameIndex"] = 94.0
     assert validate(bad, "atomics-off")["status"] == "FAIL"
@@ -212,7 +297,10 @@ def self_test() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path)
-    parser.add_argument("--mode", choices=("atomics-off", "readback-off"))
+    parser.add_argument(
+        "--mode",
+        choices=("atomics-off", "readback-off", "feedback-atomics-off", "request-atomics-off"),
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()

@@ -945,3 +945,21 @@ mode, lookup activity, zero host feedback/request counters, and observed
 telemetry lag (lookup lag 0..2 frames, scheduler/cache lag 0..1). Its
 self-test and both v36/v37 artifact checks pass. C9 production remains
 `FAIL/OPEN`; no threshold was relaxed.
+
+The v39-v40 atomics sub-split isolates the source further. v39 disabled only
+page-hit feedback atomics and retained miss-request atomics; strict C9 still
+failed (`mean=5.0315e-5`, `p99=7.0810e-4`, `max=2.5948e-3`) with
+`requestRaw=3101353` and `requestCards=953`. v40 disabled only miss-request
+atomics and retained page feedback; strict C9 passed at the no-cache baseline
+(`mean=2.8565e-6`, `p99=7.1168e-5`, `max=2.1065e-3`) while page feedback still
+recorded `269302` hits / `465` pages and request counters were zero. This
+localizes the observed variance to request atomics or their scheduler path,
+not page feedback. Suppressing request atomics also suppresses demand capture,
+so it is diagnostic-only and cannot be promoted to production behavior.
+
+The split validator now supports `feedback-atomics-off` and
+`request-atomics-off`, requiring the disabled domain to be zero and the
+enabled domain to show activity; legacy v36/v37 artifacts without the newer
+target flags remain compatible. The host copy/pending path is also guarded by
+`hasNormal`, preventing stale UAV readback when the integrate producer is not
+present.
